@@ -217,7 +217,6 @@ def register_listener(
     """
 
     @app.on_message(filters.chat(source_chat_id))
-    @app.on_channel_post(filters.chat(source_chat_id))
     async def on_message(client: Client, message: Message):
         """Validate, normalize, enqueue. No heavy work here."""
         payload = normalize_message(message)
