@@ -1,8 +1,9 @@
 """
-Telegram Bot API sender — zero-download forwarding via copyMessage / copyMessages.
+Telegram Bot API sender — delivers to destination channels.
 
-Uses BOT_TOKEN and HTTP calls to api.telegram.org. The Pyrogram user client is
-listen-only; all outbound delivery goes through this module.
+Text is sent with sendMessage (content from the userbot payload).
+Media is copied from a userbot relay chat via copyMessage / copyMessages
+so the sender bot never needs access to the source channel.
 """
 
 import asyncio
@@ -76,6 +77,30 @@ class TelegramBotSender:
             return None
         return {"message_id": int(reply_to_message_id)}
 
+    @staticmethod
+    def _bot_api_entities(entities: Optional[List[Dict[str, Any]]]) -> Optional[List[Dict[str, Any]]]:
+        """Convert serialized Pyrogram entities to Bot API MessageEntity objects."""
+        if not entities:
+            return None
+
+        result = []
+        for entity in entities:
+            entry: Dict[str, Any] = {
+                "type": entity["type"],
+                "offset": entity["offset"],
+                "length": entity["length"],
+            }
+            if entity.get("url"):
+                entry["url"] = entity["url"]
+            if entity.get("user_id"):
+                entry["user"] = {"id": entity["user_id"]}
+            if entity.get("language"):
+                entry["language"] = entity["language"]
+            if entity.get("custom_emoji_id"):
+                entry["custom_emoji_id"] = entity["custom_emoji_id"]
+            result.append(entry)
+        return result
+
     async def get_me(self) -> Dict[str, Any]:
         return await self._call("getMe", {})
 
@@ -129,13 +154,17 @@ class TelegramBotSender:
         self,
         chat_id: Union[int, str],
         text: str,
+        entities: Optional[List[Dict[str, Any]]] = None,
         reply_to_message_id: Optional[Union[int, str]] = None,
     ) -> int:
-        """Send plain text (used when word replacements changed the text)."""
+        """Send plain text with optional formatting entities."""
         payload: Dict[str, Any] = {
             "chat_id": chat_id,
             "text": text,
         }
+        bot_entities = self._bot_api_entities(entities)
+        if bot_entities:
+            payload["entities"] = bot_entities
         reply_params = self._reply_params(reply_to_message_id)
         if reply_params:
             payload["reply_parameters"] = reply_params
@@ -176,40 +205,49 @@ class TelegramBotSender:
             chat_id = dest["chat_id"]
             if not await self.verify_bot_access(chat_id):
                 name = dest.get("name", chat_id)
-                errors.append(f"Bot cannot access destination '{name}' ({chat_id})")
+                errors.append(
+                    f"Bot cannot access destination '{name}' ({chat_id}). "
+                    "Add the sender bot as admin with post permission."
+                )
         return errors
 
     async def forward_to_destination(
         self,
         dest_chat_id: Union[int, str],
-        source_chat_id: Union[int, str],
         msg_type: str,
         payload: Dict[str, Any],
         processed_payload: Dict[str, Any],
+        relay_chat_id: Optional[Union[int, str]] = None,
+        relay_message_ids: Optional[List[int]] = None,
         reply_to_message_id: Optional[Union[int, str]] = None,
     ) -> Dict[str, Any]:
         """
         Forward one message/album to a single destination.
 
+        Text uses sendMessage from payload content (no source-channel access).
+        Media uses copyMessage from the userbot relay chat.
+
         Returns:
             {
-                "sent_message_id": int | None,   # anchor / primary id
+                "sent_message_id": int | None,
                 "reply_mappings": [(source_id, sent_id), ...],
             }
         """
         if msg_type == "album":
             items = processed_payload.get("items") or payload.get("items") or []
             sorted_items = sorted(items, key=lambda x: int(x.get("message_id", 0)))
-            message_ids = [int(item["message_id"]) for item in sorted_items]
+            source_message_ids = [int(item["message_id"]) for item in sorted_items]
+
+            if not relay_chat_id or not relay_message_ids:
+                raise RuntimeError("Media album requires userbot relay before Bot API delivery")
 
             sent_ids = await self.copy_messages(
                 chat_id=dest_chat_id,
-                from_chat_id=source_chat_id,
-                message_ids=message_ids,
+                from_chat_id=relay_chat_id,
+                message_ids=relay_message_ids,
                 reply_to_message_id=reply_to_message_id,
             )
 
-            # Apply caption edits without re-uploading media
             for item, sent_id in zip(sorted_items, sent_ids):
                 original = item.get("caption") or ""
                 processed = item.get("processed_caption") or original
@@ -228,27 +266,32 @@ class TelegramBotSender:
         msg_id = int(payload["message_id"])
 
         if msg_type == "text":
-            if processed_payload.get("text_changed"):
-                sent_id = await self.send_message(
-                    chat_id=dest_chat_id,
-                    text=processed_payload.get("processed_text") or payload.get("text") or "",
-                    reply_to_message_id=reply_to_message_id,
-                )
-            else:
-                sent_id = await self.copy_message(
-                    chat_id=dest_chat_id,
-                    from_chat_id=source_chat_id,
-                    message_id=msg_id,
-                    reply_to_message_id=reply_to_message_id,
-                )
+            text = (
+                processed_payload.get("processed_text")
+                if processed_payload.get("text_changed")
+                else payload.get("text")
+            ) or ""
+            entities = None
+            if not processed_payload.get("text_changed"):
+                entities = payload.get("entities") or []
+
+            sent_id = await self.send_message(
+                chat_id=dest_chat_id,
+                text=text,
+                entities=entities,
+                reply_to_message_id=reply_to_message_id,
+            )
         else:
+            if not relay_chat_id or not relay_message_ids:
+                raise RuntimeError("Media message requires userbot relay before Bot API delivery")
+
             caption = None
             if processed_payload.get("caption_changed"):
                 caption = processed_payload.get("processed_caption") or payload.get("caption")
             sent_id = await self.copy_message(
                 chat_id=dest_chat_id,
-                from_chat_id=source_chat_id,
-                message_id=msg_id,
+                from_chat_id=relay_chat_id,
+                message_id=relay_message_ids[0],
                 caption=caption,
                 reply_to_message_id=reply_to_message_id,
             )

@@ -83,3 +83,32 @@ class TestDeduplication:
         # Verify TTL parameter
         call_kwargs = self.mock_redis.set.call_args
         assert call_kwargs[1]["ex"] == 86400
+
+    @pytest.mark.asyncio
+    async def test_mark_inflight(self):
+        from deduplication import Deduplication
+
+        dedup = Deduplication(self.mock_redis)
+        await dedup.mark_inflight(chat_id=-100123, message_ids=[10, 11])
+
+        self.mock_redis.sadd.assert_called_once_with("inflight:-100123", "10", "11")
+        self.mock_redis.expire.assert_called_once_with("inflight:-100123", 600)
+
+    @pytest.mark.asyncio
+    async def test_clear_inflight(self):
+        from deduplication import Deduplication
+
+        dedup = Deduplication(self.mock_redis)
+        await dedup.clear_inflight(chat_id=-100123, message_ids=[10])
+
+        self.mock_redis.srem.assert_called_once_with("inflight:-100123", "10")
+
+    @pytest.mark.asyncio
+    async def test_is_inflight(self):
+        from deduplication import Deduplication
+
+        self.mock_redis.sismember.return_value = True
+        dedup = Deduplication(self.mock_redis)
+
+        assert await dedup.is_inflight(chat_id=-100123, message_id=10) is True
+        self.mock_redis.sismember.assert_called_once_with("inflight:-100123", "10")

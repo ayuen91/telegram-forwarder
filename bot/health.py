@@ -79,7 +79,7 @@ class HealthMonitor:
         # 1. User account status (listen)
         results.append(await self._check_pyrogram())
 
-        # 2. Sender bot status (copyMessage delivery)
+        # 2. Sender bot status (destination delivery)
         results.append(await self._check_sender_bot())
 
         # 3. Redis connectivity

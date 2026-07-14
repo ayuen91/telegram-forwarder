@@ -43,7 +43,7 @@ services:
     networks:
       - internal
 
-  # n8n (word replacement only — Python bot sends via Bot API copyMessage)
+  # n8n (word replacement only — Python bot sends to destinations via Bot API)
   n8n:
     image: n8nio/n8n:latest
     env_file: .env

@@ -136,7 +136,7 @@ async def init_database(db_path: str):
 # ── Worker Factories ──────────────────────────────────────────────────
 # These return coroutine factories for supervised_task
 
-def make_worker_factory(worker_id, queue, dedup, album_buf, queue_mgr, webhook, sender, settings, db_path):
+def make_worker_factory(worker_id, queue, dedup, album_buf, queue_mgr, webhook, sender, settings, db_path, pyrogram_app, relay_chat_id):
     """Create a message worker coroutine factory."""
     async def worker():
         await message_worker(
@@ -148,13 +148,15 @@ def make_worker_factory(worker_id, queue, dedup, album_buf, queue_mgr, webhook, 
             webhook_sender=webhook,
             sender=sender,
             db_path=db_path,
+            pyrogram_app=pyrogram_app,
+            relay_chat_id=relay_chat_id,
             delay_min=settings.worker_delay_min,
             delay_max=settings.worker_delay_max,
         )
     return worker
 
 
-def make_album_flush_factory(album_buf, queue_mgr, webhook, sender, dedup, db_path):
+def make_album_flush_factory(album_buf, queue_mgr, webhook, sender, dedup, db_path, pyrogram_app, relay_chat_id):
     """Create album flush worker coroutine factory."""
     async def album_flush():
         while not shutdown_event.is_set():
@@ -162,7 +164,14 @@ def make_album_flush_factory(album_buf, queue_mgr, webhook, sender, dedup, db_pa
                 completed = await album_buf.check_and_flush_expired()
                 for album_payload in completed:
                     await process_payload(
-                        sender, queue_mgr, webhook, album_payload, db_path, dedup=dedup
+                        sender,
+                        queue_mgr,
+                        webhook,
+                        album_payload,
+                        db_path,
+                        dedup=dedup,
+                        pyrogram_app=pyrogram_app,
+                        relay_chat_id=relay_chat_id,
                     )
             except Exception as e:
                 logger.error(f"Album flush error: {e}", exc_info=True)
@@ -171,20 +180,38 @@ def make_album_flush_factory(album_buf, queue_mgr, webhook, sender, dedup, db_pa
     return album_flush
 
 
-def make_retry_factory(queue_mgr, webhook, sender, dedup, db_path):
+def make_retry_factory(queue_mgr, webhook, sender, dedup, db_path, pyrogram_app, relay_chat_id):
     """Create retry worker coroutine factory."""
     async def retry():
         while not shutdown_event.is_set():
             try:
                 payload = await queue_mgr.dequeue_deferred()
                 if payload:
-                    await retry_payload(sender, queue_mgr, webhook, payload, db_path, dedup=dedup)
+                    await retry_payload(
+                        sender,
+                        queue_mgr,
+                        webhook,
+                        payload,
+                        db_path,
+                        dedup=dedup,
+                        pyrogram_app=pyrogram_app,
+                        relay_chat_id=relay_chat_id,
+                    )
                     await asyncio.sleep(1)
                     continue
 
                 payload = await queue_mgr.dequeue_failed()
                 if payload:
-                    await retry_payload(sender, queue_mgr, webhook, payload, db_path, dedup=dedup)
+                    await retry_payload(
+                        sender,
+                        queue_mgr,
+                        webhook,
+                        payload,
+                        db_path,
+                        dedup=dedup,
+                        pyrogram_app=pyrogram_app,
+                        relay_chat_id=relay_chat_id,
+                    )
                 else:
                     await asyncio.sleep(60)
                     continue
@@ -293,6 +320,11 @@ async def main():
     await app.start()
     logger.info("Pyrogram client started (listen-only)")
 
+    # Relay chat: private DM with sender bot (user must /start the bot once)
+    me = await app.get_me()
+    relay_chat_id = settings.relay_chat_id or me.id
+    settings.relay_chat_id = relay_chat_id
+
     # Verify sender bot and channel access
     try:
         bot_me = await sender.get_me()
@@ -306,7 +338,15 @@ async def main():
     except Exception as e:
         logger.error(
             f"✗ CRITICAL: Cannot access source channel {settings.source_chat_id}. "
-            f"Please verify that the user account is joined to this channel. Error: {e}"
+            f"The user account must be a member of the source channel. Error: {e}"
+        )
+
+    if await sender.verify_bot_access(relay_chat_id):
+        logger.info(f"✓ Sender bot relay chat verified (chat_id={relay_chat_id})")
+    else:
+        logger.error(
+            f"✗ CRITICAL: Sender bot cannot access relay chat {relay_chat_id}. "
+            "Send /start to the sender bot from the user account's Telegram app."
         )
 
     dest_errors = await sender.verify_destinations(
@@ -314,12 +354,6 @@ async def main():
     )
     for err in dest_errors:
         logger.error(f"✗ Destination access: {err}")
-
-    if not await sender.verify_bot_access(settings.source_chat_id):
-        logger.error(
-            f"✗ CRITICAL: Sender bot cannot access source channel {settings.source_chat_id}. "
-            "Add the bot as admin to the source channel for copyMessage to work."
-        )
 
     # Now run self-test (retries every 30s until all pass)
     retry_count = 0
@@ -340,7 +374,16 @@ async def main():
     # Process albums recovered from a crashed session
     for album_payload in stale_albums:
         try:
-            await process_payload(sender, queue_mgr, webhook, album_payload, settings.db_path, dedup=dedup)
+            await process_payload(
+                sender,
+                queue_mgr,
+                webhook,
+                album_payload,
+                settings.db_path,
+                dedup=dedup,
+                pyrogram_app=app,
+                relay_chat_id=relay_chat_id,
+            )
         except Exception as e:
             logger.error(f"Failed to process recovered album: {e}", exc_info=True)
 
@@ -350,7 +393,17 @@ async def main():
     # Message workers (N workers, default 2)
     for i in range(settings.worker_count):
         factory = make_worker_factory(
-            i + 1, message_queue, dedup, album_buf, queue_mgr, webhook, sender, settings, settings.db_path
+            i + 1,
+            message_queue,
+            dedup,
+            album_buf,
+            queue_mgr,
+            webhook,
+            sender,
+            settings,
+            settings.db_path,
+            app,
+            relay_chat_id,
         )
         tasks.append(asyncio.create_task(
             supervised_task(f"worker-{i+1}", factory),
@@ -359,13 +412,21 @@ async def main():
 
     # Album flush worker
     tasks.append(asyncio.create_task(
-        supervised_task("album-flush", make_album_flush_factory(album_buf, queue_mgr, webhook, sender, dedup, settings.db_path)),
+        supervised_task(
+            "album-flush",
+            make_album_flush_factory(
+                album_buf, queue_mgr, webhook, sender, dedup, settings.db_path, app, relay_chat_id
+            ),
+        ),
         name="album-flush",
     ))
 
     # Retry worker
     tasks.append(asyncio.create_task(
-        supervised_task("retry", make_retry_factory(queue_mgr, webhook, sender, dedup, settings.db_path)),
+        supervised_task(
+            "retry",
+            make_retry_factory(queue_mgr, webhook, sender, dedup, settings.db_path, app, relay_chat_id),
+        ),
         name="retry",
     ))
 

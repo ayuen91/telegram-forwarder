@@ -22,6 +22,7 @@ import aiosqlite
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
+from media_relay import relay_to_bot, cleanup_relay
 from telegram_sender import TelegramBotSender, TelegramFloodWait
 
 logger = logging.getLogger(__name__)
@@ -211,15 +212,29 @@ async def _store_reply_mappings(
         )
 
 
+def _source_message_ids(payload: Dict[str, Any]) -> list:
+    """Source message ids that need userbot relay for media delivery."""
+    msg_type = payload.get("type")
+    if msg_type == "album":
+        items = payload.get("items") or []
+        return [int(i["message_id"]) for i in sorted(items, key=lambda x: int(x.get("message_id", 0)))]
+    if msg_type and msg_type != "text":
+        return [int(payload["message_id"])]
+    return []
+
+
 async def forward_message_pipeline(
     sender: TelegramBotSender,
     payload: Dict[str, Any],
     processed_payload: Dict[str, Any],
     db_path: str,
     dedup=None,
+    pyrogram_app: Optional[Client] = None,
+    relay_chat_id: Optional[int] = None,
 ) -> ForwardStatus:
     """
-    Copy or send the processed message/album to all destinations via Bot API.
+    Send the processed message/album to all destinations via Bot API.
+    Media is relayed through the userbot first; text is sent directly.
     Tracks per-item reply mappings so channel reply threads work correctly.
     """
     msg_type = payload.get("type")
@@ -238,6 +253,24 @@ async def forward_message_pipeline(
 
     any_failed = False
     any_deferred = False
+    relay_message_ids: Optional[list] = None
+
+    source_ids_for_relay = _source_message_ids(payload)
+    if source_ids_for_relay:
+        if not pyrogram_app or relay_chat_id is None:
+            logger.error("Media forwarding requires Pyrogram client and relay chat")
+            return "failed"
+        try:
+            relay_message_ids = await relay_to_bot(
+                pyrogram_app,
+                source_chat_id,
+                source_ids_for_relay,
+                relay_chat_id,
+                is_album=(msg_type == "album"),
+            )
+        except Exception as ex:
+            logger.error(f"Userbot media relay failed: {ex}", exc_info=True)
+            return "failed"
 
     async with aiosqlite.connect(db_path) as db:
         db.row_factory = aiosqlite.Row
@@ -331,10 +364,11 @@ async def forward_message_pipeline(
                 async def _send():
                     return await sender.forward_to_destination(
                         dest_chat_id=dest_chat_id,
-                        source_chat_id=source_chat_id,
                         msg_type=msg_type,
                         payload=payload,
                         processed_payload=processed_payload,
+                        relay_chat_id=relay_chat_id,
+                        relay_message_ids=relay_message_ids,
                         reply_to_message_id=reply_to_id,
                     )
 
@@ -405,6 +439,9 @@ async def forward_message_pipeline(
 
         await db.commit()
 
+    if relay_message_ids and not any_failed and not any_deferred:
+        await cleanup_relay(pyrogram_app, relay_chat_id, relay_message_ids)
+
     if any_deferred:
         return "defer"
     if any_failed:
@@ -419,6 +456,8 @@ async def process_payload(
     payload: Dict[str, Any],
     db_path: str,
     dedup=None,
+    pyrogram_app: Optional[Client] = None,
+    relay_chat_id: Optional[int] = None,
 ) -> ForwardStatus:
     """Run webhook processing + Bot API forward for one payload."""
     endpoint = "album" if payload.get("type") == "album" else "message"
@@ -438,7 +477,13 @@ async def process_payload(
             return "failed"
 
         status = await forward_message_pipeline(
-            sender, payload, processed_payload, db_path, dedup=dedup
+            sender,
+            payload,
+            processed_payload,
+            db_path,
+            dedup=dedup,
+            pyrogram_app=pyrogram_app,
+            relay_chat_id=relay_chat_id,
         )
 
         if status == "success":
@@ -461,6 +506,8 @@ async def retry_payload(
     payload: Dict[str, Any],
     db_path: str,
     dedup=None,
+    pyrogram_app: Optional[Client] = None,
+    relay_chat_id: Optional[int] = None,
 ) -> ForwardStatus:
     """Retry webhook + forward without re-enqueueing to the pending queue."""
     endpoint = "album" if payload.get("type") == "album" else "message"
@@ -479,7 +526,13 @@ async def retry_payload(
             return "failed"
 
         status = await forward_message_pipeline(
-            sender, payload, processed_payload, db_path, dedup=dedup
+            sender,
+            payload,
+            processed_payload,
+            db_path,
+            dedup=dedup,
+            pyrogram_app=pyrogram_app,
+            relay_chat_id=relay_chat_id,
         )
 
         if status == "success":
@@ -508,12 +561,14 @@ async def message_worker(
     webhook_sender,
     sender: TelegramBotSender,
     db_path: str,
+    pyrogram_app: Optional[Client] = None,
+    relay_chat_id: Optional[int] = None,
     delay_min: float = 0.5,
     delay_max: float = 1.5,
 ):
     """
     Worker task: pulls messages from asyncio.Queue, processes sequentially.
-    Uses n8n webhook for word replacement, then forwards via Bot API copyMessage.
+    Uses n8n webhook for word replacement, then delivers via Bot API.
     """
     logger.info(f"Worker-{worker_id} started")
 
@@ -535,7 +590,14 @@ async def message_worker(
                 flush_result = await album_buffer.add(payload)
                 if flush_result:
                     await process_payload(
-                        sender, queue_manager, webhook_sender, flush_result, db_path, dedup=dedup
+                        sender,
+                        queue_manager,
+                        webhook_sender,
+                        flush_result,
+                        db_path,
+                        dedup=dedup,
+                        pyrogram_app=pyrogram_app,
+                        relay_chat_id=relay_chat_id,
                     )
                 logger.debug(
                     f"Worker-{worker_id}: buffered album item {message_id} "
@@ -543,7 +605,14 @@ async def message_worker(
                 )
             else:
                 status = await process_payload(
-                    sender, queue_manager, webhook_sender, payload, db_path, dedup=dedup
+                    sender,
+                    queue_manager,
+                    webhook_sender,
+                    payload,
+                    db_path,
+                    dedup=dedup,
+                    pyrogram_app=pyrogram_app,
+                    relay_chat_id=relay_chat_id,
                 )
                 if status == "success":
                     logger.info(

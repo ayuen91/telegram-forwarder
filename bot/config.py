@@ -61,8 +61,9 @@ class Settings:
     phone_number: str = ""
     source_chat_id: int = 0
 
-    # Telegram Sender Bot (Bot API — copyMessage delivery)
+    # Telegram Sender Bot (Bot API — destination delivery only)
     bot_token: str = ""
+    relay_chat_id: int = 0  # Private chat with sender bot (defaults to user account id)
 
     # n8n Webhooks (from .env)
     n8n_webhook_message: str = ""
@@ -143,6 +144,10 @@ class Config:
 
         s.alert_bot_token = _require_env("ALERT_BOT_TOKEN")
         s.alert_chat_id = _env_int("ALERT_CHAT_ID", 0)
+
+        relay_env = os.getenv("RELAY_CHAT_ID")
+        if relay_env:
+            s.relay_chat_id = int(relay_env)
 
         s.worker_count = _env_int("WORKER_COUNT", 2)
         s.worker_delay_min = _env_float("WORKER_DELAY_MIN", 0.5)
