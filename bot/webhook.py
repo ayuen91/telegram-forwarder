@@ -22,6 +22,21 @@ import aiohttp
 logger = logging.getLogger(__name__)
 
 
+def _strip_nulls(value: Any) -> Any:
+    """Remove None fields so signed JSON matches n8n's parsed webhook body."""
+    if isinstance(value, dict):
+        return {k: _strip_nulls(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_strip_nulls(item) for item in value]
+    return value
+
+
+def _canonical_json(payload: Dict[str, Any]) -> str:
+    """Stable JSON matching n8n stableStringify (sorted keys, no nulls, compact)."""
+    cleaned = _strip_nulls(payload)
+    return json.dumps(cleaned, default=str, separators=(",", ":"), sort_keys=True, ensure_ascii=False)
+
+
 class WebhookSender:
     """Send HMAC-signed payloads to n8n webhook endpoints."""
 
@@ -87,11 +102,11 @@ class WebhookSender:
                 for r in s.replacement_rules
             ]
 
-        payload_json = json.dumps(outbound, default=str, separators=(",", ":"), sort_keys=True)
+        payload_json = _canonical_json(outbound)
         signature = self._sign_payload(payload_json)
 
         headers = {
-            "Content-Type": "application/json",
+            "Content-Type": "application/json; charset=utf-8",
             "X-Signature": signature,
         }
 
@@ -99,22 +114,32 @@ class WebhookSender:
 
         try:
             session = await self._get_session()
-            async with session.post(url, data=payload_json, headers=headers) as resp:
+            async with session.post(url, data=payload_json.encode("utf-8"), headers=headers) as resp:
                 body_text = await resp.text()
                 if 200 <= resp.status < 300:
+                    if not body_text or not body_text.strip():
+                        logger.warning(
+                            f"Webhook empty response: {endpoint} message_id={message_id} "
+                            f"(likely n8n HMAC rejection)"
+                        )
+                        return None
                     try:
                         result = json.loads(body_text)
+                        if not result.get("destinations"):
+                            logger.warning(
+                                f"Webhook missing destinations: {endpoint} message_id={message_id}"
+                            )
+                            return None
                         logger.info(
-                            f"Webhook sent: {endpoint} message_id={message_id} "
-                            f"status={resp.status}"
+                            f"Webhook sent: {endpoint} message_id={message_id} status={resp.status}"
                         )
                         return result
                     except json.JSONDecodeError:
                         logger.warning(
-                            f"Webhook returned non-JSON body: {body_text[:200]}"
+                            f"Webhook non-JSON response: {endpoint} message_id={message_id} "
+                            f"body={body_text[:200]}"
                         )
-                        # Return raw success indicator so caller knows it worked
-                        return {"status": "ok"}
+                        return None
                 else:
                     logger.warning(
                         f"Webhook failed: {endpoint} message_id={message_id} "

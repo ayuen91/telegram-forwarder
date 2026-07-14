@@ -63,7 +63,7 @@ class Settings:
 
     # Telegram Sender Bot (Bot API — destination delivery only)
     bot_token: str = ""
-    relay_chat_id: int = 0  # Private chat with sender bot (defaults to user account id)
+    relay_chat_id: int = 0  # Optional Bot API from_chat_id override (defaults to user id)
 
     # n8n Webhooks (from .env)
     n8n_webhook_message: str = ""

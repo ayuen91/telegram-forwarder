@@ -74,10 +74,10 @@ class QueueManager:
 
         logger.debug(f"Enqueued message {message_id} to {queue}")
 
-    async def enqueue_failed(self, payload: Dict[str, Any], error: str):
+    async def enqueue_failed(self, payload: Dict[str, Any], error: str) -> str:
         """
         Push a failed message to the retry queue with error info.
-        If max retries exceeded, moves to dead letter queue.
+        Returns 'dead_letter' if max retries exceeded, else 'failed'.
         """
         retry_count = payload.get("_retry_count", 0) + 1
         message_id = payload.get("message_id", "unknown")
@@ -87,21 +87,21 @@ class QueueManager:
         payload["_failed_at"] = time.time()
 
         if retry_count > self.max_retries:
-            # Move to dead letter queue — requires manual intervention
             payload_json = json.dumps(payload)
             await self.redis.rpush(self.QUEUE_DEAD_LETTER, payload_json)
             logger.error(
                 f"Message {message_id} moved to dead letter queue "
                 f"after {retry_count} retries: {error}"
             )
-        else:
-            # Push to retry queue
-            payload_json = json.dumps(payload)
-            await self.redis.rpush(self.QUEUE_FAILED, payload_json)
-            logger.warning(
-                f"Message {message_id} queued for retry "
-                f"({retry_count}/{self.max_retries}): {error}"
-            )
+            return "dead_letter"
+
+        payload_json = json.dumps(payload)
+        await self.redis.rpush(self.QUEUE_FAILED, payload_json)
+        logger.warning(
+            f"Message {message_id} queued for retry "
+            f"({retry_count}/{self.max_retries}): {error}"
+        )
+        return "failed"
 
     async def enqueue_deferred(self, payload: Dict[str, Any], error: str):
         """Re-queue for short retry when reply parent is not ready yet."""

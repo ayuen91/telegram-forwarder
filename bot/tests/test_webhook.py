@@ -5,10 +5,12 @@ import hmac
 import json
 import pytest
 
+from webhook import _canonical_json, _strip_nulls
+
 
 def generate_signature(payload: dict, secret: str) -> str:
     """Replicate the WebhookSender's signing logic."""
-    payload_json = json.dumps(payload, default=str, separators=(",", ":"), sort_keys=True)
+    payload_json = _canonical_json(payload)
     return hmac.new(
         secret.encode("utf-8"),
         payload_json.encode("utf-8"),
@@ -27,14 +29,15 @@ def verify_signature(payload_json: str, signature: str, secret: str) -> bool:
 
 
 def stable_stringify(value):
-    """Match n8n stableStringify / Python json.dumps(sort_keys=True, separators=(',', ':'))."""
+    """Match n8n stableStringify on null-stripped payloads."""
     import json
+    value = _strip_nulls(value)
     if value is None or not isinstance(value, (dict, list)):
-        return json.dumps(value)
+        return json.dumps(value, ensure_ascii=False)
     if isinstance(value, list):
         return "[" + ",".join(stable_stringify(item) for item in value) + "]"
     keys = sorted(value.keys())
-    parts = [json.dumps(k) + ":" + stable_stringify(value[k]) for k in keys]
+    parts = [json.dumps(k, ensure_ascii=False) + ":" + stable_stringify(value[k]) for k in keys]
     return "{" + ",".join(parts) + "}"
 
 
@@ -51,7 +54,7 @@ class TestWebhookSignature:
     def test_signature_verification(self):
         """Generated signature should pass verification."""
         payload = {"message_id": 1, "text": "hello world"}
-        payload_json = json.dumps(payload, default=str, separators=(",", ":"), sort_keys=True)
+        payload_json = _canonical_json(payload)
         sig = generate_signature(payload, self.SECRET)
         assert verify_signature(payload_json, sig, self.SECRET) is True
 
@@ -88,8 +91,28 @@ class TestWebhookSignature:
         """Signature should handle unicode text correctly."""
         payload = {"message_id": 1, "text": "Привет мир 🌍"}
         sig = generate_signature(payload, self.SECRET)
-        payload_json = json.dumps(payload, default=str, separators=(",", ":"), sort_keys=True)
+        payload_json = _canonical_json(payload)
         assert verify_signature(payload_json, sig, self.SECRET) is True
+
+    def test_photo_payload_null_fields_stripped(self):
+        """Photo payloads omit null text/caption — must match n8n body after parse."""
+        payload = {
+            "message_id": 40,
+            "chat_id": -100123,
+            "type": "photo",
+            "text": None,
+            "caption": None,
+            "entities": [],
+            "caption_entities": [],
+            "has_media": True,
+            "reply_to_message_id": None,
+            "timestamp": "2026-07-14T11:51:10+00:00",
+        }
+        py_json = _canonical_json(payload)
+        js_style = stable_stringify(payload)
+        assert py_json == js_style
+        sig = generate_signature(payload, self.SECRET)
+        assert verify_signature(py_json, sig, self.SECRET) is True
 
     def test_stable_stringify_matches_python_dumps(self):
         """n8n compact stable stringify must match Python signing."""
@@ -98,7 +121,7 @@ class TestWebhookSignature:
             "text": "hello",
             "destinations": [{"chat_id": -100, "name": "A", "enabled": True}],
         }
-        py_json = json.dumps(payload, default=str, separators=(",", ":"), sort_keys=True)
+        py_json = _canonical_json(payload)
         js_style = stable_stringify(payload)
         assert py_json == js_style
         sig = generate_signature(payload, self.SECRET)

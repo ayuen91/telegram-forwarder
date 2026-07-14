@@ -22,7 +22,9 @@ import aiosqlite
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
-from media_relay import relay_to_bot, cleanup_relay
+from media_relay import RelayConfig, relay_to_bot, cleanup_relay
+from replacements import build_processed_payload, needs_n8n
+from alerts import send_alert
 from telegram_sender import TelegramBotSender, TelegramFloodWait
 
 logger = logging.getLogger(__name__)
@@ -230,7 +232,7 @@ async def forward_message_pipeline(
     db_path: str,
     dedup=None,
     pyrogram_app: Optional[Client] = None,
-    relay_chat_id: Optional[int] = None,
+    relay: Optional[RelayConfig] = None,
 ) -> ForwardStatus:
     """
     Send the processed message/album to all destinations via Bot API.
@@ -257,15 +259,15 @@ async def forward_message_pipeline(
 
     source_ids_for_relay = _source_message_ids(payload)
     if source_ids_for_relay:
-        if not pyrogram_app or relay_chat_id is None:
-            logger.error("Media forwarding requires Pyrogram client and relay chat")
+        if not pyrogram_app or relay is None:
+            logger.error("Media forwarding requires Pyrogram client and relay config")
             return "failed"
         try:
             relay_message_ids = await relay_to_bot(
                 pyrogram_app,
                 source_chat_id,
                 source_ids_for_relay,
-                relay_chat_id,
+                relay,
                 is_album=(msg_type == "album"),
             )
         except Exception as ex:
@@ -367,7 +369,7 @@ async def forward_message_pipeline(
                         msg_type=msg_type,
                         payload=payload,
                         processed_payload=processed_payload,
-                        relay_chat_id=relay_chat_id,
+                        relay_chat_id=relay.bot_from_chat if relay else None,
                         relay_message_ids=relay_message_ids,
                         reply_to_message_id=reply_to_id,
                     )
@@ -440,7 +442,7 @@ async def forward_message_pipeline(
         await db.commit()
 
     if relay_message_ids and not any_failed and not any_deferred:
-        await cleanup_relay(pyrogram_app, relay_chat_id, relay_message_ids)
+        await cleanup_relay(pyrogram_app, relay, relay_message_ids)
 
     if any_deferred:
         return "defer"
@@ -449,41 +451,65 @@ async def forward_message_pipeline(
     return "success"
 
 
+async def _resolve_processed_payload(
+    webhook_sender,
+    config,
+    payload: Dict[str, Any],
+    endpoint: str,
+) -> Optional[Dict[str, Any]]:
+    """Get processed payload via n8n (if text to edit) with local fallback."""
+    if needs_n8n(payload):
+        processed = await webhook_sender.send(payload, endpoint=endpoint)
+        if processed and processed.get("destinations"):
+            return processed
+        logger.info(
+            f"n8n unavailable or rejected msg {payload.get('message_id')} — using local processing"
+        )
+    return build_processed_payload(payload, config)
+
+
 async def process_payload(
     sender: TelegramBotSender,
     queue_manager,
     webhook_sender,
     payload: Dict[str, Any],
     db_path: str,
+    config,
     dedup=None,
     pyrogram_app: Optional[Client] = None,
-    relay_chat_id: Optional[int] = None,
+    relay: Optional[RelayConfig] = None,
+    alert_token: str = "",
+    alert_chat_id: int = 0,
 ) -> ForwardStatus:
-    """Run webhook processing + Bot API forward for one payload."""
+    """Run word replacement + Bot API forward for one payload."""
     endpoint = "album" if payload.get("type") == "album" else "message"
     chat_id = payload.get("chat_id", 0)
     inflight_ids = _payload_inflight_ids(payload)
     status: ForwardStatus = "failed"
+    message_id = payload.get("message_id", payload.get("media_group_id", "?"))
 
     await queue_manager.enqueue(payload)
     if dedup and inflight_ids:
         await dedup.mark_inflight(chat_id, inflight_ids)
 
     try:
-        processed_payload = await webhook_sender.send(payload, endpoint=endpoint)
+        processed_payload = await _resolve_processed_payload(
+            webhook_sender, config, payload, endpoint
+        )
 
-        if not processed_payload:
-            await queue_manager.enqueue_failed(payload, "Webhook delivery failed")
+        if not processed_payload or not processed_payload.get("destinations"):
+            reason = "Processing failed — no destinations"
+            await queue_manager.enqueue_failed(payload, reason)
+            await send_alert(
+                alert_token, alert_chat_id,
+                f"🔴 <b>Forward failed</b>\nMessage: {message_id}\nReason: {reason}",
+                alert_key=f"proc-fail-{message_id}",
+            )
             return "failed"
 
         status = await forward_message_pipeline(
-            sender,
-            payload,
-            processed_payload,
-            db_path,
-            dedup=dedup,
-            pyrogram_app=pyrogram_app,
-            relay_chat_id=relay_chat_id,
+            sender, payload, processed_payload, db_path,
+            dedup=dedup, pyrogram_app=pyrogram_app, relay=relay,
         )
 
         if status == "success":
@@ -491,7 +517,15 @@ async def process_payload(
         elif status == "defer":
             await queue_manager.enqueue_deferred(payload, "Reply parent not ready yet")
         else:
-            await queue_manager.enqueue_failed(payload, "Telegram forwarding failed")
+            reason = "Telegram forwarding failed"
+            result = await queue_manager.enqueue_failed(payload, reason)
+            await send_alert(
+                alert_token, alert_chat_id,
+                f"🔴 <b>Forward failed</b>\nMessage: {message_id}\nType: {payload.get('type')}\n"
+                f"Reason: {reason}"
+                + ("\n⚠️ Moved to dead letter queue" if result == "dead_letter" else ""),
+                alert_key=f"fwd-fail-{message_id}",
+            )
 
         return status
     finally:
@@ -505,46 +539,50 @@ async def retry_payload(
     webhook_sender,
     payload: Dict[str, Any],
     db_path: str,
+    config,
     dedup=None,
     pyrogram_app: Optional[Client] = None,
-    relay_chat_id: Optional[int] = None,
+    relay: Optional[RelayConfig] = None,
+    alert_token: str = "",
+    alert_chat_id: int = 0,
 ) -> ForwardStatus:
-    """Retry webhook + forward without re-enqueueing to the pending queue."""
+    """Retry processing + forward without re-enqueueing to the pending queue."""
     endpoint = "album" if payload.get("type") == "album" else "message"
     chat_id = payload.get("chat_id", 0)
     inflight_ids = _payload_inflight_ids(payload)
     status: ForwardStatus = "failed"
+    message_id = payload.get("message_id", payload.get("media_group_id", "?"))
 
     if dedup and inflight_ids:
         await dedup.mark_inflight(chat_id, inflight_ids)
 
     try:
-        processed_payload = await webhook_sender.send(payload, endpoint=endpoint)
+        processed_payload = await _resolve_processed_payload(
+            webhook_sender, config, payload, endpoint
+        )
 
-        if not processed_payload:
-            await queue_manager.enqueue_failed(payload, "Retry webhook failed")
+        if not processed_payload or not processed_payload.get("destinations"):
+            await queue_manager.enqueue_failed(payload, "Retry processing failed")
             return "failed"
 
         status = await forward_message_pipeline(
-            sender,
-            payload,
-            processed_payload,
-            db_path,
-            dedup=dedup,
-            pyrogram_app=pyrogram_app,
-            relay_chat_id=relay_chat_id,
+            sender, payload, processed_payload, db_path,
+            dedup=dedup, pyrogram_app=pyrogram_app, relay=relay,
         )
 
         if status == "success":
             await queue_manager.remove_from_queue(payload)
-            logger.info(
-                f"Retry succeeded for "
-                f"{payload.get('message_id', payload.get('media_group_id'))}"
-            )
+            logger.info(f"Retry succeeded for {message_id}")
         elif status == "defer":
             await queue_manager.enqueue_deferred(payload, "Reply parent not ready yet (retry)")
         else:
-            await queue_manager.enqueue_failed(payload, "Retry telegram forwarding failed")
+            result = await queue_manager.enqueue_failed(payload, "Retry telegram forwarding failed")
+            await send_alert(
+                alert_token, alert_chat_id,
+                f"🔴 <b>Retry failed</b>\nMessage: {message_id}"
+                + ("\n⚠️ Moved to dead letter queue" if result == "dead_letter" else ""),
+                alert_key=f"retry-fail-{message_id}",
+            )
 
         return status
     finally:
@@ -561,8 +599,11 @@ async def message_worker(
     webhook_sender,
     sender: TelegramBotSender,
     db_path: str,
+    config,
     pyrogram_app: Optional[Client] = None,
-    relay_chat_id: Optional[int] = None,
+    relay: Optional[RelayConfig] = None,
+    alert_token: str = "",
+    alert_chat_id: int = 0,
     delay_min: float = 0.5,
     delay_max: float = 1.5,
 ):
@@ -590,14 +631,10 @@ async def message_worker(
                 flush_result = await album_buffer.add(payload)
                 if flush_result:
                     await process_payload(
-                        sender,
-                        queue_manager,
-                        webhook_sender,
-                        flush_result,
-                        db_path,
-                        dedup=dedup,
-                        pyrogram_app=pyrogram_app,
-                        relay_chat_id=relay_chat_id,
+                        sender, queue_manager, webhook_sender, flush_result,
+                        db_path, config, dedup=dedup,
+                        pyrogram_app=pyrogram_app, relay=relay,
+                        alert_token=alert_token, alert_chat_id=alert_chat_id,
                     )
                 logger.debug(
                     f"Worker-{worker_id}: buffered album item {message_id} "
@@ -605,14 +642,10 @@ async def message_worker(
                 )
             else:
                 status = await process_payload(
-                    sender,
-                    queue_manager,
-                    webhook_sender,
-                    payload,
-                    db_path,
-                    dedup=dedup,
-                    pyrogram_app=pyrogram_app,
-                    relay_chat_id=relay_chat_id,
+                    sender, queue_manager, webhook_sender, payload,
+                    db_path, config, dedup=dedup,
+                    pyrogram_app=pyrogram_app, relay=relay,
+                    alert_token=alert_token, alert_chat_id=alert_chat_id,
                 )
                 if status == "success":
                     logger.info(

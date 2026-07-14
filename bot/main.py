@@ -50,7 +50,7 @@ from queue_manager import QueueManager
 from deduplication import Deduplication
 from webhook import WebhookSender
 from health import HealthMonitor
-from media_relay import ensure_relay_chat
+from media_relay import RelayConfig, ensure_relay_chat, resolve_relay_config
 from telegram_sender import TelegramBotSender, TelegramFloodWait
 
 logger = logging.getLogger(__name__)
@@ -69,10 +69,13 @@ class WorkerContext:
     dedup: Deduplication
     album_buf: AlbumBuffer
     pyrogram_app: Client
-    relay_chat_id: int
+    relay: RelayConfig
+    config: object
     db_path: str
     delay_min: float
     delay_max: float
+    alert_token: str
+    alert_chat_id: int
 
 
 async def supervised_task(name: str, coro_factory, restart_delay: float = 5.0):
@@ -156,8 +159,11 @@ def make_worker_factory(worker_id: int, queue: asyncio.Queue, ctx: WorkerContext
             webhook_sender=ctx.webhook,
             sender=ctx.sender,
             db_path=ctx.db_path,
+            config=ctx.config,
             pyrogram_app=ctx.pyrogram_app,
-            relay_chat_id=ctx.relay_chat_id,
+            relay=ctx.relay,
+            alert_token=ctx.alert_token,
+            alert_chat_id=ctx.alert_chat_id,
             delay_min=ctx.delay_min,
             delay_max=ctx.delay_max,
         )
@@ -171,8 +177,9 @@ def make_album_flush_factory(ctx: WorkerContext):
                 for album_payload in await ctx.album_buf.check_and_flush_expired():
                     await process_payload(
                         ctx.sender, ctx.queue_mgr, ctx.webhook, album_payload,
-                        ctx.db_path, dedup=ctx.dedup,
-                        pyrogram_app=ctx.pyrogram_app, relay_chat_id=ctx.relay_chat_id,
+                        ctx.db_path, ctx.config, dedup=ctx.dedup,
+                        pyrogram_app=ctx.pyrogram_app, relay=ctx.relay,
+                        alert_token=ctx.alert_token, alert_chat_id=ctx.alert_chat_id,
                     )
             except Exception as e:
                 logger.error(f"Album flush error: {e}", exc_info=True)
@@ -188,8 +195,9 @@ def make_retry_factory(ctx: WorkerContext):
                 if payload:
                     await retry_payload(
                         ctx.sender, ctx.queue_mgr, ctx.webhook, payload,
-                        ctx.db_path, dedup=ctx.dedup,
-                        pyrogram_app=ctx.pyrogram_app, relay_chat_id=ctx.relay_chat_id,
+                        ctx.db_path, ctx.config, dedup=ctx.dedup,
+                        pyrogram_app=ctx.pyrogram_app, relay=ctx.relay,
+                        alert_token=ctx.alert_token, alert_chat_id=ctx.alert_chat_id,
                     )
                     await asyncio.sleep(1)
                     continue
@@ -198,8 +206,9 @@ def make_retry_factory(ctx: WorkerContext):
                 if payload:
                     await retry_payload(
                         ctx.sender, ctx.queue_mgr, ctx.webhook, payload,
-                        ctx.db_path, dedup=ctx.dedup,
-                        pyrogram_app=ctx.pyrogram_app, relay_chat_id=ctx.relay_chat_id,
+                        ctx.db_path, ctx.config, dedup=ctx.dedup,
+                        pyrogram_app=ctx.pyrogram_app, relay=ctx.relay,
+                        alert_token=ctx.alert_token, alert_chat_id=ctx.alert_chat_id,
                     )
                 else:
                     await asyncio.sleep(60)
@@ -282,8 +291,6 @@ async def main():
     await app.start()
 
     me = await app.get_me()
-    relay_chat_id = settings.relay_chat_id or me.id
-    settings.relay_chat_id = relay_chat_id
     logger.info(f"Pyrogram connected as {me.first_name} (id={me.id})")
 
     try:
@@ -292,13 +299,18 @@ async def main():
     except Exception as e:
         logger.error(f"Sender bot verification failed: {e}")
 
+    relay = await resolve_relay_config(
+        app, sender, me.id,
+        override_bot_from_chat=settings.relay_chat_id or 0,
+    )
+
     try:
         source_chat = await app.get_chat(settings.source_chat_id)
         logger.info(f"Source channel: '{source_chat.title}'")
     except Exception as e:
         logger.error(f"Cannot access source channel {settings.source_chat_id}: {e}")
 
-    relay_ok = await ensure_relay_chat(app, sender, relay_chat_id)
+    relay_ok = await ensure_relay_chat(app, sender, relay)
     if not relay_ok:
         logger.warning("Media forwarding disabled until relay chat is accessible (text still works)")
 
@@ -321,10 +333,13 @@ async def main():
         dedup=dedup,
         album_buf=album_buf,
         pyrogram_app=app,
-        relay_chat_id=relay_chat_id,
+        relay=relay,
+        config=config,
         db_path=settings.db_path,
         delay_min=settings.worker_delay_min,
         delay_max=settings.worker_delay_max,
+        alert_token=settings.alert_bot_token,
+        alert_chat_id=settings.alert_chat_id,
     )
 
     logger.info("Startup complete — launching workers")
@@ -333,8 +348,9 @@ async def main():
         try:
             await process_payload(
                 ctx.sender, ctx.queue_mgr, ctx.webhook, album_payload,
-                ctx.db_path, dedup=ctx.dedup,
-                pyrogram_app=ctx.pyrogram_app, relay_chat_id=ctx.relay_chat_id,
+                ctx.db_path, ctx.config, dedup=ctx.dedup,
+                pyrogram_app=ctx.pyrogram_app, relay=ctx.relay,
+                alert_token=ctx.alert_token, alert_chat_id=ctx.alert_chat_id,
             )
         except Exception as e:
             logger.error(f"Failed to process recovered album: {e}", exc_info=True)
