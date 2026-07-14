@@ -54,6 +54,7 @@ def normalize_message(message: Message) -> Optional[Dict[str, Any]]:
         "caption_entities": caption_entities,
         "media_group_id": message.media_group_id,
         "has_media": msg_type != "text",
+        "reply_to_message_id": message.reply_to_message_id if message.reply_to_message_id else None,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 

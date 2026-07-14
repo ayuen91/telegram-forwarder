@@ -98,7 +98,7 @@
     },
     {
       "parameters": {
-        "functionCode": "// Route to destinations (Media)\nconst destinations = $json.destinations || [];\nconst results = [];\nfor (const dest of destinations) {\n  results.push({\n    json: {\n      ...$json,\n      destination_chat_id: dest.chat_id,\n      destination_name: dest.name,\n    }\n  });\n}\nif (results.length === 0) {\n  throw new Error('No destinations found in payload');\n}\nreturn results;"
+        "functionCode": "// Route to destinations (Media) — build flat fields, omit optional params if absent\nconst destinations = $json.destinations || [];\nconst results = [];\nfor (const dest of destinations) {\n  const item = {\n    _bot_token: $json._bot_token,\n    copy_chat_id: dest.chat_id,\n    copy_from_chat_id: $json.chat_id,\n    copy_message_id: $json.message_id,\n    copy_caption: ($json.processed_caption || $json.caption || '').trim(),\n    copy_reply_to: $json.reply_to_message_id || null,\n  };\n  results.push({ json: item });\n}\nif (results.length === 0) {\n  throw new Error('No destinations found in payload');\n}\nreturn results;"
       },
       "id": "destination-router-media",
       "name": "Route to Destinations (Media)",
@@ -133,10 +133,11 @@
         "sendBody": true,
         "bodyParameters": {
           "parameters": [
-            { "name": "chat_id", "value": "={{ $json.destination_chat_id }}" },
-            { "name": "from_chat_id", "value": "={{ $json.chat_id }}" },
-            { "name": "message_id", "value": "={{ $json.message_id }}" },
-            { "name": "caption", "value": "={{ $json.processed_caption || $json.caption || '' }}" }
+            { "name": "chat_id", "value": "={{ $json.copy_chat_id }}" },
+            { "name": "from_chat_id", "value": "={{ $json.copy_from_chat_id }}" },
+            { "name": "message_id", "value": "={{ $json.copy_message_id }}" },
+            { "name": "caption", "value": "={{ $json.copy_caption }}", "skip": "={{ !$json.copy_caption }}" },
+            { "name": "reply_to_message_id", "value": "={{ $json.copy_reply_to }}", "skip": "={{ !$json.copy_reply_to }}" }
           ]
         },
         "options": {}
@@ -163,7 +164,7 @@
     },
     {
       "parameters": {
-        "functionCode": "// Album Handler — route each item to each destination\nconst destinations = $json.destinations || [];\nconst items = $json.items || [];\nconst botToken = $json._bot_token || '';\nconst results = [];\nfor (const dest of destinations) {\n  for (const item of items) {\n    results.push({\n      json: {\n        chat_id: item.chat_id,\n        message_id: item.message_id,\n        destination_chat_id: dest.chat_id,\n        destination_name: dest.name,\n        caption: item.processed_caption || item.caption || '',\n        media_group_id: $json.media_group_id,\n        _bot_token: botToken,\n      }\n    });\n  }\n}\nif (results.length === 0) {\n  throw new Error('No destinations or items found');\n}\nreturn results;"
+        "functionCode": "// Album Handler — route each item to each destination\nconst destinations = $json.destinations || [];\nconst items = $json.items || [];\nconst botToken = $json._bot_token || '';\nconst results = [];\nfor (const dest of destinations) {\n  for (const item of items) {\n    results.push({\n      json: {\n        _bot_token: botToken,\n        copy_chat_id: dest.chat_id,\n        copy_from_chat_id: item.chat_id,\n        copy_message_id: item.message_id,\n        copy_caption: (item.processed_caption || item.caption || '').trim(),\n        copy_reply_to: null,\n        media_group_id: $json.media_group_id,\n      }\n    });\n  }\n}\nif (results.length === 0) {\n  throw new Error('No destinations or items found');\n}\nreturn results;"
       },
       "id": "album-router",
       "name": "Album: Route Items",
@@ -177,10 +178,10 @@
         "sendBody": true,
         "bodyParameters": {
           "parameters": [
-            { "name": "chat_id", "value": "={{ $json.destination_chat_id }}" },
-            { "name": "from_chat_id", "value": "={{ $json.chat_id }}" },
-            { "name": "message_id", "value": "={{ $json.message_id }}" },
-            { "name": "caption", "value": "={{ $json.caption }}" }
+            { "name": "chat_id", "value": "={{ $json.copy_chat_id }}" },
+            { "name": "from_chat_id", "value": "={{ $json.copy_from_chat_id }}" },
+            { "name": "message_id", "value": "={{ $json.copy_message_id }}" },
+            { "name": "caption", "value": "={{ $json.copy_caption }}", "skip": "={{ !$json.copy_caption }}" }
           ]
         },
         "options": {}
