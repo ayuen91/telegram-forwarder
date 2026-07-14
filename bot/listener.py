@@ -265,6 +265,7 @@ async def forward_message_pipeline(
         try:
             relay_message_ids = await relay_to_bot(
                 pyrogram_app,
+                sender,
                 source_chat_id,
                 source_ids_for_relay,
                 relay,

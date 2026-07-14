@@ -39,6 +39,7 @@ class TelegramBotSender:
             total=read_timeout + connect_timeout,
         )
         self._session: Optional[aiohttp.ClientSession] = None
+        self._update_offset: int = 0
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -107,6 +108,57 @@ class TelegramBotSender:
     async def get_chat(self, chat_id: Union[int, str]) -> Dict[str, Any]:
         return await self._call("getChat", {"chat_id": chat_id})
 
+    async def _consume_updates(self) -> List[Dict[str, Any]]:
+        """Fetch pending Bot API updates (sender bot must not use a webhook)."""
+        params: Dict[str, Any] = {
+            "timeout": 0,
+            "allowed_updates": ["message"],
+            "limit": 100,
+        }
+        if self._update_offset:
+            params["offset"] = self._update_offset
+
+        updates = await self._call("getUpdates", params)
+        if updates:
+            self._update_offset = updates[-1]["update_id"] + 1
+        return updates
+
+    async def resolve_relay_message_ids(
+        self,
+        user_id: int,
+        count: int = 1,
+        wait_seconds: float = 1.0,
+    ) -> List[int]:
+        """
+        After userbot posts media to the bot DM, resolve message id(s) the Bot API can copy.
+
+        Pyrogram message ids in a user→bot DM do not always match Bot API ids.
+        """
+        await asyncio.sleep(wait_seconds)
+
+        for attempt in range(6):
+            updates = await self._consume_updates()
+            matched: List[int] = []
+            for upd in updates:
+                msg = upd.get("message")
+                if not msg:
+                    continue
+                chat = msg.get("chat") or {}
+                from_user = msg.get("from") or {}
+                if chat.get("id") == user_id and from_user.get("id") == user_id:
+                    matched.append(int(msg["message_id"]))
+
+            matched.sort()
+            if len(matched) >= count:
+                return matched[-count:]
+
+            await asyncio.sleep(0.5 * (attempt + 1))
+
+        raise RuntimeError(
+            f"Bot API did not receive relay message from user {user_id} "
+            f"(needed {count} id(s))"
+        )
+
     async def copy_message(
         self,
         chat_id: Union[int, str],
@@ -127,8 +179,24 @@ class TelegramBotSender:
         if reply_params:
             payload["reply_parameters"] = reply_params
 
-        result = await self._call("copyMessage", payload)
-        return int(result["message_id"])
+        last_error = None
+        for attempt in range(4):
+            try:
+                result = await self._call("copyMessage", payload)
+                return int(result["message_id"])
+            except RuntimeError as e:
+                last_error = e
+                if "message to copy not found" in str(e).lower() and attempt < 3:
+                    wait = 1.0 * (attempt + 1)
+                    logger.warning(
+                        f"copyMessage not found (from={from_chat_id}, id={message_id}), "
+                        f"retry in {wait}s"
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+                raise
+
+        raise last_error  # pragma: no cover
 
     async def copy_messages(
         self,

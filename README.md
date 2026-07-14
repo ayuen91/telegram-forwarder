@@ -80,7 +80,7 @@ This installs Docker, enables it on boot, sets up firewall, creates a service us
 | `API_HASH` | ✅ | Telegram API hash |
 | `PHONE_NUMBER` | ✅ | Phone number for user account |
 | `BOT_TOKEN` | ✅ | Sender bot token |
-| `RELAY_CHAT_ID` | ❌ | Chat where userbot relays media for the bot (default: user account ID) |
+| `RELAY_CHANNEL_ID` | ❌ | **Recommended.** Private channel for media relay — userbot + sender bot both admin |
 | `ALERT_BOT_TOKEN` | ✅ | Alert bot token (separate from sender) |
 | `ALERT_CHAT_ID` | ✅ | Your personal chat ID for alerts |
 | `WEBHOOK_SECRET` | ✅ | HMAC secret (generate a random 64-char string) |
@@ -209,7 +209,7 @@ telegram-forwarder/
 | Messages in failed queue | `redis-cli LLEN queue:failed` — retry worker handles automatically |
 | Messages in dead letter | Alerts only — does **not** block the listener. Inspect: `docker compose exec redis redis-cli LRANGE queue:dead_letter 0 -1`. Clear after review: `docker compose exec redis redis-cli DEL queue:dead_letter` |
 | Listener not receiving | Check logs for `Workers running` — if missing, startup was blocked by a **critical** check (pyrogram/redis/sender bot/sqlite). Dead letter warnings are safe to ignore at startup |
-| Media not forwarding | Relay chat not open — bot logs `Opening relay chat — userbot sending /start`. If that fails, send `/start` to the sender bot manually from the user account |
+| Media not forwarding | Set `RELAY_CHANNEL_ID` to a private channel (both userbot + sender bot as admins). Without it, DM relay is used — ensure `/start` was sent to the sender bot |
 | No alerts received | Verify `ALERT_BOT_TOKEN` and `ALERT_CHAT_ID` in `.env` |
 | n8n not processing | Check n8n workflow is **activated** |
 | FloodWait errors | Increase `WORKER_DELAY_MIN`/`WORKER_DELAY_MAX` in `.env` |

@@ -300,8 +300,7 @@ async def main():
         logger.error(f"Sender bot verification failed: {e}")
 
     relay = await resolve_relay_config(
-        app, sender, me.id,
-        override_bot_from_chat=settings.relay_chat_id or 0,
+        sender, me.id, relay_channel_id=settings.relay_channel_id,
     )
 
     try:

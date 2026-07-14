@@ -159,13 +159,23 @@ class WebhookSender:
 
     async def is_reachable(self) -> bool:
         """
-        Check if n8n webhook endpoint is reachable (HEAD request).
-        Used by health checks.
+        Check if n8n is up. Webhook URLs only accept POST, so probe /healthz instead.
         """
         try:
             session = await self._get_session()
-            async with session.head(self.message_url) as resp:
-                # n8n may return 404 for HEAD on webhook, but connection works
+            # e.g. http://n8n:5678/webhook/message → http://n8n:5678/healthz
+            base = self.message_url.split("/webhook", 1)[0]
+            health_url = f"{base}/healthz"
+            async with session.get(health_url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status == 200:
+                    return True
+        except Exception:
+            pass
+
+        # Fallback: TCP reachability to n8n host (webhook may return 404/405 on GET)
+        try:
+            session = await self._get_session()
+            async with session.get(self.message_url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
                 return resp.status < 500
         except Exception:
             return False

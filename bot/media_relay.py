@@ -1,15 +1,16 @@
 """
 Userbot media relay — copy messages from source to a bot-accessible chat.
 
-The sender bot only needs access to destination channels. Media is copied
-server-side by the Pyrogram user account into a private relay chat (default:
-the user's DM with the bot), then the bot uses copyMessage from that relay.
+Preferred: private relay channel (RELAY_CHANNEL_ID) where userbot posts and
+the sender bot copies — message IDs match Bot API reliably.
+
+Fallback: userbot DM with sender bot + Bot API getUpdates to resolve message IDs.
 """
 
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import List, Optional, TYPE_CHECKING, Union
+from typing import List, Optional, TYPE_CHECKING
 
 from pyrogram import Client
 from pyrogram.errors import FloodWait
@@ -22,29 +23,36 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class RelayConfig:
-    """
-    Two chat IDs for the media relay hop.
-
-    userbot_target: where the Pyrogram user copies media (the bot's DM).
-    bot_from_chat:  Bot API from_chat_id (the user's ID in that private chat).
-    """
+    """Relay target shared by userbot (post) and sender bot (copyMessage source)."""
 
     userbot_target: int
     bot_from_chat: int
+    mode: str = "channel"  # "channel" or "dm"
 
 
 async def resolve_relay_config(
-    app: Client,
     sender: "TelegramBotSender",
     user_id: int,
-    override_userbot_target: int = 0,
-    override_bot_from_chat: int = 0,
+    relay_channel_id: int = 0,
 ) -> RelayConfig:
-    """Build relay config from bot + user ids."""
+    """
+    Build relay config.
+
+    Channel mode (recommended): userbot + bot both access the same channel.
+    DM mode: userbot posts to bot; Bot API message ids resolved via getUpdates.
+    """
+    if relay_channel_id:
+        return RelayConfig(
+            userbot_target=relay_channel_id,
+            bot_from_chat=relay_channel_id,
+            mode="channel",
+        )
+
     bot_me = await sender.get_me()
     return RelayConfig(
-        userbot_target=override_userbot_target or bot_me["id"],
-        bot_from_chat=override_bot_from_chat or user_id,
+        userbot_target=bot_me["id"],
+        bot_from_chat=user_id,
+        mode="dm",
     )
 
 
@@ -53,15 +61,21 @@ async def ensure_relay_chat(
     sender: "TelegramBotSender",
     relay: RelayConfig,
 ) -> bool:
-    """
-    Ensure the sender bot can access the relay chat.
+    """Verify relay is accessible; for DM mode auto-send /start to open bot chat."""
+    if relay.mode == "channel":
+        if await sender.verify_bot_access(relay.bot_from_chat):
+            logger.info(f"Relay channel ready (chat_id={relay.bot_from_chat})")
+            return True
+        logger.error(
+            f"Sender bot cannot access relay channel {relay.bot_from_chat}. "
+            "Add the bot as admin to the relay channel."
+        )
+        return False
 
-    Opens the private chat automatically by sending /start from the userbot.
-    """
     if await sender.verify_bot_access(relay.bot_from_chat):
         logger.info(
-            f"Relay chat ready (userbot→{relay.userbot_target}, "
-            f"bot copies from {relay.bot_from_chat})"
+            f"Relay DM ready (userbot→{relay.userbot_target}, "
+            f"bot copies from user {relay.bot_from_chat})"
         )
         return True
 
@@ -77,12 +91,12 @@ async def ensure_relay_chat(
         await asyncio.sleep(2)
 
         if await sender.verify_bot_access(relay.bot_from_chat):
-            logger.info(f"Relay chat opened via /start (bot_from_chat={relay.bot_from_chat})")
+            logger.info(f"Relay DM opened via /start (user={relay.bot_from_chat})")
             return True
 
         logger.error(
-            f"Relay chat still inaccessible (bot_from_chat={relay.bot_from_chat}). "
-            "Send /start to the sender bot from the user account manually."
+            f"Relay DM still inaccessible (user={relay.bot_from_chat}). "
+            "Send /start to the sender bot manually."
         )
     except Exception as e:
         logger.error(f"Failed to auto-open relay chat: {e}", exc_info=True)
@@ -92,15 +106,14 @@ async def ensure_relay_chat(
 
 async def relay_to_bot(
     app: Client,
+    sender: "TelegramBotSender",
     source_chat_id: int,
     message_ids: List[int],
     relay: RelayConfig,
     is_album: bool = False,
 ) -> List[int]:
     """
-    Copy message(s) from the source channel into the bot DM via userbot.
-
-    Returns message ids in the bot DM (for Bot API copyMessage).
+    Copy message(s) from source into relay, return Bot-API-compatible message ids.
     """
     if not message_ids:
         return []
@@ -114,25 +127,33 @@ async def relay_to_bot(
                 from_chat_id=source_chat_id,
                 message_id=message_ids[0],
             )
-            relay_ids = [msg.id for msg in copied]
+            pyrogram_ids = [msg.id for msg in copied]
             logger.info(
-                f"Relayed album ({len(relay_ids)} items) "
-                f"source={source_chat_id} → bot DM {target}"
+                f"Relayed album ({len(pyrogram_ids)} items) "
+                f"source={source_chat_id} → {relay.mode} {target}"
             )
-            return relay_ids
+        else:
+            copied = await app.copy_message(
+                chat_id=target,
+                from_chat_id=source_chat_id,
+                message_id=message_ids[0],
+            )
+            pyrogram_ids = [copied.id]
+            logger.info(
+                f"Relayed message {message_ids[0]} "
+                f"source={source_chat_id} → {relay.mode} {target} (pyrogram id={copied.id})"
+            )
 
-        copied = await app.copy_message(
-            chat_id=target,
-            from_chat_id=source_chat_id,
-            message_id=message_ids[0],
-        )
-        logger.info(
-            f"Relayed message {message_ids[0]} "
-            f"source={source_chat_id} → bot DM {target} (id={copied.id})"
-        )
-        return [copied.id]
+        if relay.mode == "channel":
+            return pyrogram_ids
 
-    except FloodWait as e:
+        bot_ids = await sender.resolve_relay_message_ids(
+            relay.bot_from_chat, count=len(pyrogram_ids)
+        )
+        logger.info(f"Resolved Bot API relay ids: {bot_ids} (pyrogram {pyrogram_ids})")
+        return bot_ids
+
+    except FloodWait:
         raise
     except Exception as e:
         logger.error(
@@ -147,7 +168,7 @@ async def cleanup_relay(
     relay: RelayConfig,
     relay_message_ids: List[int],
 ):
-    """Delete relay messages from bot DM after successful delivery."""
+    """Delete relay messages after successful delivery (best-effort)."""
     if not app or not relay_message_ids:
         return
     try:
