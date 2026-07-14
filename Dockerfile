@@ -2,10 +2,11 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install system dependencies (sqlite3 for backup; gcc for tgcrypto C extension)
+# Install system dependencies (sqlite3 for backup; gcc and libc-dev for tgcrypto C extension)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     sqlite3 \
     gcc \
+    libc6-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
