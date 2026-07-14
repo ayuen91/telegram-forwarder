@@ -134,12 +134,22 @@ async def forward_message_pipeline(client, payload, processed_payload, db_path):
         logger.warning("No destinations specified in processed payload")
         return True
 
+    # Safely convert incoming IDs to integers if they are numerical
+    def to_int_or_str(val):
+        if val is None:
+            return None
+        try:
+            return int(val)
+        except (ValueError, TypeError):
+            return val
+
+    source_chat_id = to_int_or_str(payload.get("chat_id"))
+    telegram_id = to_int_or_str(payload.get("message_id") or payload.get("media_group_id"))
+    source_reply_id = to_int_or_str(payload.get("reply_to_message_id"))
+
     # 1. Insert/Update the source message in SQLite
     async with aiosqlite.connect(db_path) as db:
         db.row_factory = aiosqlite.Row
-        
-        telegram_id = payload.get("message_id") or payload.get("media_group_id")
-        source_chat_id = payload.get("chat_id")
         
         # Insert parent message tracker
         await db.execute(
@@ -183,14 +193,13 @@ async def forward_message_pipeline(client, payload, processed_payload, db_path):
 
         # 2. Forward to all destinations
         for dest in destinations:
-            dest_chat_id = dest["chat_id"]
+            dest_chat_id = to_int_or_str(dest["chat_id"])
             sent_msg_id = None
             error_msg = None
             
             try:
                 # Check reply mapping
                 reply_to_id = None
-                source_reply_id = payload.get("reply_to_message_id")
                 if source_reply_id:
                     cursor = await db.execute(
                         """
@@ -204,13 +213,13 @@ async def forward_message_pipeline(client, payload, processed_payload, db_path):
                     )
                     reply_row = await cursor.fetchone()
                     if reply_row:
-                        reply_to_id = reply_row["sent_message_id"]
+                        reply_to_id = to_int_or_str(reply_row["sent_message_id"])
                         logger.info(f"Mapping reply: source_reply_id={source_reply_id} -> destination_reply_id={reply_to_id}")
 
                 # Perform the forward using Pyrogram Client
                 if msg_type == "album":
                     items = processed_payload.get("items", [])
-                    sorted_items = sorted(items, key=lambda x: x.get("message_id", 0))
+                    sorted_items = sorted(items, key=lambda x: to_int_or_str(x.get("message_id", 0)))
                     
                     # Extract captions in the correct order
                     captions = []
@@ -218,7 +227,7 @@ async def forward_message_pipeline(client, payload, processed_payload, db_path):
                         caption = item.get("processed_caption") or item.get("caption") or ""
                         captions.append(caption)
                         
-                    anchor_msg_id = sorted_items[0]["message_id"]
+                    anchor_msg_id = to_int_or_str(sorted_items[0]["message_id"])
                     
                     sent_messages = await client.copy_media_group(
                         chat_id=dest_chat_id,
@@ -228,9 +237,10 @@ async def forward_message_pipeline(client, payload, processed_payload, db_path):
                         reply_to_message_id=reply_to_id
                     )
                     if sent_messages:
-                        sent_msg_id = sent_messages[0].id
+                        sent_msg_id = to_int_or_str(sent_messages[0].id)
                 else:
                     # Single message
+                    msg_id = to_int_or_str(payload.get("message_id"))
                     if msg_type == "text":
                         text_changed = processed_payload.get("text_changed", False)
                         text_to_send = processed_payload.get("processed_text") or payload.get("text")
@@ -245,7 +255,7 @@ async def forward_message_pipeline(client, payload, processed_payload, db_path):
                             sent_msg = await client.copy_message(
                                 chat_id=dest_chat_id,
                                 from_chat_id=source_chat_id,
-                                message_id=payload.get("message_id"),
+                                message_id=msg_id,
                                 reply_to_message_id=reply_to_id
                             )
                     else:
@@ -257,7 +267,7 @@ async def forward_message_pipeline(client, payload, processed_payload, db_path):
                             sent_msg = await client.copy_message(
                                 chat_id=dest_chat_id,
                                 from_chat_id=source_chat_id,
-                                message_id=payload.get("message_id"),
+                                message_id=msg_id,
                                 caption=caption_to_send,
                                 reply_to_message_id=reply_to_id
                             )
@@ -265,10 +275,10 @@ async def forward_message_pipeline(client, payload, processed_payload, db_path):
                             sent_msg = await client.copy_message(
                                 chat_id=dest_chat_id,
                                 from_chat_id=source_chat_id,
-                                message_id=payload.get("message_id"),
+                                message_id=msg_id,
                                 reply_to_message_id=reply_to_id
                             )
-                    sent_msg_id = sent_msg.id
+                    sent_msg_id = to_int_or_str(sent_msg.id)
                 
                 # Log success to message_destinations
                 await db.execute(
