@@ -20,6 +20,18 @@ import signal
 import sys
 from pathlib import Path
 
+# Monkey patch Pyrogram to support 64-bit channel IDs (like -1002...)
+from pyrogram import utils
+def get_peer_type_new(peer_id: int) -> str:
+    peer_id_str = str(peer_id)
+    if not peer_id_str.startswith("-"):
+        return "user"
+    elif peer_id_str.startswith("-100"):
+        return "channel"
+    else:
+        return "chat"
+utils.get_peer_type = get_peer_type_new
+
 import aiosqlite
 import redis.asyncio as aioredis
 from pyrogram import Client
