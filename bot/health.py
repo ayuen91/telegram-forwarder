@@ -138,22 +138,34 @@ class HealthMonitor:
 
     async def startup_self_test(self) -> bool:
         """
-        Run health checks and return True if all pass.
-        Used by main.py to block listener startup until ready.
+        Run health checks; only critical failures block startup.
+
+        Operational issues (dead letter queue, failed retries, queue depth)
+        are logged and alerted later — they must not stop the listener.
         """
         results = await self.run_all_checks()
-        all_passed = all(r.passed for r in results)
+        critical_failures = [r for r in results if not r.passed and r.level == "critical"]
+        warnings = [r for r in results if not r.passed and r.level != "critical"]
 
-        if not all_passed:
-            failed = [r for r in results if not r.passed]
+        for result in warnings:
+            logger.warning(f"Startup warning (non-blocking): {result.name}: {result.message}")
+
+        if critical_failures:
             logger.warning(
-                f"Startup self-test: {len(failed)} checks failed: "
-                f"{', '.join(f'{r.name}: {r.message}' for r in failed)}"
+                f"Startup self-test: {len(critical_failures)} critical checks failed: "
+                f"{', '.join(f'{r.name}: {r.message}' for r in critical_failures)}"
+            )
+            return False
+
+        if warnings:
+            logger.info(
+                f"Startup self-test: critical checks passed "
+                f"({len(warnings)} non-blocking warning(s))"
             )
         else:
             logger.info("Startup self-test: all checks passed ✓")
 
-        return all_passed
+        return True
 
     # ── Individual health checks ──────────────────────────────────────
 
@@ -292,10 +304,10 @@ class HealthMonitor:
 
             async with aiosqlite.connect(self.db_path) as db:
                 await db.execute("SELECT 1")
-            return HealthCheckResult(name="sqlite", passed=True, level="high")
+            return HealthCheckResult(name="sqlite", passed=True, level="critical")
         except Exception as e:
             return HealthCheckResult(
-                name="sqlite", passed=False, level="high", message=str(e)
+                name="sqlite", passed=False, level="critical", message=str(e)
             )
 
     def _check_disk_space(self) -> HealthCheckResult:

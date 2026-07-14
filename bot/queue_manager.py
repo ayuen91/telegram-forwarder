@@ -167,3 +167,11 @@ class QueueManager:
             "deferred": await self.redis.llen(self.QUEUE_DEFERRED),
             "dead_letter": await self.redis.llen(self.QUEUE_DEAD_LETTER),
         }
+
+    async def clear_dead_letter(self) -> int:
+        """Remove all dead-letter entries (manual recovery). Returns count cleared."""
+        count = await self.redis.llen(self.QUEUE_DEAD_LETTER)
+        if count:
+            await self.redis.delete(self.QUEUE_DEAD_LETTER)
+            logger.warning(f"Cleared {count} message(s) from dead letter queue")
+        return count

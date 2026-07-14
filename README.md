@@ -207,7 +207,9 @@ telegram-forwarder/
 |---------|-------|
 | Bot not forwarding | `docker compose logs bot --tail 50` |
 | Messages in failed queue | `redis-cli LLEN queue:failed` — retry worker handles automatically |
-| Messages in dead letter | `redis-cli LRANGE queue:dead_letter 0 -1` — manual review needed |
+| Messages in dead letter | Alerts only — does **not** block the listener. Inspect: `docker compose exec redis redis-cli LRANGE queue:dead_letter 0 -1`. Clear after review: `docker compose exec redis redis-cli DEL queue:dead_letter` |
+| Listener not receiving | Check logs for `Workers running` — if missing, startup was blocked by a **critical** check (pyrogram/redis/sender bot/sqlite). Dead letter warnings are safe to ignore at startup |
+| Media not forwarding | Relay chat not open — bot logs `Opening relay chat — userbot sending /start`. If that fails, send `/start` to the sender bot manually from the user account |
 | No alerts received | Verify `ALERT_BOT_TOKEN` and `ALERT_CHAT_ID` in `.env` |
 | n8n not processing | Check n8n workflow is **activated** |
 | FloodWait errors | Increase `WORKER_DELAY_MIN`/`WORKER_DELAY_MAX` in `.env` |
