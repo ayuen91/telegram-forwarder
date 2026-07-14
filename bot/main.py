@@ -279,6 +279,16 @@ async def main():
     await app.start()
     logger.info("Pyrogram client started")
 
+    # Verify source channel access
+    try:
+        source_chat = await app.get_chat(settings.source_chat_id)
+        logger.info(f"✓ Source channel access verified: '{source_chat.title}' (type: {source_chat.type})")
+    except Exception as e:
+        logger.error(
+            f"✗ CRITICAL: Cannot access source channel {settings.source_chat_id}. "
+            f"Please verify that the user account is joined to this channel. Error: {e}"
+        )
+
     # Now run self-test (retries every 30s until all pass)
     retry_count = 0
     while True:

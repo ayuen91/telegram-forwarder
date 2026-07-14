@@ -210,13 +210,14 @@ def register_listener(
     message_queue: asyncio.Queue,
 ):
     """
-    Register the on_message handler on the Pyrogram client.
+    Register the message and channel post handlers on the Pyrogram client.
 
     The handler is intentionally thin — validate, normalize, enqueue.
     No Redis or webhook calls happen here.
     """
 
     @app.on_message(filters.chat(source_chat_id))
+    @app.on_channel_post(filters.chat(source_chat_id))
     async def on_message(client: Client, message: Message):
         """Validate, normalize, enqueue. No heavy work here."""
         payload = normalize_message(message)
