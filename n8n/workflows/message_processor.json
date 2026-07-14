@@ -153,7 +153,7 @@
     {
       "parameters": {
         "respondWith": "json",
-        "responseBody": "={\"status\": \"ok\", \"message_id\": {{ $json.message_id }} }"
+        "responseBody": "{\n  \"status\": \"ok\"\n}"
       },
       "id": "respond-success",
       "name": "Respond Success",
@@ -197,7 +197,7 @@
     {
       "parameters": {
         "respondWith": "json",
-        "responseBody": "={\"status\": \"ok\", \"type\": \"album\", \"media_group_id\": \"{{ $json.media_group_id }}\" }"
+        "responseBody": "{\n  \"status\": \"ok\",\n  \"type\": \"album\"\n}"
       },
       "id": "respond-album-success",
       "name": "Respond Album Success",
