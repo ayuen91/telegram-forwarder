@@ -146,7 +146,6 @@ class AlbumBuffer:
 
             items.sort(key=lambda x: x.get("message_id", 0))
 
-            # Build bundled album payload
             album_payload = {
                 "type": "album",
                 "media_group_id": group_id,
@@ -154,6 +153,7 @@ class AlbumBuffer:
                 "item_count": len(items),
                 "items": items,
                 "timestamp": items[0].get("timestamp"),
+                "reply_to_message_id": items[0].get("reply_to_message_id"),
             }
 
             # Clean up Redis keys
@@ -169,13 +169,15 @@ class AlbumBuffer:
             logger.error(f"Error flushing album {group_id}: {e}", exc_info=True)
             return None
 
-    async def flush_stale_albums(self):
+    async def flush_stale_albums(self) -> List[Dict[str, Any]]:
         """
-        Flush any albums that were left over from a previous bot session.
+        Flush albums left over from a previous bot session.
         Called once at startup to recover from mid-album crashes.
+
+        Returns list of album payloads ready for processing.
         """
         cursor = 0
-        flushed = 0
+        recovered: List[Dict[str, Any]] = []
 
         while True:
             cursor, keys = await self.redis.scan(
@@ -192,14 +194,14 @@ class AlbumBuffer:
                     )
                     result = await self._flush_album(group_id)
                     if result:
-                        flushed += 1
+                        recovered.append(result)
                 except Exception as e:
                     logger.error(f"Error flushing stale album: {e}")
 
             if cursor == 0:
                 break
 
-        if flushed:
-            logger.info(f"Flushed {flushed} stale albums from previous session")
+        if recovered:
+            logger.info(f"Recovered {len(recovered)} stale albums from previous session")
 
-        return flushed
+        return recovered

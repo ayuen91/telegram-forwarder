@@ -44,12 +44,13 @@ from pyrogram.errors import (
 
 from config import config
 from logging_config import setup_logging
-from listener import register_listener, message_worker
+from listener import register_listener, message_worker, process_payload, retry_payload
 from album_buffer import AlbumBuffer
 from queue_manager import QueueManager
 from deduplication import Deduplication
 from webhook import WebhookSender
 from health import HealthMonitor
+from telegram_sender import TelegramBotSender, TelegramFloodWait
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,10 @@ async def supervised_task(name: str, coro_factory, restart_delay: float = 5.0):
         except FloodWait as e:
             wait = e.value + 1
             logger.warning(f"Task '{name}' hit FloodWait({e.value}s), sleeping {wait}s")
+            await asyncio.sleep(wait)
+        except TelegramFloodWait as e:
+            wait = e.retry_after + 1
+            logger.warning(f"Task '{name}' hit Bot API FloodWait({e.retry_after}s), sleeping {wait}s")
             await asyncio.sleep(wait)
         except asyncio.CancelledError:
             logger.info(f"Task '{name}' cancelled — shutting down")
@@ -131,7 +136,7 @@ async def init_database(db_path: str):
 # ── Worker Factories ──────────────────────────────────────────────────
 # These return coroutine factories for supervised_task
 
-def make_worker_factory(worker_id, queue, dedup, album_buf, queue_mgr, webhook, settings, app, db_path):
+def make_worker_factory(worker_id, queue, dedup, album_buf, queue_mgr, webhook, sender, settings, db_path):
     """Create a message worker coroutine factory."""
     async def worker():
         await message_worker(
@@ -141,7 +146,7 @@ def make_worker_factory(worker_id, queue, dedup, album_buf, queue_mgr, webhook, 
             album_buffer=album_buf,
             queue_manager=queue_mgr,
             webhook_sender=webhook,
-            app=app,
+            sender=sender,
             db_path=db_path,
             delay_min=settings.worker_delay_min,
             delay_max=settings.worker_delay_max,
@@ -149,64 +154,44 @@ def make_worker_factory(worker_id, queue, dedup, album_buf, queue_mgr, webhook, 
     return worker
 
 
-def make_album_flush_factory(album_buf, queue_mgr, webhook, app, db_path):
+def make_album_flush_factory(album_buf, queue_mgr, webhook, sender, dedup, db_path):
     """Create album flush worker coroutine factory."""
     async def album_flush():
         while not shutdown_event.is_set():
             try:
                 completed = await album_buf.check_and_flush_expired()
                 for album_payload in completed:
-                    await queue_mgr.enqueue(album_payload)
-                    processed_payload = await webhook.send(album_payload, endpoint="album")
-                    if processed_payload:
-                        from listener import forward_message_pipeline
-                        forward_success = await forward_message_pipeline(app, album_payload, processed_payload, db_path)
-                        if forward_success:
-                            await queue_mgr.remove_from_queue(album_payload)
-                        else:
-                            await queue_mgr.enqueue_failed(album_payload, "Telegram forwarding failed")
-                    else:
-                        await queue_mgr.enqueue_failed(
-                            album_payload, "Webhook delivery failed (album flush)"
-                        )
+                    await process_payload(
+                        sender, queue_mgr, webhook, album_payload, db_path, dedup=dedup
+                    )
             except Exception as e:
                 logger.error(f"Album flush error: {e}", exc_info=True)
 
-            await asyncio.sleep(0.5)  # Poll every 500ms
+            await asyncio.sleep(0.5)
     return album_flush
 
 
-def make_retry_factory(queue_mgr, webhook, app, db_path):
+def make_retry_factory(queue_mgr, webhook, sender, dedup, db_path):
     """Create retry worker coroutine factory."""
     async def retry():
         while not shutdown_event.is_set():
             try:
+                payload = await queue_mgr.dequeue_deferred()
+                if payload:
+                    await retry_payload(sender, queue_mgr, webhook, payload, db_path, dedup=dedup)
+                    await asyncio.sleep(1)
+                    continue
+
                 payload = await queue_mgr.dequeue_failed()
                 if payload:
-                    # Determine endpoint
-                    endpoint = "album" if payload.get("type") == "album" else "message"
-                    processed_payload = await webhook.send(payload, endpoint=endpoint)
-                    if processed_payload:
-                        from listener import forward_message_pipeline
-                        forward_success = await forward_message_pipeline(app, payload, processed_payload, db_path)
-                        if forward_success:
-                            await queue_mgr.remove_from_queue(payload)
-                            logger.info(
-                                f"Retry succeeded for message "
-                                f"{payload.get('message_id', payload.get('media_group_id'))}"
-                            )
-                        else:
-                            await queue_mgr.enqueue_failed(payload, "Retry telegram forwarding failed")
-                    else:
-                        await queue_mgr.enqueue_failed(payload, "Retry webhook failed")
+                    await retry_payload(sender, queue_mgr, webhook, payload, db_path, dedup=dedup)
                 else:
-                    # No failed messages — sleep longer
                     await asyncio.sleep(60)
                     continue
             except Exception as e:
                 logger.error(f"Retry worker error: {e}", exc_info=True)
 
-            await asyncio.sleep(2)  # Small delay between retries
+            await asyncio.sleep(2)
     return retry
 
 
@@ -267,8 +252,9 @@ async def main():
         secret=settings.webhook_secret,
         config=config,
     )
+    sender = TelegramBotSender(bot_token=settings.bot_token)
 
-    # Initialize Pyrogram client
+    # Initialize Pyrogram client (listen-only)
     _workdir = os.getenv("PYROGRAM_WORKDIR", "/app/sessions")
 
     app = Client(
@@ -285,6 +271,7 @@ async def main():
         webhook_sender=webhook,
         config=config,
         pyrogram_app=app,
+        bot_sender=sender,
         alert_bot_token=settings.alert_bot_token,
         alert_chat_id=settings.alert_chat_id,
         db_path=settings.db_path,
@@ -296,17 +283,23 @@ async def main():
     # Register the on_message handler
     register_listener(app, settings.source_chat_id, message_queue)
 
-    # Flush any stale albums from previous session
-    await album_buf.flush_stale_albums()
+    # Recover stale albums from a previous session and process them
+    stale_albums = await album_buf.flush_stale_albums()
 
     # ── Startup self-test ─────────────────────────────────────────
     logger.info("Running startup self-test...")
 
     # Start Pyrogram first (needed for get_me check)
     await app.start()
-    logger.info("Pyrogram client started")
+    logger.info("Pyrogram client started (listen-only)")
 
-    # Verify source channel access
+    # Verify sender bot and channel access
+    try:
+        bot_me = await sender.get_me()
+        logger.info(f"✓ Sender bot verified: @{bot_me.get('username', 'unknown')}")
+    except Exception as e:
+        logger.error(f"✗ CRITICAL: Sender bot (BOT_TOKEN) verification failed: {e}")
+
     try:
         source_chat = await app.get_chat(settings.source_chat_id)
         logger.info(f"✓ Source channel access verified: '{source_chat.title}' (type: {source_chat.type})")
@@ -314,6 +307,18 @@ async def main():
         logger.error(
             f"✗ CRITICAL: Cannot access source channel {settings.source_chat_id}. "
             f"Please verify that the user account is joined to this channel. Error: {e}"
+        )
+
+    dest_errors = await sender.verify_destinations(
+        [{"chat_id": d.chat_id, "name": d.name, "enabled": d.enabled} for d in config.get_active_destinations()]
+    )
+    for err in dest_errors:
+        logger.error(f"✗ Destination access: {err}")
+
+    if not await sender.verify_bot_access(settings.source_chat_id):
+        logger.error(
+            f"✗ CRITICAL: Sender bot cannot access source channel {settings.source_chat_id}. "
+            "Add the bot as admin to the source channel for copyMessage to work."
         )
 
     # Now run self-test (retries every 30s until all pass)
@@ -332,13 +337,20 @@ async def main():
 
     logger.info("Startup complete — launching workers")
 
+    # Process albums recovered from a crashed session
+    for album_payload in stale_albums:
+        try:
+            await process_payload(sender, queue_mgr, webhook, album_payload, settings.db_path, dedup=dedup)
+        except Exception as e:
+            logger.error(f"Failed to process recovered album: {e}", exc_info=True)
+
     # ── Launch supervised tasks ───────────────────────────────────
     tasks = []
 
     # Message workers (N workers, default 2)
     for i in range(settings.worker_count):
         factory = make_worker_factory(
-            i + 1, message_queue, dedup, album_buf, queue_mgr, webhook, settings, app, settings.db_path
+            i + 1, message_queue, dedup, album_buf, queue_mgr, webhook, sender, settings, settings.db_path
         )
         tasks.append(asyncio.create_task(
             supervised_task(f"worker-{i+1}", factory),
@@ -347,13 +359,13 @@ async def main():
 
     # Album flush worker
     tasks.append(asyncio.create_task(
-        supervised_task("album-flush", make_album_flush_factory(album_buf, queue_mgr, webhook, app, settings.db_path)),
+        supervised_task("album-flush", make_album_flush_factory(album_buf, queue_mgr, webhook, sender, dedup, settings.db_path)),
         name="album-flush",
     ))
 
     # Retry worker
     tasks.append(asyncio.create_task(
-        supervised_task("retry", make_retry_factory(queue_mgr, webhook, app, settings.db_path)),
+        supervised_task("retry", make_retry_factory(queue_mgr, webhook, sender, dedup, settings.db_path)),
         name="retry",
     ))
 
@@ -394,6 +406,7 @@ async def main():
     finally:
         logger.info("Shutting down...")
         await webhook.close()
+        await sender.close()
         await app.stop()
         await redis_client.close()
         logger.info("Shutdown complete")

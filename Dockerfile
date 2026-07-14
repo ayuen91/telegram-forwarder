@@ -21,7 +21,7 @@ RUN mkdir -p /app/db
 COPY db/schema.sql /app/db/schema.sql
 
 # Create required runtime directories
-RUN mkdir -p /app/sessions /app/data /app/logs /app/media /app/config
+RUN mkdir -p /app/sessions /app/data /app/logs /app/config
 
 # Healthcheck: checks heartbeat file written by health.py
 # If 3 consecutive checks fail (~10 min stale), Docker auto-restarts container

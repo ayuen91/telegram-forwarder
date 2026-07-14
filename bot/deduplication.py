@@ -18,12 +18,17 @@ class Deduplication:
 
     # Key prefix for dedup entries
     KEY_PREFIX = "dedup"
+    INFLIGHT_PREFIX = "inflight"
 
     # How long to remember a message_id (24 hours)
     TTL_SECONDS = 86400
+    INFLIGHT_TTL = 600  # 10 minutes — covers worker delay + webhook round-trip
 
     def __init__(self, redis_client: aioredis.Redis):
         self.redis = redis_client
+
+    def _inflight_key(self, chat_id: int) -> str:
+        return f"{self.INFLIGHT_PREFIX}:{chat_id}"
 
     async def is_new(self, chat_id: int, message_id: int) -> bool:
         """
@@ -45,3 +50,23 @@ class Deduplication:
         else:
             logger.debug(f"Dedup: duplicate message {message_id} in chat {chat_id}, skipping")
             return False
+
+    async def mark_inflight(self, chat_id: int, message_ids: list):
+        """Track message ids currently being forwarded (for reply ordering)."""
+        if not message_ids:
+            return
+        key = self._inflight_key(chat_id)
+        await self.redis.sadd(key, *[str(mid) for mid in message_ids])
+        await self.redis.expire(key, self.INFLIGHT_TTL)
+
+    async def clear_inflight(self, chat_id: int, message_ids: list):
+        """Remove message ids from the in-flight set after forwarding completes."""
+        if not message_ids:
+            return
+        key = self._inflight_key(chat_id)
+        await self.redis.srem(key, *[str(mid) for mid in message_ids])
+
+    async def is_inflight(self, chat_id: int, message_id: int) -> bool:
+        """True if the parent message is still being processed."""
+        key = self._inflight_key(chat_id)
+        return bool(await self.redis.sismember(key, str(message_id)))

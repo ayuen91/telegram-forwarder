@@ -55,6 +55,7 @@ class HealthMonitor:
         webhook_sender,  # WebhookSender instance
         config,  # Config instance
         pyrogram_app=None,  # Pyrogram Client instance (set after app starts)
+        bot_sender=None,  # TelegramBotSender instance
         alert_bot_token: str = "",
         alert_chat_id: int = 0,
         db_path: str = "/app/data/forwarder.db",
@@ -63,6 +64,7 @@ class HealthMonitor:
         self.webhook_sender = webhook_sender
         self.config = config
         self.pyrogram_app = pyrogram_app
+        self.bot_sender = bot_sender
         self.alert_bot_token = alert_bot_token
         self.alert_chat_id = alert_chat_id
         self.db_path = db_path
@@ -74,28 +76,31 @@ class HealthMonitor:
         """Run all health checks and return results."""
         results = []
 
-        # 1. User account status
+        # 1. User account status (listen)
         results.append(await self._check_pyrogram())
 
-        # 2. Redis connectivity
+        # 2. Sender bot status (copyMessage delivery)
+        results.append(await self._check_sender_bot())
+
+        # 3. Redis connectivity
         results.append(await self._check_redis())
 
-        # 3. n8n webhook reachable
+        # 4. n8n webhook reachable
         results.append(await self._check_n8n())
 
-        # 4. Queue depth
+        # 5. Queue depth
         results.append(await self._check_queue_depth())
 
-        # 5. Failed queue
+        # 6. Failed queue
         results.append(await self._check_failed_queue())
 
-        # 6. Dead letter queue
+        # 7. Dead letter queue
         results.append(await self._check_dead_letter())
 
-        # 7. SQLite writable
+        # 8. SQLite writable
         results.append(await self._check_sqlite())
 
-        # 8. Disk space
+        # 9. Disk space
         results.append(self._check_disk_space())
 
         return results
@@ -176,6 +181,31 @@ class HealthMonitor:
                 passed=False,
                 level="critical",
                 message=f"get_me() failed: {e}",
+            )
+
+    async def _check_sender_bot(self) -> HealthCheckResult:
+        """Check if the sender bot token is valid."""
+        try:
+            if self.bot_sender:
+                me = await self.bot_sender.get_me()
+                return HealthCheckResult(
+                    name="sender_bot",
+                    passed=True,
+                    level="critical",
+                    message=f"Bot @{me.get('username', 'unknown')} (ID: {me.get('id')})",
+                )
+            return HealthCheckResult(
+                name="sender_bot",
+                passed=False,
+                level="critical",
+                message="Sender bot not configured",
+            )
+        except Exception as e:
+            return HealthCheckResult(
+                name="sender_bot",
+                passed=False,
+                level="critical",
+                message=f"getMe() failed: {e}",
             )
 
     async def _check_redis(self) -> HealthCheckResult:

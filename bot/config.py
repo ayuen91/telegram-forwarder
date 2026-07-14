@@ -61,6 +61,9 @@ class Settings:
     phone_number: str = ""
     source_chat_id: int = 0
 
+    # Telegram Sender Bot (Bot API — copyMessage delivery)
+    bot_token: str = ""
+
     # n8n Webhooks (from .env)
     n8n_webhook_message: str = ""
     n8n_webhook_album: str = ""
@@ -123,6 +126,7 @@ class Config:
         s.api_id = _env_int("API_ID", 0)
         s.api_hash = _require_env("API_HASH")
         s.phone_number = _require_env("PHONE_NUMBER")
+        s.bot_token = _require_env("BOT_TOKEN")
 
         # Source chat ID — loaded from channels.yml, but can be overridden via env
         # Will be set in _load_channels if not in env
@@ -268,6 +272,8 @@ class Config:
             errors.append("No destinations configured in channels.yml")
         if not s.webhook_secret:
             errors.append("WEBHOOK_SECRET is not set")
+        if not s.bot_token:
+            errors.append("BOT_TOKEN is not set")
         if not s.alert_bot_token:
             errors.append("ALERT_BOT_TOKEN is not set")
         if not s.alert_chat_id:

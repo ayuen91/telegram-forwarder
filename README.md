@@ -5,11 +5,17 @@ A production-ready system that listens to a Telegram source channel and forwards
 ## Architecture
 
 ```
-Source Channel → Pyrogram Bot (listen-only) → Redis Queue → n8n Workflow → Bot API → Destinations
+Source Channel → Pyrogram (listen) → Redis Queue → n8n (word replace) → Python Bot API (copyMessage) → Destinations
 ```
 
+**Roles:**
+- **Pyrogram user account** — listens to the source channel only (no sending)
+- **Sender bot (`BOT_TOKEN`)** — delivers to destinations via Bot API `copyMessage` / `copyMessages` (zero download)
+- **n8n** — HMAC-verified webhook that applies word replacements from `replacements.yml` and returns JSON
+
 **Key features:**
-- **Zero-download media**: Uses `copyMessage` (sender bot is admin of source) — no file downloads
+- **Zero-download media**: Bot API `copyMessage` — sender bot must be admin of source + destinations
+- **Reply threading**: Maps source message IDs to destination IDs so channel replies are preserved
 - **Album support**: Buffers media groups via `media_group_id` with 2-second collection window
 - **Word replacement**: Applied to both text and captions, regex and plain string supported
 - **Backpressure control**: `asyncio.Queue` + 2 workers with randomized delay prevents FloodWait
@@ -22,7 +28,7 @@ Source Channel → Pyrogram Bot (listen-only) → Redis Queue → n8n Workflow �
 ### 1. Prerequisites
 - VPS with Docker & Docker Compose
 - Telegram user account (for Pyrogram — listen only)
-- Telegram Bot (sender) — must be admin of source channel
+- Telegram Bot (sender) — must be admin of **source channel and all destinations** (for copyMessage)
 - Telegram Bot (alerts) — sends health alerts to your personal chat
 
 ### 2. Setup
@@ -138,11 +144,13 @@ bash scripts/deploy.sh
 
 ### n8n Workflow
 
+n8n handles **word replacement only** — it does not send Telegram messages. The Python bot sends via Bot API after n8n returns the processed payload.
+
 1. Open n8n at `http://localhost:5678` via SSH tunnel: `ssh -L 5678:localhost:5678 user@your-ec2-ip`
 2. Import `n8n/workflows/message_processor.json` (use the `+` button → Import from file)
 3. Activate the workflow (toggle in top-right corner)
 
-> **Note:** `WEBHOOK_SECRET` and `BOT_TOKEN` are automatically injected into n8n from `.env` via Docker Compose — no manual configuration in the n8n UI is needed.
+> **Note:** `WEBHOOK_SECRET` is injected into n8n from `.env` via Docker Compose. `BOT_TOKEN` stays in the bot container only.
 
 ### Backups
 
@@ -175,7 +183,8 @@ telegram-forwarder/
 ├── docker-compose.yml     # 3 services: bot, redis, n8n
 ├── bot/                   # Pyrogram user bot
 │   ├── main.py            # Entry point: supervisor + self-test
-│   ├── listener.py        # on_message → Queue → workers
+│   ├── listener.py        # on_message → Queue → workers → Bot API forward
+│   ├── telegram_sender.py # Bot API copyMessage / copyMessages delivery
 │   ├── album_buffer.py    # Media group collection
 │   ├── queue_manager.py   # Redis queues + retry
 │   ├── deduplication.py   # Message dedup

@@ -10,6 +10,7 @@ Two endpoints:
   - /webhook/album   — album payloads
 """
 
+import copy
 import hashlib
 import hmac
 import json
@@ -74,20 +75,19 @@ class WebhookSender:
         """
         url = self.album_url if endpoint == "album" else self.message_url
 
-        # Inject config data so n8n doesn't need filesystem/js-yaml access
+        outbound = copy.deepcopy(payload)
         if self._config:
             s = self._config.settings
-            payload["destinations"] = [
+            outbound["destinations"] = [
                 {"chat_id": d.chat_id, "name": d.name, "enabled": d.enabled}
                 for d in s.destinations if d.enabled
             ]
-            payload["replacement_rules"] = [
+            outbound["replacement_rules"] = [
                 {"pattern": r.pattern, "replacement": r.replacement, "is_regex": r.is_regex}
                 for r in s.replacement_rules
             ]
 
-        # Compact JSON must match n8n JSON.stringify() for HMAC verification.
-        payload_json = json.dumps(payload, default=str, separators=(",", ":"))
+        payload_json = json.dumps(outbound, default=str, separators=(",", ":"), sort_keys=True)
         signature = self._sign_payload(payload_json)
 
         headers = {

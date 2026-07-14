@@ -1,5 +1,5 @@
 services:
-  # Pyrogram user bot (listen-only) + health monitor + alert sender
+  # Pyrogram user bot (listen-only) + Bot API sender + health monitor
   bot:
     build:
       context: .                         # Repo root — so COPY bot/ and db/ both work
@@ -10,7 +10,6 @@ services:
       - ./data:/app/data                 # SQLite database + heartbeat file
       - ./config:/app/config             # channels.yml + replacements.yml (hot-reloadable)
       - ./logs:/app/logs                 # Log files
-      - ./media:/app/media               # Temp dir for album downloads
       - ./db:/app/db                     # schema.sql access
     depends_on:
       redis:
@@ -44,7 +43,7 @@ services:
     networks:
       - internal
 
-  # n8n (workflow engine — processes messages and sends via Bot API)
+  # n8n (word replacement only — Python bot sends via Bot API copyMessage)
   n8n:
     image: n8nio/n8n:latest
     env_file: .env
@@ -57,12 +56,8 @@ services:
       - N8N_BLOCK_ENV_ACCESS_IN_NODE=false
       - NODE_FUNCTION_ALLOW_BUILTIN=crypto
       - WEBHOOK_SECRET=${WEBHOOK_SECRET}
-      - BOT_TOKEN=${BOT_TOKEN}
     volumes:
       - n8n_data:/home/node/.n8n
-      - ./data:/app/data                 # Shared SQLite access
-      - ./config:/app/config             # Access to replacement rules
-      - ./media:/app/media               # Shared media temp dir
     depends_on:
       redis:
         condition: service_healthy

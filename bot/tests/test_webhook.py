@@ -8,7 +8,7 @@ import pytest
 
 def generate_signature(payload: dict, secret: str) -> str:
     """Replicate the WebhookSender's signing logic."""
-    payload_json = json.dumps(payload, default=str, separators=(",", ":"))
+    payload_json = json.dumps(payload, default=str, separators=(",", ":"), sort_keys=True)
     return hmac.new(
         secret.encode("utf-8"),
         payload_json.encode("utf-8"),
@@ -26,6 +26,18 @@ def verify_signature(payload_json: str, signature: str, secret: str) -> bool:
     return hmac.compare_digest(signature, expected)
 
 
+def stable_stringify(value):
+    """Match n8n stableStringify / Python json.dumps(sort_keys=True, separators=(',', ':'))."""
+    import json
+    if value is None or not isinstance(value, (dict, list)):
+        return json.dumps(value)
+    if isinstance(value, list):
+        return "[" + ",".join(stable_stringify(item) for item in value) + "]"
+    keys = sorted(value.keys())
+    parts = [json.dumps(k) + ":" + stable_stringify(value[k]) for k in keys]
+    return "{" + ",".join(parts) + "}"
+
+
 class TestWebhookSignature:
     SECRET = "test-secret-key-12345"
 
@@ -39,14 +51,14 @@ class TestWebhookSignature:
     def test_signature_verification(self):
         """Generated signature should pass verification."""
         payload = {"message_id": 1, "text": "hello world"}
-        payload_json = json.dumps(payload, default=str, separators=(",", ":"))
+        payload_json = json.dumps(payload, default=str, separators=(",", ":"), sort_keys=True)
         sig = generate_signature(payload, self.SECRET)
         assert verify_signature(payload_json, sig, self.SECRET) is True
 
     def test_wrong_secret_fails(self):
         """Signature with wrong secret should fail verification."""
         payload = {"message_id": 1, "text": "hello"}
-        payload_json = json.dumps(payload, default=str, separators=(",", ":"))
+        payload_json = json.dumps(payload, default=str, separators=(",", ":"), sort_keys=True)
         sig = generate_signature(payload, self.SECRET)
         assert verify_signature(payload_json, sig, "wrong-secret") is False
 
@@ -76,12 +88,20 @@ class TestWebhookSignature:
         """Signature should handle unicode text correctly."""
         payload = {"message_id": 1, "text": "Привет мир 🌍"}
         sig = generate_signature(payload, self.SECRET)
-        payload_json = json.dumps(payload, default=str, separators=(",", ":"))
+        payload_json = json.dumps(payload, default=str, separators=(",", ":"), sort_keys=True)
         assert verify_signature(payload_json, sig, self.SECRET) is True
 
-    def test_empty_payload(self):
-        """Signature should work with empty dict."""
-        payload = {}
+    def test_stable_stringify_matches_python_dumps(self):
+        """n8n compact stable stringify must match Python signing."""
+        payload = {
+            "message_id": 1,
+            "text": "hello",
+            "destinations": [{"chat_id": -100, "name": "A", "enabled": True}],
+        }
+        py_json = json.dumps(payload, default=str, separators=(",", ":"), sort_keys=True)
+        js_style = stable_stringify(payload)
+        assert py_json == js_style
         sig = generate_signature(payload, self.SECRET)
-        payload_json = json.dumps(payload, default=str, separators=(",", ":"))
-        assert verify_signature(payload_json, sig, self.SECRET) is True
+        assert verify_signature(py_json, sig, self.SECRET) is True
+        assert verify_signature(js_style, sig, self.SECRET) is True
+

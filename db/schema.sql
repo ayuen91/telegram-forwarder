@@ -47,3 +47,19 @@ CREATE INDEX IF NOT EXISTS idx_messages_telegram_id ON messages(telegram_message
 CREATE INDEX IF NOT EXISTS idx_messages_received ON messages(received_at);
 CREATE INDEX IF NOT EXISTS idx_dest_status ON message_destinations(status);
 CREATE INDEX IF NOT EXISTS idx_dest_message ON message_destinations(message_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_dest_message_chat
+    ON message_destinations(message_id, destination_chat_id);
+
+-- Reply threading: maps each source message_id to its sent id per destination.
+-- Needed for channel replies and for replies to any item in an album.
+CREATE TABLE IF NOT EXISTS message_reply_map (
+    source_chat_id      INTEGER NOT NULL,
+    source_message_id   INTEGER NOT NULL,
+    destination_chat_id INTEGER NOT NULL,
+    sent_message_id     INTEGER NOT NULL,
+    created_at          TEXT DEFAULT (datetime('now')),
+    PRIMARY KEY (source_chat_id, source_message_id, destination_chat_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_reply_map_lookup
+    ON message_reply_map(source_chat_id, source_message_id, destination_chat_id);
