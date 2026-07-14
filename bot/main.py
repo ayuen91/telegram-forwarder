@@ -119,7 +119,7 @@ async def init_database(db_path: str):
 # ── Worker Factories ──────────────────────────────────────────────────
 # These return coroutine factories for supervised_task
 
-def make_worker_factory(worker_id, queue, dedup, album_buf, queue_mgr, webhook, settings):
+def make_worker_factory(worker_id, queue, dedup, album_buf, queue_mgr, webhook, settings, app, db_path):
     """Create a message worker coroutine factory."""
     async def worker():
         await message_worker(
@@ -129,13 +129,15 @@ def make_worker_factory(worker_id, queue, dedup, album_buf, queue_mgr, webhook, 
             album_buffer=album_buf,
             queue_manager=queue_mgr,
             webhook_sender=webhook,
+            app=app,
+            db_path=db_path,
             delay_min=settings.worker_delay_min,
             delay_max=settings.worker_delay_max,
         )
     return worker
 
 
-def make_album_flush_factory(album_buf, queue_mgr, webhook):
+def make_album_flush_factory(album_buf, queue_mgr, webhook, app, db_path):
     """Create album flush worker coroutine factory."""
     async def album_flush():
         while not shutdown_event.is_set():
@@ -143,8 +145,15 @@ def make_album_flush_factory(album_buf, queue_mgr, webhook):
                 completed = await album_buf.check_and_flush_expired()
                 for album_payload in completed:
                     await queue_mgr.enqueue(album_payload)
-                    success = await webhook.send(album_payload, endpoint="album")
-                    if not success:
+                    processed_payload = await webhook.send(album_payload, endpoint="album")
+                    if processed_payload:
+                        from listener import forward_message_pipeline
+                        forward_success = await forward_message_pipeline(app, album_payload, processed_payload, db_path)
+                        if forward_success:
+                            await queue_mgr.remove_from_queue(album_payload)
+                        else:
+                            await queue_mgr.enqueue_failed(album_payload, "Telegram forwarding failed")
+                    else:
                         await queue_mgr.enqueue_failed(
                             album_payload, "Webhook delivery failed (album flush)"
                         )
@@ -155,7 +164,7 @@ def make_album_flush_factory(album_buf, queue_mgr, webhook):
     return album_flush
 
 
-def make_retry_factory(queue_mgr, webhook):
+def make_retry_factory(queue_mgr, webhook, app, db_path):
     """Create retry worker coroutine factory."""
     async def retry():
         while not shutdown_event.is_set():
@@ -164,12 +173,18 @@ def make_retry_factory(queue_mgr, webhook):
                 if payload:
                     # Determine endpoint
                     endpoint = "album" if payload.get("type") == "album" else "message"
-                    success = await webhook.send(payload, endpoint=endpoint)
-                    if success:
-                        logger.info(
-                            f"Retry succeeded for message "
-                            f"{payload.get('message_id', payload.get('media_group_id'))}"
-                        )
+                    processed_payload = await webhook.send(payload, endpoint=endpoint)
+                    if processed_payload:
+                        from listener import forward_message_pipeline
+                        forward_success = await forward_message_pipeline(app, payload, processed_payload, db_path)
+                        if forward_success:
+                            await queue_mgr.remove_from_queue(payload)
+                            logger.info(
+                                f"Retry succeeded for message "
+                                f"{payload.get('message_id', payload.get('media_group_id'))}"
+                            )
+                        else:
+                            await queue_mgr.enqueue_failed(payload, "Retry telegram forwarding failed")
                     else:
                         await queue_mgr.enqueue_failed(payload, "Retry webhook failed")
                 else:
@@ -311,7 +326,7 @@ async def main():
     # Message workers (N workers, default 2)
     for i in range(settings.worker_count):
         factory = make_worker_factory(
-            i + 1, message_queue, dedup, album_buf, queue_mgr, webhook, settings
+            i + 1, message_queue, dedup, album_buf, queue_mgr, webhook, settings, app, settings.db_path
         )
         tasks.append(asyncio.create_task(
             supervised_task(f"worker-{i+1}", factory),
@@ -320,13 +335,13 @@ async def main():
 
     # Album flush worker
     tasks.append(asyncio.create_task(
-        supervised_task("album-flush", make_album_flush_factory(album_buf, queue_mgr, webhook)),
+        supervised_task("album-flush", make_album_flush_factory(album_buf, queue_mgr, webhook, app, settings.db_path)),
         name="album-flush",
     ))
 
     # Retry worker
     tasks.append(asyncio.create_task(
-        supervised_task("retry", make_retry_factory(queue_mgr, webhook)),
+        supervised_task("retry", make_retry_factory(queue_mgr, webhook, app, settings.db_path)),
         name="retry",
     ))
 

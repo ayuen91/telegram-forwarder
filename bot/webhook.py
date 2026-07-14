@@ -2,8 +2,8 @@
 HMAC-signed webhook sender to n8n.
 
 Signs every payload with HMAC-SHA256 using a shared secret. n8n verifies
-the signature before processing. On failure, the message stays in the
-Redis queue for retry by the retry worker.
+the signature before processing. n8n returns the processed payload (with
+word replacements applied) as JSON, which we parse and return to the caller.
 
 Two endpoints:
   - /webhook/message — single messages
@@ -57,16 +57,20 @@ class WebhookSender:
             hashlib.sha256,
         ).hexdigest()
 
-    async def send(self, payload: Dict[str, Any], endpoint: str = "message") -> bool:
+    async def send(
+        self, payload: Dict[str, Any], endpoint: str = "message"
+    ) -> Optional[Dict[str, Any]]:
         """
-        Send a signed payload to n8n.
+        Send a signed payload to n8n and return the processed result.
+
+        n8n applies word replacements and returns the enriched payload as JSON.
 
         Args:
             payload: Message or album data dict
             endpoint: "message" or "album"
 
         Returns:
-            True if n8n responded with 2xx, False otherwise
+            Parsed response dict from n8n if successful, None otherwise.
         """
         url = self.album_url if endpoint == "album" else self.message_url
 
@@ -96,30 +100,37 @@ class WebhookSender:
         try:
             session = await self._get_session()
             async with session.post(url, data=payload_json, headers=headers) as resp:
-                body_preview = (await resp.text())[:200]
+                body_text = await resp.text()
                 if 200 <= resp.status < 300:
-                    logger.info(
-                        f"Webhook sent: {endpoint} message_id={message_id} "
-                        f"status={resp.status}"
-                    )
-                    return True
+                    try:
+                        result = json.loads(body_text)
+                        logger.info(
+                            f"Webhook sent: {endpoint} message_id={message_id} "
+                            f"status={resp.status}"
+                        )
+                        return result
+                    except json.JSONDecodeError:
+                        logger.warning(
+                            f"Webhook returned non-JSON body: {body_text[:200]}"
+                        )
+                        # Return raw success indicator so caller knows it worked
+                        return {"status": "ok"}
                 else:
-                    body = body_preview
                     logger.warning(
                         f"Webhook failed: {endpoint} message_id={message_id} "
-                        f"status={resp.status} body={body[:200]}"
+                        f"status={resp.status} body={body_text[:200]}"
                     )
-                    return False
+                    return None
 
         except aiohttp.ClientConnectorError as e:
             logger.warning(f"Webhook connection failed ({endpoint}): {e}")
-            return False
+            return None
         except aiohttp.ClientError as e:
             logger.warning(f"Webhook error ({endpoint}): {e}")
-            return False
+            return None
         except Exception as e:
             logger.error(f"Unexpected webhook error ({endpoint}): {e}", exc_info=True)
-            return False
+            return None
 
     async def is_reachable(self) -> bool:
         """

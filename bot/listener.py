@@ -18,6 +18,7 @@ import random
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 
+import aiosqlite
 from pyrogram import Client, filters
 from pyrogram.types import Message
 from pyrogram.enums import MessageMediaType
@@ -122,6 +123,183 @@ def _serialize_entities(entities) -> list:
     return result
 
 
+async def forward_message_pipeline(client, payload, processed_payload, db_path):
+    """
+    Copy or send the processed message/album to all destinations.
+    Keeps track of message IDs in SQLite to map reply threading correctly.
+    """
+    msg_type = payload.get("type")
+    destinations = processed_payload.get("destinations", [])
+    if not destinations:
+        logger.warning("No destinations specified in processed payload")
+        return True
+
+    # 1. Insert/Update the source message in SQLite
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        
+        telegram_id = payload.get("message_id") or payload.get("media_group_id")
+        source_chat_id = payload.get("chat_id")
+        
+        # Insert parent message tracker
+        await db.execute(
+            """
+            INSERT INTO messages (
+                telegram_message_id, source_chat_id, message_type, 
+                original_text, original_caption, 
+                processed_text, processed_caption, 
+                has_media, media_group_id, status, processed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'processing', datetime('now'))
+            ON CONFLICT(telegram_message_id, source_chat_id) DO UPDATE SET
+                processed_text = excluded.processed_text,
+                processed_caption = excluded.processed_caption,
+                status = 'processing',
+                processed_at = datetime('now')
+            """,
+            (
+                telegram_id,
+                source_chat_id,
+                msg_type,
+                payload.get("text"),
+                payload.get("caption"),
+                processed_payload.get("processed_text"),
+                processed_payload.get("processed_caption"),
+                1 if payload.get("has_media") else 0,
+                payload.get("media_group_id"),
+            )
+        )
+        
+        # Get the ID of the inserted/updated row
+        cursor = await db.execute(
+            "SELECT id FROM messages WHERE telegram_message_id = ? AND source_chat_id = ?",
+            (telegram_id, source_chat_id)
+        )
+        row = await cursor.fetchone()
+        message_db_id = row["id"] if row else None
+        
+        if not message_db_id:
+            logger.error("Failed to track message in database")
+            return False
+
+        # 2. Forward to all destinations
+        for dest in destinations:
+            dest_chat_id = dest["chat_id"]
+            sent_msg_id = None
+            error_msg = None
+            
+            try:
+                # Check reply mapping
+                reply_to_id = None
+                source_reply_id = payload.get("reply_to_message_id")
+                if source_reply_id:
+                    cursor = await db.execute(
+                        """
+                        SELECT md.sent_message_id 
+                        FROM message_destinations md
+                        JOIN messages m ON md.message_id = m.id
+                        WHERE m.telegram_message_id = ? AND m.source_chat_id = ? AND md.destination_chat_id = ?
+                        LIMIT 1
+                        """,
+                        (source_reply_id, source_chat_id, dest_chat_id)
+                    )
+                    reply_row = await cursor.fetchone()
+                    if reply_row:
+                        reply_to_id = reply_row["sent_message_id"]
+                        logger.info(f"Mapping reply: source_reply_id={source_reply_id} -> destination_reply_id={reply_to_id}")
+
+                # Perform the forward using Pyrogram Client
+                if msg_type == "album":
+                    items = processed_payload.get("items", [])
+                    sorted_items = sorted(items, key=lambda x: x.get("message_id", 0))
+                    
+                    # Extract captions in the correct order
+                    captions = []
+                    for item in sorted_items:
+                        caption = item.get("processed_caption") or item.get("caption") or ""
+                        captions.append(caption)
+                        
+                    anchor_msg_id = sorted_items[0]["message_id"]
+                    
+                    sent_messages = await client.copy_media_group(
+                        chat_id=dest_chat_id,
+                        from_chat_id=source_chat_id,
+                        message_id=anchor_msg_id,
+                        captions=captions,
+                        reply_to_message_id=reply_to_id
+                    )
+                    if sent_messages:
+                        sent_msg_id = sent_messages[0].id
+                else:
+                    # Single message
+                    if msg_type == "text":
+                        text_changed = processed_payload.get("text_changed", False)
+                        text_to_send = processed_payload.get("processed_text") or payload.get("text")
+                        
+                        if text_changed:
+                            sent_msg = await client.send_message(
+                                chat_id=dest_chat_id,
+                                text=text_to_send,
+                                reply_to_message_id=reply_to_id
+                            )
+                        else:
+                            sent_msg = await client.copy_message(
+                                chat_id=dest_chat_id,
+                                from_chat_id=source_chat_id,
+                                message_id=payload.get("message_id"),
+                                reply_to_message_id=reply_to_id
+                            )
+                    else:
+                        # Media message
+                        caption_changed = processed_payload.get("caption_changed", False)
+                        caption_to_send = processed_payload.get("processed_caption") or payload.get("caption")
+                        
+                        if caption_changed:
+                            sent_msg = await client.copy_message(
+                                chat_id=dest_chat_id,
+                                from_chat_id=source_chat_id,
+                                message_id=payload.get("message_id"),
+                                caption=caption_to_send,
+                                reply_to_message_id=reply_to_id
+                            )
+                        else:
+                            sent_msg = await client.copy_message(
+                                chat_id=dest_chat_id,
+                                from_chat_id=source_chat_id,
+                                message_id=payload.get("message_id"),
+                                reply_to_message_id=reply_to_id
+                            )
+                    sent_msg_id = sent_msg.id
+                
+                # Log success to message_destinations
+                await db.execute(
+                    """
+                    INSERT INTO message_destinations (message_id, destination_chat_id, status, sent_message_id, sent_at)
+                    VALUES (?, ?, 'sent', ?, datetime('now'))
+                    """,
+                    (message_db_id, dest_chat_id, sent_msg_id)
+                )
+                logger.info(f"Forwarded successfully to {dest['name']} (chat_id={dest_chat_id}, sent_message_id={sent_msg_id})")
+
+            except Exception as ex:
+                error_msg = str(ex)
+                logger.error(f"Failed to forward message to {dest['name']} (chat_id={dest_chat_id}): {ex}", exc_info=True)
+                await db.execute(
+                    """
+                    INSERT INTO message_destinations (message_id, destination_chat_id, status, error_message, sent_at)
+                    VALUES (?, ?, 'failed', ?, datetime('now'))
+                    """,
+                    (message_db_id, dest_chat_id, error_msg)
+                )
+        
+        # 3. Update the overall status to sent
+        await db.execute(
+            "UPDATE messages SET status = 'sent', sent_at = datetime('now') WHERE id = ?",
+            (message_db_id,)
+        )
+        await db.commit()
+    return True
+
+
 async def message_worker(
     worker_id: int,
     queue: asyncio.Queue,
@@ -129,18 +307,14 @@ async def message_worker(
     album_buffer,
     queue_manager,
     webhook_sender,
+    app,
+    db_path: str,
     delay_min: float = 0.5,
     delay_max: float = 1.5,
 ):
     """
     Worker task: pulls messages from asyncio.Queue, processes sequentially.
-
-    Each worker adds a randomized delay between operations to:
-    1. Look natural to Telegram (not machine-like)
-    2. Prevent FloodWait errors
-    3. Naturally limit throughput without a separate rate limiter
-
-    With 2 workers and 0.5–1.5s delay, effective throughput is ~1–3 msg/sec.
+    Uses n8n webhook for processing text, then forwards directly using Pyrogram.
     """
     logger.info(f"Worker-{worker_id} started")
 
@@ -167,8 +341,14 @@ async def message_worker(
                 if flush_result:
                     # Album was full (10 items), immediately enqueue + send webhook
                     await queue_manager.enqueue(flush_result)
-                    success = await webhook_sender.send(flush_result, endpoint="album")
-                    if not success:
+                    processed_payload = await webhook_sender.send(flush_result, endpoint="album")
+                    if processed_payload:
+                        forward_success = await forward_message_pipeline(app, flush_result, processed_payload, db_path)
+                        if forward_success:
+                            await queue_manager.remove_from_queue(flush_result)
+                        else:
+                            await queue_manager.enqueue_failed(flush_result, "Telegram forwarding failed")
+                    else:
                         await queue_manager.enqueue_failed(
                             flush_result, "Webhook delivery failed (album, immediate flush)"
                         )
@@ -179,16 +359,23 @@ async def message_worker(
             else:
                 # Single message — enqueue in Redis and fire webhook
                 await queue_manager.enqueue(payload)
-                success = await webhook_sender.send(payload, endpoint="message")
-                if not success:
+                processed_payload = await webhook_sender.send(payload, endpoint="message")
+                if not processed_payload:
                     await queue_manager.enqueue_failed(
                         payload, "Webhook delivery failed"
                     )
                 else:
-                    logger.info(
-                        f"Worker-{worker_id}: processed message {message_id} "
-                        f"type={payload.get('type')}"
-                    )
+                    forward_success = await forward_message_pipeline(app, payload, processed_payload, db_path)
+                    if forward_success:
+                        await queue_manager.remove_from_queue(payload)
+                        logger.info(
+                            f"Worker-{worker_id}: processed message {message_id} "
+                            f"type={payload.get('type')}"
+                        )
+                    else:
+                        await queue_manager.enqueue_failed(
+                            payload, "Telegram forwarding failed"
+                        )
 
         except Exception as e:
             logger.error(
