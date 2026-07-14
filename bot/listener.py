@@ -198,6 +198,12 @@ async def forward_message_pipeline(client, payload, processed_payload, db_path):
             error_msg = None
             
             try:
+                # Force Pyrogram to resolve and cache the destination chat ID
+                try:
+                    await client.get_chat(dest_chat_id)
+                except Exception as cache_ex:
+                    logger.warning(f"Could not pre-resolve destination chat {dest_chat_id}: {cache_ex}")
+
                 # Check reply mapping
                 reply_to_id = None
                 if source_reply_id:
