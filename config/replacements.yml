@@ -1,0 +1,29 @@
+# Word Replacement Rules
+# Applied in order (top to bottom) to both text and caption fields.
+# Hot-reloaded every 5 minutes — edit on VPS without restart.
+
+rules:
+  # Simple string replacement
+  - pattern: "old_word"
+    replacement: "new_word"
+    is_regex: false
+
+  # Regex replacement (URL rewriting)
+  - pattern: "https?://original\\.com(/\\S*)?"
+    replacement: "https://new-domain.com\\1"
+    is_regex: true
+
+  # Channel/username replacement
+  - pattern: "@old_channel"
+    replacement: "@new_channel"
+    is_regex: false
+
+  # Remove specific text
+  - pattern: "Sponsored by.*$"
+    replacement: ""
+    is_regex: true
+
+  # Case-insensitive replacement
+  - pattern: "(?i)old brand"
+    replacement: "New Brand"
+    is_regex: true

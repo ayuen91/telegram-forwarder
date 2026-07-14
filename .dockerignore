@@ -1,0 +1,32 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Pyrogram session files (copied to server manually)
+sessions/
+*.session
+
+# Virtual environment (local dev only)
+.venv/
+
+# Tests
+tests/
+
+# IDE
+.cursor/
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment files
+.env
+*.env.local
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db

@@ -1,0 +1,84 @@
+services:
+  # Pyrogram user bot (listen-only) + health monitor + alert sender
+  bot:
+    build:
+      context: .                         # Repo root — so COPY bot/ and db/ both work
+      dockerfile: Dockerfile
+    env_file: .env
+    volumes:
+      - ./bot/sessions:/app/sessions     # Persist Pyrogram session
+      - ./data:/app/data                 # SQLite database + heartbeat file
+      - ./config:/app/config             # channels.yml + replacements.yml (hot-reloadable)
+      - ./logs:/app/logs                 # Log files
+      - ./media:/app/media               # Temp dir for album downloads
+      - ./db:/app/db                     # schema.sql access
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+    networks:
+      - internal
+
+  # Redis (message queue + deduplication + album buffer)
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "3"
+    networks:
+      - internal
+
+  # n8n (workflow engine — processes messages and sends via Bot API)
+  n8n:
+    image: n8nio/n8n:latest
+    env_file: .env
+    ports:
+      - "127.0.0.1:5678:5678"           # Only localhost — use Nginx reverse proxy for remote access
+    environment:
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_BASIC_AUTH_USER=${N8N_BASIC_AUTH_USER}
+      - N8N_BASIC_AUTH_PASSWORD=${N8N_BASIC_AUTH_PASSWORD}
+      - N8N_BLOCK_ENV_ACCESS_IN_NODE=false
+      - NODE_FUNCTION_ALLOW_BUILTIN=crypto
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET}
+      - BOT_TOKEN=${BOT_TOKEN}
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./data:/app/data                 # Shared SQLite access
+      - ./config:/app/config             # Access to replacement rules
+      - ./media:/app/media               # Shared media temp dir
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+    networks:
+      - internal
+
+volumes:
+  redis_data:
+  n8n_data:
+
+networks:
+  internal:
+    driver: bridge

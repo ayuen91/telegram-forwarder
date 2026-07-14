@@ -1,0 +1,280 @@
+{
+  "name": "Telegram Message Processor",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "message",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-message",
+      "name": "Webhook: Message",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1.1,
+      "position": [220, 300]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "album",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-album",
+      "name": "Webhook: Album",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1.1,
+      "position": [220, 600]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const crypto = require('crypto');\n\nconst webhookItem = $('Webhook: Message').first();\nconst body = webhookItem.json;\nconst headers = webhookItem.headers || {};\n\nconst secret = (process.env.WEBHOOK_SECRET || '').trim();\nif (!secret) {\n  throw new Error('WEBHOOK_SECRET not set — start n8n via scripts/start_n8n_local.ps1 or run_local.py so .env is loaded');\n}\n\nconst botToken = (process.env.BOT_TOKEN || '').trim();\nif (!botToken) {\n  throw new Error('BOT_TOKEN not set — start n8n via scripts/start_n8n_local.ps1 or run_local.py so .env is loaded');\n}\n\nconst signature = (headers['x-signature'] || headers['X-Signature'] || '').toLowerCase();\nconst payload = JSON.stringify(body);\nconst expected = crypto.createHmac('sha256', secret).update(payload).digest('hex');\n\nif (!signature || signature.length !== 64) {\n  throw new Error('Missing or invalid X-Signature header');\n}\n\nconst sigBuf = Buffer.from(signature, 'hex');\nconst expBuf = Buffer.from(expected, 'hex');\nif (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {\n  throw new Error('Invalid webhook signature');\n}\n\nreturn [{ json: { ...body, _bot_token: botToken } }];"
+      },
+      "id": "verify-hmac",
+      "name": "Verify HMAC",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const crypto = require('crypto');\n\nconst webhookItem = $('Webhook: Album').first();\nconst body = webhookItem.json;\nconst headers = webhookItem.headers || {};\n\nconst secret = (process.env.WEBHOOK_SECRET || '').trim();\nif (!secret) {\n  throw new Error('WEBHOOK_SECRET not set — start n8n via scripts/start_n8n_local.ps1 or run_local.py so .env is loaded');\n}\n\nconst botToken = (process.env.BOT_TOKEN || '').trim();\nif (!botToken) {\n  throw new Error('BOT_TOKEN not set — start n8n via scripts/start_n8n_local.ps1 or run_local.py so .env is loaded');\n}\n\nconst signature = (headers['x-signature'] || headers['X-Signature'] || '').toLowerCase();\nconst payload = JSON.stringify(body);\nconst expected = crypto.createHmac('sha256', secret).update(payload).digest('hex');\n\nif (!signature || signature.length !== 64) {\n  throw new Error('Missing or invalid X-Signature header');\n}\n\nconst sigBuf = Buffer.from(signature, 'hex');\nconst expBuf = Buffer.from(expected, 'hex');\nif (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {\n  throw new Error('Invalid webhook signature');\n}\n\nreturn [{ json: { ...body, _bot_token: botToken } }];"
+      },
+      "id": "verify-hmac-album",
+      "name": "Verify HMAC (Album)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 600]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Word Replacement Engine\n// Reads replacement_rules from the webhook payload (injected by Python bot)\nconst rules = $json.replacement_rules || [];\n\nfunction applyReplacements(text, rules) {\n  if (!text) return text;\n  let result = text;\n  for (const rule of rules) {\n    if (rule.is_regex) {\n      result = result.replace(new RegExp(rule.pattern, 'gm'), rule.replacement);\n    } else {\n      result = result.split(rule.pattern).join(rule.replacement);\n    }\n  }\n  return result;\n}\n\nconst data = {...$json};\nif (data.text) {\n  data.processed_text = applyReplacements(data.text, rules);\n  data.text_changed = data.processed_text !== data.text;\n}\nif (data.caption) {\n  data.processed_caption = applyReplacements(data.caption, rules);\n  data.caption_changed = data.processed_caption !== data.caption;\n}\nreturn [{json: data}];"
+      },
+      "id": "word-replacement",
+      "name": "Word Replacement",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [700, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Word Replacement (Album)\nconst rules = $json.replacement_rules || [];\n\nfunction applyReplacements(text, rules) {\n  if (!text) return text;\n  let result = text;\n  for (const rule of rules) {\n    if (rule.is_regex) {\n      result = result.replace(new RegExp(rule.pattern, 'gm'), rule.replacement);\n    } else {\n      result = result.split(rule.pattern).join(rule.replacement);\n    }\n  }\n  return result;\n}\n\nconst data = {...$json};\ndata.any_caption_changed = false;\nif (data.items && Array.isArray(data.items)) {\n  for (let item of data.items) {\n    if (item.caption) {\n      item.processed_caption = applyReplacements(item.caption, rules);\n      if (item.processed_caption !== item.caption) {\n        data.any_caption_changed = true;\n      }\n    }\n  }\n}\nreturn [{json: data}];"
+      },
+      "id": "word-replacement-album",
+      "name": "Word Replacement (Album)",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [700, 600]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{$json.type}}",
+              "value2": "text"
+            }
+          ]
+        }
+      },
+      "id": "type-router",
+      "name": "Is Text Message?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [940, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Route to all destinations (from payload)\nconst destinations = $json.destinations || [];\nconst results = [];\nfor (const dest of destinations) {\n  results.push({\n    json: {\n      ...$json,\n      destination_chat_id: dest.chat_id,\n      destination_name: dest.name,\n    }\n  });\n}\nif (results.length === 0) {\n  throw new Error('No destinations found in payload');\n}\nreturn results;"
+      },
+      "id": "destination-router",
+      "name": "Route to Destinations",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1180, 200]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Route to destinations (Media)\nconst destinations = $json.destinations || [];\nconst results = [];\nfor (const dest of destinations) {\n  results.push({\n    json: {\n      ...$json,\n      destination_chat_id: dest.chat_id,\n      destination_name: dest.name,\n    }\n  });\n}\nif (results.length === 0) {\n  throw new Error('No destinations found in payload');\n}\nreturn results;"
+      },
+      "id": "destination-router-media",
+      "name": "Route to Destinations (Media)",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1180, 400]
+    },
+    {
+      "parameters": {
+        "url": "=https://api.telegram.org/bot{{ $json._bot_token }}/sendMessage",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "chat_id", "value": "={{ $json.destination_chat_id }}" },
+            { "name": "text", "value": "={{ $json.processed_text || $json.text }}" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "send-text",
+      "name": "Bot API: sendMessage",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1420, 200],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "url": "=https://api.telegram.org/bot{{ $json._bot_token }}/copyMessage",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "chat_id", "value": "={{ $json.destination_chat_id }}" },
+            { "name": "from_chat_id", "value": "={{ $json.chat_id }}" },
+            { "name": "message_id", "value": "={{ $json.message_id }}" },
+            { "name": "caption", "value": "={{ $json.processed_caption || $json.caption || '' }}" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "copy-message",
+      "name": "Bot API: copyMessage",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1420, 400],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\"status\": \"ok\", \"message_id\": {{ $json.message_id }} }"
+      },
+      "id": "respond-success",
+      "name": "Respond Success",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1660, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Album Handler — route each item to each destination\nconst destinations = $json.destinations || [];\nconst items = $json.items || [];\nconst botToken = $json._bot_token || '';\nconst results = [];\nfor (const dest of destinations) {\n  for (const item of items) {\n    results.push({\n      json: {\n        chat_id: item.chat_id,\n        message_id: item.message_id,\n        destination_chat_id: dest.chat_id,\n        destination_name: dest.name,\n        caption: item.processed_caption || item.caption || '',\n        media_group_id: $json.media_group_id,\n        _bot_token: botToken,\n      }\n    });\n  }\n}\nif (results.length === 0) {\n  throw new Error('No destinations or items found');\n}\nreturn results;"
+      },
+      "id": "album-router",
+      "name": "Album: Route Items",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [940, 600]
+    },
+    {
+      "parameters": {
+        "url": "=https://api.telegram.org/bot{{ $json._bot_token }}/copyMessage",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "chat_id", "value": "={{ $json.destination_chat_id }}" },
+            { "name": "from_chat_id", "value": "={{ $json.chat_id }}" },
+            { "name": "message_id", "value": "={{ $json.message_id }}" },
+            { "name": "caption", "value": "={{ $json.caption }}" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "copy-album-item",
+      "name": "Bot API: copyMessage (Album Item)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1180, 600],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\"status\": \"ok\", \"type\": \"album\", \"media_group_id\": \"{{ $json.media_group_id }}\" }"
+      },
+      "id": "respond-album-success",
+      "name": "Respond Album Success",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1420, 600]
+    }
+  ],
+  "connections": {
+    "Webhook: Message": {
+      "main": [
+        [{ "node": "Verify HMAC", "type": "main", "index": 0 }]
+      ]
+    },
+    "Webhook: Album": {
+      "main": [
+        [{ "node": "Verify HMAC (Album)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Verify HMAC": {
+      "main": [
+        [{ "node": "Word Replacement", "type": "main", "index": 0 }]
+      ]
+    },
+    "Verify HMAC (Album)": {
+      "main": [
+        [{ "node": "Word Replacement (Album)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Word Replacement": {
+      "main": [
+        [{ "node": "Is Text Message?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Word Replacement (Album)": {
+      "main": [
+        [{ "node": "Album: Route Items", "type": "main", "index": 0 }]
+      ]
+    },
+    "Is Text Message?": {
+      "main": [
+        [{ "node": "Route to Destinations", "type": "main", "index": 0 }],
+        [{ "node": "Route to Destinations (Media)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Route to Destinations": {
+      "main": [
+        [{ "node": "Bot API: sendMessage", "type": "main", "index": 0 }]
+      ]
+    },
+    "Route to Destinations (Media)": {
+      "main": [
+        [{ "node": "Bot API: copyMessage", "type": "main", "index": 0 }]
+      ]
+    },
+    "Bot API: sendMessage": {
+      "main": [
+        [{ "node": "Respond Success", "type": "main", "index": 0 }]
+      ]
+    },
+    "Bot API: copyMessage": {
+      "main": [
+        [{ "node": "Respond Success", "type": "main", "index": 0 }]
+      ]
+    },
+    "Album: Route Items": {
+      "main": [
+        [{ "node": "Bot API: copyMessage (Album Item)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Bot API: copyMessage (Album Item)": {
+      "main": [
+        [{ "node": "Respond Album Success", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

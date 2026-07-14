@@ -1,0 +1,52 @@
+# Environment
+.env
+*.env.local
+
+# Pyrogram sessions
+bot/sessions/*.session
+*.session
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# SQLite
+data/*.db
+data/*.db-journal
+data/*.db-wal
+
+# Heartbeat
+data/heartbeat
+
+# Logs
+logs/*.log
+debug-*.log
+
+# Media temp files
+media/*
+
+# Backups
+backups/*.db
+
+# IDE
+.cursor/
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+.docker/
+
+# Virtual environment
+.venv/
+.venv/*

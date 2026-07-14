@@ -1,0 +1,15 @@
+source:
+  chat_id: -1004497139985       # Source channel ID (replace with your channel)
+  name: "Source Channel"
+
+destinations:
+  - chat_id: -1002674892914
+    name: "Destination Channel A"
+    enabled: true
+  - chat_id: -1005555555555
+    name: "Destination Channel B"
+    enabled: false
+  # Add more destinations as needed:
+  # - chat_id: -1001111111111
+  #   name: "Destination Channel C"
+  #   enabled: false            # Set to false to temporarily disable

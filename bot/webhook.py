@@ -1,0 +1,141 @@
+"""
+HMAC-signed webhook sender to n8n.
+
+Signs every payload with HMAC-SHA256 using a shared secret. n8n verifies
+the signature before processing. On failure, the message stays in the
+Redis queue for retry by the retry worker.
+
+Two endpoints:
+  - /webhook/message — single messages
+  - /webhook/album   — album payloads
+"""
+
+import hashlib
+import hmac
+import json
+import logging
+from typing import Dict, Any, Optional
+
+import aiohttp
+
+logger = logging.getLogger(__name__)
+
+
+class WebhookSender:
+    """Send HMAC-signed payloads to n8n webhook endpoints."""
+
+    def __init__(
+        self,
+        message_url: str,
+        album_url: str,
+        secret: str,
+        config=None,
+        connect_timeout: float = 5.0,
+        read_timeout: float = 30.0,
+    ):
+        self.message_url = message_url
+        self.album_url = album_url
+        self.secret = secret
+        self._config = config  # Config instance for injecting destinations/rules
+        self.timeout = aiohttp.ClientTimeout(
+            connect=connect_timeout,
+            total=read_timeout + connect_timeout,
+        )
+        self._session: Optional[aiohttp.ClientSession] = None
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """Lazy-initialize aiohttp session."""
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(timeout=self.timeout)
+        return self._session
+
+    def _sign_payload(self, payload_json: str) -> str:
+        """Generate HMAC-SHA256 signature for a JSON payload string."""
+        return hmac.new(
+            self.secret.encode("utf-8"),
+            payload_json.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+    async def send(self, payload: Dict[str, Any], endpoint: str = "message") -> bool:
+        """
+        Send a signed payload to n8n.
+
+        Args:
+            payload: Message or album data dict
+            endpoint: "message" or "album"
+
+        Returns:
+            True if n8n responded with 2xx, False otherwise
+        """
+        url = self.album_url if endpoint == "album" else self.message_url
+
+        # Inject config data so n8n doesn't need filesystem/js-yaml access
+        if self._config:
+            s = self._config.settings
+            payload["destinations"] = [
+                {"chat_id": d.chat_id, "name": d.name, "enabled": d.enabled}
+                for d in s.destinations if d.enabled
+            ]
+            payload["replacement_rules"] = [
+                {"pattern": r.pattern, "replacement": r.replacement, "is_regex": r.is_regex}
+                for r in s.replacement_rules
+            ]
+
+        # Compact JSON must match n8n JSON.stringify() for HMAC verification.
+        payload_json = json.dumps(payload, default=str, separators=(",", ":"))
+        signature = self._sign_payload(payload_json)
+
+        headers = {
+            "Content-Type": "application/json",
+            "X-Signature": signature,
+        }
+
+        message_id = payload.get("message_id", payload.get("media_group_id", "unknown"))
+
+        try:
+            session = await self._get_session()
+            async with session.post(url, data=payload_json, headers=headers) as resp:
+                body_preview = (await resp.text())[:200]
+                if 200 <= resp.status < 300:
+                    logger.info(
+                        f"Webhook sent: {endpoint} message_id={message_id} "
+                        f"status={resp.status}"
+                    )
+                    return True
+                else:
+                    body = body_preview
+                    logger.warning(
+                        f"Webhook failed: {endpoint} message_id={message_id} "
+                        f"status={resp.status} body={body[:200]}"
+                    )
+                    return False
+
+        except aiohttp.ClientConnectorError as e:
+            logger.warning(f"Webhook connection failed ({endpoint}): {e}")
+            return False
+        except aiohttp.ClientError as e:
+            logger.warning(f"Webhook error ({endpoint}): {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected webhook error ({endpoint}): {e}", exc_info=True)
+            return False
+
+    async def is_reachable(self) -> bool:
+        """
+        Check if n8n webhook endpoint is reachable (HEAD request).
+        Used by health checks.
+        """
+        try:
+            session = await self._get_session()
+            async with session.head(self.message_url) as resp:
+                # n8n may return 404 for HEAD on webhook, but connection works
+                return resp.status < 500
+        except Exception:
+            return False
+
+    async def close(self):
+        """Close the aiohttp session."""
+        if self._session and not self._session.closed:
+            await self._session.close()
+            self._session = None
