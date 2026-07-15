@@ -37,6 +37,13 @@ def _env_float(key: str, default: float) -> float:
     return float(os.getenv(key, str(default)))
 
 
+def _env_bool(key: str, default: bool) -> bool:
+    raw = os.getenv(key)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 @dataclass
 class Destination:
     chat_id: int
@@ -102,6 +109,12 @@ class Settings:
     health_check_interval: int = 300
     max_retries: int = 3
     log_level: str = "INFO"
+
+    # Daily health report (from .env)
+    daily_report_enabled: bool = True
+    daily_report_hour: int = 8
+    daily_report_timezone: str = "Etc/GMT-3"  # fixed UTC+3
+    daily_report_run_on_start: bool = False
 
     # Hot-reloadable (from YAML)
     destinations: List[Destination] = field(default_factory=list)
@@ -173,6 +186,11 @@ class Config:
         s.health_check_interval = _env_int("HEALTH_CHECK_INTERVAL", 300)
         s.max_retries = _env_int("MAX_RETRIES", 3)
         s.log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+
+        s.daily_report_enabled = _env_bool("DAILY_REPORT_ENABLED", True)
+        s.daily_report_hour = _env_int("DAILY_REPORT_HOUR", 8)
+        s.daily_report_timezone = os.getenv("DAILY_REPORT_TIMEZONE", "Etc/GMT-3")
+        s.daily_report_run_on_start = _env_bool("DAILY_REPORT_RUN_ON_START", False)
 
         if not s.api_id:
             raise EnvironmentError("Missing required environment variable: API_ID")

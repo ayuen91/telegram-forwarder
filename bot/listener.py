@@ -883,12 +883,13 @@ def register_listener(
     app: Client,
     source_chat_id: int,
     message_queue: asyncio.Queue,
+    redis_client=None,
 ):
     """
     Register the message and channel post handlers on the Pyrogram client.
 
     The handler is intentionally thin — validate, normalize, enqueue.
-    No Redis or webhook calls happen here.
+    Optionally increments a Redis daily received counter for metrics.
     """
 
     @app.on_message(filters.chat(source_chat_id))
@@ -897,6 +898,14 @@ def register_listener(
         payload = normalize_message(message)
         if payload is None:
             return  # Unsupported message type
+
+        if redis_client is not None:
+            try:
+                from metrics import incr_received
+
+                await incr_received(redis_client)
+            except Exception as e:
+                logger.debug(f"Received counter skipped: {e}")
 
         try:
             # Put to queue — blocks if queue is full (backpressure)

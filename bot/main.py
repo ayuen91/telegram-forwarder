@@ -8,6 +8,7 @@ Launched tasks:
   - album_flush_worker   — flush expired album buffers
   - retry_worker         — retry failed/deferred messages
   - health_checker       — periodic health checks + alerts
+  - daily_report         — scheduled visual health digest (08:00 UTC+3)
 """
 
 import asyncio
@@ -52,6 +53,7 @@ from webhook import WebhookSender
 from health import HealthMonitor
 from media_relay import RelayConfig, ensure_relay_chat, resolve_relay_config
 from telegram_sender import TelegramBotSender, TelegramFloodWait
+from scheduler import make_daily_report_factory
 
 logger = logging.getLogger(__name__)
 
@@ -283,7 +285,7 @@ async def main():
     )
 
     message_queue = asyncio.Queue(maxsize=100)
-    register_listener(app, settings.source_chat_id, message_queue)
+    register_listener(app, settings.source_chat_id, message_queue, redis_client=redis_client)
     stale_albums = await album_buf.flush_stale_albums()
 
     # ── Connect and verify ────────────────────────────────────────────
@@ -374,8 +376,34 @@ async def main():
         name="health",
     ))
 
+    if settings.daily_report_enabled:
+        tasks.append(asyncio.create_task(
+            supervised_task(
+                "daily-report",
+                make_daily_report_factory(
+                    health_monitor=health_monitor,
+                    queue_mgr=queue_mgr,
+                    redis_client=redis_client,
+                    config=config,
+                    db_path=settings.db_path,
+                    alert_token=settings.alert_bot_token,
+                    alert_chat_id=settings.alert_chat_id,
+                    hour=settings.daily_report_hour,
+                    tz_name=settings.daily_report_timezone,
+                    run_on_start=settings.daily_report_run_on_start,
+                    shutdown_event=shutdown_event,
+                ),
+            ),
+            name="daily-report",
+        ))
+        logger.info(
+            f"Daily report enabled: {settings.daily_report_hour:02d}:00 "
+            f"{settings.daily_report_timezone}"
+        )
+
     logger.info(
         f"Workers running: {settings.worker_count} processors, album-flush, retry, health"
+        + (", daily-report" if settings.daily_report_enabled else "")
     )
 
     def handle_shutdown(sig):

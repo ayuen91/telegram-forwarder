@@ -1,8 +1,8 @@
-"""Telegram alert delivery for operational failures."""
+"""Telegram alert delivery for operational failures and daily reports."""
 
 import logging
 import time
-from typing import Dict
+from typing import Dict, Optional
 
 import aiohttp
 
@@ -43,3 +43,38 @@ async def send_alert(
                     logger.error(f"Alert API error {resp.status}: {body[:200]}")
     except Exception as e:
         logger.error(f"Failed to send alert: {e}")
+
+
+async def send_photo(
+    token: str,
+    chat_id: int,
+    photo_url: str,
+    caption: Optional[str] = None,
+) -> None:
+    """Send a photo (e.g. QuickChart URL) via the alert bot. No cooldown."""
+    if not token or not chat_id or not photo_url:
+        return
+
+    url = f"https://api.telegram.org/bot{token}/sendPhoto"
+    payload = {"chat_id": chat_id, "photo": photo_url}
+    if caption:
+        # Captions support HTML; keep under Telegram's 1024-char limit
+        payload["caption"] = caption[:1024]
+        payload["parse_mode"] = "HTML"
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url, json=payload, timeout=aiohttp.ClientTimeout(total=30)
+            ) as resp:
+                if resp.status == 200:
+                    logger.info("Alert photo sent")
+                else:
+                    body = await resp.text()
+                    logger.error(f"Alert sendPhoto error {resp.status}: {body[:200]}")
+                    raise RuntimeError(f"sendPhoto failed: {resp.status}")
+    except RuntimeError:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to send alert photo: {e}")
+        raise
