@@ -26,13 +26,20 @@ def apply_replacements(text: Optional[str], rules: List[Dict[str, Any]]) -> Opti
 
 def build_processed_payload(payload: Dict[str, Any], config) -> Dict[str, Any]:
     """Apply replacements locally and attach destinations (no n8n required)."""
-    rules = [
-        {"pattern": r.pattern, "replacement": r.replacement, "is_regex": r.is_regex}
-        for r in config.settings.replacement_rules
-    ]
     destinations = [
         {"chat_id": d.chat_id, "name": d.name, "enabled": d.enabled}
         for d in config.get_active_destinations()
+    ]
+
+    # Native forward path preserves attribution — skip word replacements
+    if payload.get("use_native_forward"):
+        result = dict(payload)
+        result["destinations"] = destinations
+        return result
+
+    rules = [
+        {"pattern": r.pattern, "replacement": r.replacement, "is_regex": r.is_regex}
+        for r in config.settings.replacement_rules
     ]
 
     if payload.get("type") == "album":
@@ -74,6 +81,8 @@ def build_processed_payload(payload: Dict[str, Any], config) -> Dict[str, Any]:
 
 def needs_n8n(payload: Dict[str, Any]) -> bool:
     """Only route through n8n when there is text/caption to edit."""
+    if payload.get("use_native_forward"):
+        return False
     if payload.get("type") == "album":
         return any(item.get("caption") for item in payload.get("items", []))
     return bool(payload.get("text") or payload.get("caption"))

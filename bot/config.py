@@ -52,6 +52,20 @@ class ReplacementRule:
 
 
 @dataclass
+class OriginChannel:
+    chat_id: int
+    name: str = ""
+
+
+@dataclass
+class ForwardAttributionSettings:
+    """When enabled, preserve 'Forwarded from' via Bot API forwardMessage."""
+
+    enabled: bool = True
+    allowed_origin_channels: List[OriginChannel] = field(default_factory=list)
+
+
+@dataclass
 class Settings:
     """Application settings — immutable env vars + hot-reloadable YAML."""
 
@@ -92,6 +106,9 @@ class Settings:
     # Hot-reloadable (from YAML)
     destinations: List[Destination] = field(default_factory=list)
     replacement_rules: List[ReplacementRule] = field(default_factory=list)
+    forward_attribution: ForwardAttributionSettings = field(
+        default_factory=ForwardAttributionSettings
+    )
 
 
 class Config:
@@ -189,10 +206,27 @@ class Config:
                     )
                 )
 
+            # Forward attribution (preserve "Forwarded from" tag)
+            fa_data = data.get("forward_attribution") or {}
+            allowed: List[OriginChannel] = []
+            for origin in fa_data.get("allowed_origin_channels") or []:
+                allowed.append(
+                    OriginChannel(
+                        chat_id=int(origin["chat_id"]),
+                        name=origin.get("name", str(origin["chat_id"])),
+                    )
+                )
+            self.settings.forward_attribution = ForwardAttributionSettings(
+                enabled=fa_data.get("enabled", True),
+                allowed_origin_channels=allowed,
+            )
+
             self._channels_mtime = os.path.getmtime(path)
             logger.info(
                 f"Loaded channels.yml: source={self.settings.source_chat_id}, "
-                f"destinations={len(self.settings.destinations)}"
+                f"destinations={len(self.settings.destinations)}, "
+                f"forward_attribution.enabled={self.settings.forward_attribution.enabled}, "
+                f"allowed_origins={len(allowed)}"
             )
 
         except Exception as e:

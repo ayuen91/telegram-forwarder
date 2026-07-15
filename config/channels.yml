@@ -13,3 +13,16 @@ destinations:
   # - chat_id: -1001111111111
   #   name: "Destination Channel C"
   #   enabled: false            # Set to false to temporarily disable
+
+# When the source channel posts a message forwarded from another channel where
+# the sender bot is admin, re-forward via Bot API so destinations show
+# "Forwarded from …". Word replacements are skipped for those messages.
+#
+# If allowed_origin_channels is empty, any origin channel where the bot is
+# admin is eligible (runtime getChatMember check). Use an explicit list to
+# restrict which origins get the native-forward path.
+forward_attribution:
+  enabled: true
+  allowed_origin_channels: []
+  # - chat_id: -1001111111111
+  #   name: "Original News Channel"

@@ -26,6 +26,11 @@ from media_relay import RelayConfig, relay_to_bot, cleanup_relay
 from replacements import build_processed_payload, needs_n8n
 from alerts import send_alert
 from telegram_sender import TelegramBotSender, TelegramFloodWait
+from forward_attribution import (
+    serialize_forward_origin,
+    ForwardAttributionChecker,
+    attach_native_forward_flag,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +69,10 @@ def normalize_message(message: Message) -> Optional[Dict[str, Any]]:
         "reply_to_message_id": message.reply_to_message_id if message.reply_to_message_id else None,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+
+    forward_origin = serialize_forward_origin(message)
+    if forward_origin:
+        payload["forward_origin"] = forward_origin
 
     return payload
 
@@ -237,6 +246,7 @@ async def forward_message_pipeline(
     """
     Send the processed message/album to all destinations via Bot API.
     Media is relayed through the userbot first; text is sent directly.
+    Native-forward payloads skip relay and use forwardMessage from the origin.
     Tracks per-item reply mappings so channel reply threads work correctly.
     """
     msg_type = payload.get("type")
@@ -256,8 +266,10 @@ async def forward_message_pipeline(
     any_failed = False
     any_deferred = False
     relay_message_ids: Optional[list] = None
+    use_native = bool(payload.get("use_native_forward"))
 
-    source_ids_for_relay = _source_message_ids(payload)
+    # Media relay only when not using native forward from origin channel
+    source_ids_for_relay = [] if use_native else _source_message_ids(payload)
     if source_ids_for_relay:
         if not pyrogram_app or relay is None:
             logger.error("Media forwarding requires Pyrogram client and relay config")
@@ -375,7 +387,35 @@ async def forward_message_pipeline(
                         reply_to_message_id=reply_to_id,
                     )
 
-                result = await sender.call_with_flood_wait(_send)
+                try:
+                    result = await sender.call_with_flood_wait(_send)
+                except TelegramFloodWait:
+                    raise
+                except Exception as native_err:
+                    # Fall back to copy/send if native forward fails (protected
+                    # content, deleted origin message, bot lacking access, etc.)
+                    if use_native and _is_native_forward_fallback_error(native_err):
+                        logger.warning(
+                            f"Native forward failed for {dest_name} "
+                            f"({native_err}); falling back to copy/send"
+                        )
+                        relay_holder = [relay_message_ids]
+                        result = await _deliver_with_native_fallback(
+                            sender=sender,
+                            payload=payload,
+                            processed_payload=processed_payload,
+                            msg_type=msg_type,
+                            dest_chat_id=dest_chat_id,
+                            reply_to_id=reply_to_id,
+                            pyrogram_app=pyrogram_app,
+                            relay=relay,
+                            source_chat_id=source_chat_id,
+                            relay_message_ids_holder=relay_holder,
+                        )
+                        relay_message_ids = relay_holder[0]
+                    else:
+                        raise
+
                 sent_msg_id = result["sent_message_id"]
 
                 await _store_reply_mappings(
@@ -452,6 +492,78 @@ async def forward_message_pipeline(
     return "success"
 
 
+def _is_native_forward_fallback_error(exc: Exception) -> bool:
+    """True if the error suggests falling back to copy/send is worthwhile."""
+    msg = str(exc).lower()
+    keywords = (
+        "protected",
+        "can't be forwarded",
+        "cannot be forwarded",
+        "message to forward not found",
+        "message not found",
+        "chat not found",
+        "not enough rights",
+        "have no rights",
+        "bot is not a member",
+        "forbidden",
+        "forwardmessage failed",
+        "forwardmessages failed",
+    )
+    return any(k in msg for k in keywords)
+
+
+async def _deliver_with_native_fallback(
+    sender: TelegramBotSender,
+    payload: Dict[str, Any],
+    processed_payload: Dict[str, Any],
+    msg_type: str,
+    dest_chat_id: int,
+    reply_to_id,
+    pyrogram_app: Optional[Client],
+    relay: Optional[RelayConfig],
+    source_chat_id: int,
+    relay_message_ids_holder: list,
+) -> Dict[str, Any]:
+    """
+    Retry delivery without native forward (copy/send path).
+    Ensures media is relayed if needed. Mutates payload flags off.
+    """
+    fallback_payload = dict(payload)
+    fallback_payload["use_native_forward"] = False
+    fallback_payload.pop("native_forward_origin", None)
+
+    relay_ids = relay_message_ids_holder[0]
+    source_ids = _source_message_ids(fallback_payload)
+    if source_ids and not relay_ids:
+        if not pyrogram_app or relay is None:
+            raise RuntimeError(
+                "Native forward fallback needs Pyrogram/relay for media"
+            )
+        relay_ids = await relay_to_bot(
+            pyrogram_app,
+            sender,
+            source_chat_id,
+            source_ids,
+            relay,
+            is_album=(msg_type == "album"),
+        )
+        relay_message_ids_holder[0] = relay_ids
+
+    async def _send():
+        return await sender.forward_to_destination(
+            dest_chat_id=dest_chat_id,
+            msg_type=msg_type,
+            payload=fallback_payload,
+            processed_payload=processed_payload,
+            relay_chat_id=relay.bot_from_chat if relay else None,
+            relay_message_ids=relay_ids,
+            reply_to_message_id=reply_to_id,
+        )
+
+    result = await sender.call_with_flood_wait(_send)
+    return result
+
+
 async def _resolve_processed_payload(
     webhook_sender,
     config,
@@ -467,6 +579,17 @@ async def _resolve_processed_payload(
             f"n8n unavailable or rejected msg {payload.get('message_id')} — using local processing"
         )
     return build_processed_payload(payload, config)
+
+
+async def _prepare_payload_for_delivery(
+    sender: TelegramBotSender,
+    payload: Dict[str, Any],
+    config,
+) -> Dict[str, Any]:
+    """Evaluate forward-attribution eligibility and flag the payload."""
+    checker = ForwardAttributionChecker(sender)
+    use_native = await checker.should_use_native_forward(payload, config)
+    return attach_native_forward_flag(payload, use_native)
 
 
 async def process_payload(
@@ -494,6 +617,7 @@ async def process_payload(
         await dedup.mark_inflight(chat_id, inflight_ids)
 
     try:
+        payload = await _prepare_payload_for_delivery(sender, payload, config)
         processed_payload = await _resolve_processed_payload(
             webhook_sender, config, payload, endpoint
         )
@@ -558,6 +682,7 @@ async def retry_payload(
         await dedup.mark_inflight(chat_id, inflight_ids)
 
     try:
+        payload = await _prepare_payload_for_delivery(sender, payload, config)
         processed_payload = await _resolve_processed_payload(
             webhook_sender, config, payload, endpoint
         )

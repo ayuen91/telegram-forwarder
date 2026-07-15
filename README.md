@@ -16,6 +16,7 @@ Source Channel → Pyrogram user (listen + media relay) → Redis Queue → n8n 
 **Key features:**
 - **Minimal bot privileges**: sender bot does not need source channel access
 - **Zero-download media**: userbot copies media to relay chat; bot copies from relay to destinations
+- **Forward attribution**: when the source posts a message forwarded from a channel where the sender bot is admin, destinations get the same "Forwarded from" tag via `forwardMessage`
 - **Reply threading**: Maps source message IDs to destination IDs so channel replies are preserved
 - **Album support**: Buffers media groups via `media_group_id` with 2-second collection window
 - **Word replacement**: Applied to both text and captions, regex and plain string supported
@@ -98,7 +99,18 @@ destinations:
   - chat_id: -1009876543210
     name: "Destination A"
     enabled: true
+
+# Preserve "Forwarded from" when source posts a channel-forward and the
+# sender bot is admin of that origin channel. Word replacements are skipped
+# for those messages. Empty allowlist = any origin where the bot is admin.
+forward_attribution:
+  enabled: true
+  allowed_origin_channels: []
+  # - chat_id: -1001111111111
+  #   name: "Original News Channel"
 ```
+
+**Forward attribution setup:** Add the sender bot as admin (with post permission) to each origin channel you want attributed forwards from. If `forwardMessage` fails (protected content, deleted origin, etc.), the bot falls back to the normal copy/send path without the tag.
 
 ### Word Replacements (`config/replacements.yml`)
 
@@ -187,7 +199,8 @@ telegram-forwarder/
 │   ├── main.py            # Entry point: supervisor + self-test
 │   ├── listener.py        # on_message → Queue → workers → Bot API forward
 │   ├── media_relay.py     # Userbot copy to relay chat (media only)
-│   ├── telegram_sender.py # Bot API sendMessage / copyMessage delivery
+│   ├── telegram_sender.py # Bot API sendMessage / copyMessage / forwardMessage
+│   ├── forward_attribution.py  # Detect origin + admin eligibility for forward tags
 │   ├── album_buffer.py    # Media group collection
 │   ├── queue_manager.py   # Redis queues + retry
 │   ├── deduplication.py   # Message dedup

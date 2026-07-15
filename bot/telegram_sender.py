@@ -108,6 +108,59 @@ class TelegramBotSender:
     async def get_chat(self, chat_id: Union[int, str]) -> Dict[str, Any]:
         return await self._call("getChat", {"chat_id": chat_id})
 
+    async def get_chat_member(self, chat_id: Union[int, str], user_id: int) -> Dict[str, Any]:
+        """Return ChatMember object for user_id in chat_id."""
+        return await self._call(
+            "getChatMember",
+            {"chat_id": chat_id, "user_id": int(user_id)},
+        )
+
+    async def forward_message(
+        self,
+        chat_id: Union[int, str],
+        from_chat_id: Union[int, str],
+        message_id: Union[int, str],
+        reply_to_message_id: Optional[Union[int, str]] = None,
+    ) -> int:
+        """
+        Forward a message preserving the 'Forwarded from' attribution.
+        Returns the new message_id in the destination chat.
+        """
+        payload: Dict[str, Any] = {
+            "chat_id": chat_id,
+            "from_chat_id": from_chat_id,
+            "message_id": int(message_id),
+        }
+        reply_params = self._reply_params(reply_to_message_id)
+        if reply_params:
+            payload["reply_parameters"] = reply_params
+
+        result = await self._call("forwardMessage", payload)
+        return int(result["message_id"])
+
+    async def forward_messages(
+        self,
+        chat_id: Union[int, str],
+        from_chat_id: Union[int, str],
+        message_ids: List[Union[int, str]],
+        reply_to_message_id: Optional[Union[int, str]] = None,
+    ) -> List[int]:
+        """
+        Forward multiple messages (e.g. album) preserving attribution.
+        Returns destination message_ids in order.
+        """
+        payload: Dict[str, Any] = {
+            "chat_id": chat_id,
+            "from_chat_id": from_chat_id,
+            "message_ids": [int(mid) for mid in message_ids],
+        }
+        reply_params = self._reply_params(reply_to_message_id)
+        if reply_params:
+            payload["reply_parameters"] = reply_params
+
+        result = await self._call("forwardMessages", payload)
+        return [int(item["message_id"]) for item in result]
+
     async def _consume_updates(self) -> List[Dict[str, Any]]:
         """Fetch pending Bot API updates (sender bot must not use a webhook)."""
         params: Dict[str, Any] = {
@@ -294,6 +347,8 @@ class TelegramBotSender:
 
         Text uses sendMessage from payload content (no source-channel access).
         Media uses copyMessage from the userbot relay chat.
+        When use_native_forward is set, uses forwardMessage from the origin channel
+        so destinations show the "Forwarded from" tag.
 
         Returns:
             {
@@ -301,6 +356,14 @@ class TelegramBotSender:
                 "reply_mappings": [(source_id, sent_id), ...],
             }
         """
+        if payload.get("use_native_forward"):
+            return await self._native_forward_to_destination(
+                dest_chat_id=dest_chat_id,
+                msg_type=msg_type,
+                payload=payload,
+                reply_to_message_id=reply_to_message_id,
+            )
+
         if msg_type == "album":
             items = processed_payload.get("items") or payload.get("items") or []
             sorted_items = sorted(items, key=lambda x: int(x.get("message_id", 0)))
@@ -364,6 +427,60 @@ class TelegramBotSender:
                 reply_to_message_id=reply_to_message_id,
             )
 
+        return {
+            "sent_message_id": sent_id,
+            "reply_mappings": [(msg_id, sent_id)],
+        }
+
+    async def _native_forward_to_destination(
+        self,
+        dest_chat_id: Union[int, str],
+        msg_type: str,
+        payload: Dict[str, Any],
+        reply_to_message_id: Optional[Union[int, str]] = None,
+    ) -> Dict[str, Any]:
+        """Deliver via forwardMessage(s) from the original channel."""
+        origin = payload.get("native_forward_origin") or {}
+        from_chat_id = origin.get("chat_id")
+        origin_ids = origin.get("message_ids") or (
+            [origin["message_id"]] if origin.get("message_id") is not None else []
+        )
+        if from_chat_id is None or not origin_ids:
+            raise RuntimeError("Native forward missing origin chat_id / message_ids")
+
+        if msg_type == "album":
+            items = payload.get("items") or []
+            sorted_items = sorted(items, key=lambda x: int(x.get("message_id", 0)))
+            # Prefer per-item forward_origin message_ids (same order as sorted items)
+            fwd_ids = []
+            for item in sorted_items:
+                fo = item.get("forward_origin") or {}
+                fwd_ids.append(int(fo.get("message_id") or 0))
+            if not all(fwd_ids):
+                fwd_ids = [int(mid) for mid in origin_ids]
+
+            sent_ids = await self.forward_messages(
+                chat_id=dest_chat_id,
+                from_chat_id=from_chat_id,
+                message_ids=fwd_ids,
+                reply_to_message_id=reply_to_message_id,
+            )
+            reply_mappings = [
+                (int(item["message_id"]), sent_id)
+                for item, sent_id in zip(sorted_items, sent_ids)
+            ]
+            return {
+                "sent_message_id": sent_ids[0] if sent_ids else None,
+                "reply_mappings": reply_mappings,
+            }
+
+        msg_id = int(payload["message_id"])
+        sent_id = await self.forward_message(
+            chat_id=dest_chat_id,
+            from_chat_id=from_chat_id,
+            message_id=int(origin_ids[0]),
+            reply_to_message_id=reply_to_message_id,
+        )
         return {
             "sent_message_id": sent_id,
             "reply_mappings": [(msg_id, sent_id)],
