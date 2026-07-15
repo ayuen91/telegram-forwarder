@@ -105,3 +105,120 @@ class TestForwardToDestination:
             reply_to_message_id=None,
         )
         assert result["sent_message_id"] == 55
+
+    @pytest.mark.asyncio
+    async def test_poll_uses_send_poll_without_relay(self, sender):
+        sender.send_poll = AsyncMock(return_value=60)
+        sender.copy_message = AsyncMock()
+
+        poll_data = {
+            "question": "Yes or no?",
+            "options": ["Yes", "No"],
+            "is_anonymous": True,
+            "type": "regular",
+        }
+        result = await sender.forward_to_destination(
+            dest_chat_id=-1001,
+            msg_type="poll",
+            payload={"message_id": 40, "poll": poll_data},
+            processed_payload={},
+        )
+
+        sender.send_poll.assert_awaited_once_with(
+            chat_id=-1001,
+            poll=poll_data,
+            reply_to_message_id=None,
+        )
+        sender.copy_message.assert_not_called()
+        assert result == {"sent_message_id": 60, "reply_mappings": [(40, 60)]}
+
+    @pytest.mark.asyncio
+    async def test_location_uses_send_location_without_relay(self, sender):
+        sender.send_location = AsyncMock(return_value=61)
+        sender.copy_message = AsyncMock()
+
+        location_data = {"latitude": 1.1, "longitude": 2.2}
+        result = await sender.forward_to_destination(
+            dest_chat_id=-1001,
+            msg_type="location",
+            payload={"message_id": 41, "location": location_data},
+            processed_payload={},
+        )
+
+        sender.send_location.assert_awaited_once_with(
+            chat_id=-1001,
+            location=location_data,
+            reply_to_message_id=None,
+        )
+        sender.copy_message.assert_not_called()
+        assert result["sent_message_id"] == 61
+
+    @pytest.mark.asyncio
+    async def test_venue_uses_send_venue_without_relay(self, sender):
+        sender.send_venue = AsyncMock(return_value=62)
+        sender.copy_message = AsyncMock()
+
+        venue_data = {
+            "latitude": 3.3,
+            "longitude": 4.4,
+            "title": "Place",
+            "address": "Street 1",
+        }
+        result = await sender.forward_to_destination(
+            dest_chat_id=-1001,
+            msg_type="venue",
+            payload={"message_id": 42, "venue": venue_data},
+            processed_payload={},
+        )
+
+        sender.send_venue.assert_awaited_once_with(
+            chat_id=-1001,
+            venue=venue_data,
+            reply_to_message_id=None,
+        )
+        sender.copy_message.assert_not_called()
+        assert result["sent_message_id"] == 62
+
+    @pytest.mark.asyncio
+    async def test_contact_uses_send_contact_without_relay(self, sender):
+        sender.send_contact = AsyncMock(return_value=63)
+        sender.copy_message = AsyncMock()
+
+        contact_data = {
+            "phone_number": "+123",
+            "first_name": "Test",
+            "last_name": "User",
+        }
+        result = await sender.forward_to_destination(
+            dest_chat_id=-1001,
+            msg_type="contact",
+            payload={"message_id": 43, "contact": contact_data},
+            processed_payload={},
+        )
+
+        sender.send_contact.assert_awaited_once_with(
+            chat_id=-1001,
+            contact=contact_data,
+            reply_to_message_id=None,
+        )
+        sender.copy_message.assert_not_called()
+        assert result["sent_message_id"] == 63
+
+    @pytest.mark.asyncio
+    async def test_quiz_poll_without_correct_option_falls_back_to_regular(self, sender):
+        sender._call = AsyncMock(return_value={"message_id": 70})
+
+        poll_data = {
+            "question": "Quiz?",
+            "options": ["A", "B"],
+            "type": "quiz",
+        }
+        await sender.send_poll(
+            chat_id=-1001,
+            poll=poll_data,
+        )
+
+        sender._call.assert_awaited_once()
+        payload = sender._call.await_args.args[1]
+        assert payload["type"] == "regular"
+        assert "correct_option_id" not in payload

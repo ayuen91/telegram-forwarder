@@ -10,7 +10,7 @@ CREATE TABLE IF NOT EXISTS messages (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     telegram_message_id INTEGER NOT NULL,
     source_chat_id      INTEGER NOT NULL,
-    message_type        TEXT NOT NULL,      -- 'text','photo','video','document','sticker','voice','animation','audio','video_note','album'
+    message_type        TEXT NOT NULL,      -- 'text','photo','video','document','sticker','voice','animation','audio','video_note','album','poll','contact','location','venue'
     original_text       TEXT,               -- For text messages
     original_caption    TEXT,               -- For media messages
     processed_text      TEXT,               -- After word replacement

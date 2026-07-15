@@ -36,6 +36,15 @@ logger = logging.getLogger(__name__)
 
 ForwardStatus = Literal["success", "failed", "defer"]
 
+# Message types delivered via Bot API send* methods (no userbot relay).
+_BOT_API_DIRECT_TYPES = frozenset({"text", "poll", "contact", "location", "venue"})
+
+# File media types that require userbot relay before copyMessage delivery.
+_RELAY_MEDIA_TYPES = frozenset({
+    "photo", "video", "document", "sticker", "voice",
+    "video_note", "animation", "audio",
+})
+
 
 def normalize_message(message: Message) -> Optional[Dict[str, Any]]:
     """
@@ -65,10 +74,19 @@ def normalize_message(message: Message) -> Optional[Dict[str, Any]]:
         "entities": entities,
         "caption_entities": caption_entities,
         "media_group_id": message.media_group_id,
-        "has_media": msg_type != "text",
+        "has_media": msg_type in _RELAY_MEDIA_TYPES or msg_type == "album",
         "reply_to_message_id": message.reply_to_message_id if message.reply_to_message_id else None,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+
+    if msg_type == "poll" and message.poll:
+        payload["poll"] = _serialize_poll(message.poll)
+    elif msg_type == "contact" and message.contact:
+        payload["contact"] = _serialize_contact(message.contact)
+    elif msg_type == "location" and message.location:
+        payload["location"] = _serialize_location(message.location)
+    elif msg_type == "venue" and message.venue:
+        payload["venue"] = _serialize_venue(message.venue)
 
     forward_origin = serialize_forward_origin(message)
     if forward_origin:
@@ -101,12 +119,75 @@ def _get_message_type(message: Message) -> Optional[str]:
         return "poll"
     elif message.contact:
         return "contact"
+    elif message.venue:
+        return "venue"
     elif message.location:
         return "location"
     else:
         # Service messages, empty messages, etc.
         logger.debug(f"Unsupported message type for message {message.id}, skipping")
         return None
+
+
+def _serialize_poll(poll) -> Dict[str, Any]:
+    poll_type = poll.type.value if hasattr(poll.type, "value") else str(poll.type or "regular")
+    data: Dict[str, Any] = {
+        "question": poll.question,
+        "options": [opt.text for opt in poll.options],
+        "is_anonymous": poll.is_anonymous if poll.is_anonymous is not None else True,
+        "type": poll_type,
+    }
+    if poll.allows_multiple_answers:
+        data["allows_multiple_answers"] = True
+    if poll.correct_option_id is not None:
+        data["correct_option_id"] = poll.correct_option_id
+    if poll.explanation:
+        data["explanation"] = poll.explanation
+    if poll.open_period:
+        data["open_period"] = poll.open_period
+    if poll.close_date:
+        data["close_date"] = poll.close_date.isoformat()
+    return data
+
+
+def _serialize_location(location) -> Dict[str, Any]:
+    data: Dict[str, Any] = {
+        "latitude": location.latitude,
+        "longitude": location.longitude,
+    }
+    accuracy = getattr(location, "horizontal_accuracy", None)
+    if accuracy is not None:
+        data["horizontal_accuracy"] = accuracy
+    return data
+
+
+def _serialize_venue(venue) -> Dict[str, Any]:
+    data: Dict[str, Any] = {
+        "latitude": venue.location.latitude,
+        "longitude": venue.location.longitude,
+        "title": venue.title,
+        "address": venue.address,
+    }
+    if venue.foursquare_id:
+        data["foursquare_id"] = venue.foursquare_id
+    if venue.foursquare_type:
+        data["foursquare_type"] = venue.foursquare_type
+    google_place_id = getattr(venue, "google_place_id", None)
+    if google_place_id:
+        data["google_place_id"] = google_place_id
+    return data
+
+
+def _serialize_contact(contact) -> Dict[str, Any]:
+    data: Dict[str, Any] = {
+        "phone_number": contact.phone_number,
+        "first_name": contact.first_name,
+    }
+    if contact.last_name:
+        data["last_name"] = contact.last_name
+    if contact.vcard:
+        data["vcard"] = contact.vcard
+    return data
 
 
 def _serialize_entities(entities) -> list:
@@ -229,7 +310,7 @@ def _source_message_ids(payload: Dict[str, Any]) -> list:
     if msg_type == "album":
         items = payload.get("items") or []
         return [int(i["message_id"]) for i in sorted(items, key=lambda x: int(x.get("message_id", 0)))]
-    if msg_type and msg_type != "text":
+    if msg_type in _RELAY_MEDIA_TYPES:
         return [int(payload["message_id"])]
     return []
 

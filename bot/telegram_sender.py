@@ -8,6 +8,7 @@ so the sender bot never needs access to the source channel.
 
 import asyncio
 import logging
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Union
 
 import aiohttp
@@ -293,6 +294,134 @@ class TelegramBotSender:
         result = await self._call("sendMessage", payload)
         return int(result["message_id"])
 
+    @staticmethod
+    def _unix_timestamp(value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return int(value)
+        if isinstance(value, datetime):
+            return int(value.timestamp())
+        if isinstance(value, str):
+            return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+        return None
+
+    async def send_poll(
+        self,
+        chat_id: Union[int, str],
+        poll: Dict[str, Any],
+        reply_to_message_id: Optional[Union[int, str]] = None,
+    ) -> int:
+        """Recreate a poll via sendPoll."""
+        poll_type = poll.get("type", "regular")
+        correct_option_id = poll.get("correct_option_id")
+
+        if poll_type == "quiz" and correct_option_id is None:
+            logger.warning(
+                "Quiz poll missing correct_option_id — sending as regular poll"
+            )
+            poll_type = "regular"
+
+        payload: Dict[str, Any] = {
+            "chat_id": chat_id,
+            "question": poll["question"],
+            "options": poll["options"],
+            "is_anonymous": poll.get("is_anonymous", True),
+            "type": poll_type,
+        }
+        if poll.get("allows_multiple_answers"):
+            payload["allows_multiple_answers"] = True
+        if poll_type == "quiz" and correct_option_id is not None:
+            payload["correct_option_id"] = int(correct_option_id)
+        if poll.get("explanation"):
+            payload["explanation"] = poll["explanation"]
+        if poll.get("open_period"):
+            payload["open_period"] = int(poll["open_period"])
+        close_date = self._unix_timestamp(poll.get("close_date"))
+        if close_date is not None:
+            payload["close_date"] = close_date
+
+        reply_params = self._reply_params(reply_to_message_id)
+        if reply_params:
+            payload["reply_parameters"] = reply_params
+
+        result = await self._call("sendPoll", payload)
+        return int(result["message_id"])
+
+    async def send_location(
+        self,
+        chat_id: Union[int, str],
+        location: Dict[str, Any],
+        reply_to_message_id: Optional[Union[int, str]] = None,
+    ) -> int:
+        """Recreate a location pin via sendLocation."""
+        payload: Dict[str, Any] = {
+            "chat_id": chat_id,
+            "latitude": location["latitude"],
+            "longitude": location["longitude"],
+        }
+        if location.get("horizontal_accuracy") is not None:
+            payload["horizontal_accuracy"] = location["horizontal_accuracy"]
+
+        reply_params = self._reply_params(reply_to_message_id)
+        if reply_params:
+            payload["reply_parameters"] = reply_params
+
+        result = await self._call("sendLocation", payload)
+        return int(result["message_id"])
+
+    async def send_venue(
+        self,
+        chat_id: Union[int, str],
+        venue: Dict[str, Any],
+        reply_to_message_id: Optional[Union[int, str]] = None,
+    ) -> int:
+        """Recreate a venue via sendVenue."""
+        payload: Dict[str, Any] = {
+            "chat_id": chat_id,
+            "latitude": venue["latitude"],
+            "longitude": venue["longitude"],
+            "title": venue["title"],
+            "address": venue["address"],
+        }
+        if venue.get("foursquare_id"):
+            payload["foursquare_id"] = venue["foursquare_id"]
+        if venue.get("foursquare_type"):
+            payload["foursquare_type"] = venue["foursquare_type"]
+        if venue.get("google_place_id"):
+            payload["google_place_id"] = venue["google_place_id"]
+
+        reply_params = self._reply_params(reply_to_message_id)
+        if reply_params:
+            payload["reply_parameters"] = reply_params
+
+        result = await self._call("sendVenue", payload)
+        return int(result["message_id"])
+
+    async def send_contact(
+        self,
+        chat_id: Union[int, str],
+        contact: Dict[str, Any],
+        reply_to_message_id: Optional[Union[int, str]] = None,
+    ) -> int:
+        """Recreate a shared contact via sendContact."""
+        payload: Dict[str, Any] = {
+            "chat_id": chat_id,
+            "phone_number": contact["phone_number"],
+            "first_name": contact["first_name"],
+        }
+        if contact.get("last_name"):
+            payload["last_name"] = contact["last_name"]
+        if contact.get("vcard"):
+            payload["vcard"] = contact["vcard"]
+
+        reply_params = self._reply_params(reply_to_message_id)
+        if reply_params:
+            payload["reply_parameters"] = reply_params
+
+        result = await self._call("sendContact", payload)
+        return int(result["message_id"])
+
     async def edit_message_caption(
         self,
         chat_id: Union[int, str],
@@ -410,6 +539,30 @@ class TelegramBotSender:
                 chat_id=dest_chat_id,
                 text=text,
                 entities=entities,
+                reply_to_message_id=reply_to_message_id,
+            )
+        elif msg_type == "poll":
+            sent_id = await self.send_poll(
+                chat_id=dest_chat_id,
+                poll=payload["poll"],
+                reply_to_message_id=reply_to_message_id,
+            )
+        elif msg_type == "location":
+            sent_id = await self.send_location(
+                chat_id=dest_chat_id,
+                location=payload["location"],
+                reply_to_message_id=reply_to_message_id,
+            )
+        elif msg_type == "venue":
+            sent_id = await self.send_venue(
+                chat_id=dest_chat_id,
+                venue=payload["venue"],
+                reply_to_message_id=reply_to_message_id,
+            )
+        elif msg_type == "contact":
+            sent_id = await self.send_contact(
+                chat_id=dest_chat_id,
+                contact=payload["contact"],
                 reply_to_message_id=reply_to_message_id,
             )
         else:
