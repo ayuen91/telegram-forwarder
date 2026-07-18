@@ -111,7 +111,14 @@ class HealthMonitor:
         Called by the supervised health_checker task every interval.
         """
         # Step 1: Hot-reload config if files changed
-        self.config.check_and_reload()
+        if self.config.check_and_reload():
+            try:
+                await self._send_telegram_alert(
+                    "⚙️ <b>Config Hot-Reloaded</b>\n\n"
+                    "<blockquote>Successfully loaded configurations from YAML files. All settings applied without reboot.</blockquote>"
+                )
+            except Exception as e:
+                logger.error(f"Failed to send config reload alert: {e}")
 
         # Step 2: Run health checks
         results = await self.run_all_checks()
@@ -352,12 +359,18 @@ class HealthMonitor:
             result.level, "⚪"
         )
 
+        details_html = f"<code>{result.message}</code>" if result.message else "<i>No details provided.</i>"
+        if result.message and len(result.message) > 100:
+            import html
+            details_html = f"<blockquote expandable><pre>{html.escape(result.message)}</pre></blockquote>"
+
         message = (
             f"{level_emoji} <b>ALERT: Telegram Forwarder</b>\n\n"
-            f"<b>Component:</b> {result.name}\n"
+            f"<blockquote><b>Component:</b> <code>{result.name}</code>\n"
             f"<b>Status:</b> FAILED\n"
-            f"<b>Details:</b> {result.message}\n"
-            f"<b>Time:</b> {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}"
+            f"<b>Severity:</b> <code>{result.level.upper()}</code></blockquote>\n"
+            f"📝 <b>Details:</b>\n{details_html}\n\n"
+            f"🕒 <i>{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}</i>"
         )
 
         try:

@@ -705,7 +705,9 @@ async def process_payload(
             await queue_manager.enqueue_failed(payload, reason)
             await send_alert(
                 alert_token, alert_chat_id,
-                f"🔴 <b>Forward failed</b>\nMessage: {message_id}\nReason: {reason}",
+                f"🔴 <b>Forward Failed</b>\n\n"
+                f"<blockquote><b>Message ID:</b> <code>{message_id}</code>\n"
+                f"<b>Reason:</b> {reason}</blockquote>",
                 alert_key=f"proc-fail-{message_id}",
             )
             return "failed"
@@ -724,9 +726,11 @@ async def process_payload(
             result = await queue_manager.enqueue_failed(payload, reason)
             await send_alert(
                 alert_token, alert_chat_id,
-                f"🔴 <b>Forward failed</b>\nMessage: {message_id}\nType: {payload.get('type')}\n"
-                f"Reason: {reason}"
-                + ("\n⚠️ Moved to dead letter queue" if result == "dead_letter" else ""),
+                f"🔴 <b>Forward Failed</b>\n\n"
+                f"<blockquote><b>Message ID:</b> <code>{message_id}</code>\n"
+                f"<b>Type:</b> <code>{payload.get('type')}</code>\n"
+                f"<b>Reason:</b> {reason}</blockquote>"
+                + ("\n⚠️ <b>Status:</b> Moved to dead letter queue" if result == "dead_letter" else ""),
                 alert_key=f"fwd-fail-{message_id}",
             )
 
@@ -783,8 +787,10 @@ async def retry_payload(
             result = await queue_manager.enqueue_failed(payload, "Retry telegram forwarding failed")
             await send_alert(
                 alert_token, alert_chat_id,
-                f"🔴 <b>Retry failed</b>\nMessage: {message_id}"
-                + ("\n⚠️ Moved to dead letter queue" if result == "dead_letter" else ""),
+                f"🔴 <b>Retry Failed</b>\n\n"
+                f"<blockquote><b>Message ID:</b> <code>{message_id}</code>\n"
+                f"<b>Reason:</b> Retry telegram forwarding failed</blockquote>"
+                + ("\n⚠️ <b>Status:</b> Moved to dead letter queue" if result == "dead_letter" else ""),
                 alert_key=f"retry-fail-{message_id}",
             )
 

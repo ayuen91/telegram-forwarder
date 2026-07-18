@@ -114,18 +114,11 @@ def build_narrative(m: DailyReportMetrics) -> str:
 
 
 def build_quickchart_url(destinations: List[DestinationStats], w: int = 800, h: int = 400) -> str:
-    """Build a QuickChart.io bar chart URL for delivery success rates."""
+    """Build a QuickChart.io mixed dual-axis chart URL showing attempted volume and success rate."""
     active = [d for d in destinations if d.attempted > 0] or list(destinations)
     labels = [_truncate_name(d.name, 15) for d in active]
     rates = [round(d.success_rate, 1) for d in active]
-    colors = []
-    for r in rates:
-        if r >= 95:
-            colors.append("#22c55e")
-        elif r >= 80:
-            colors.append("#eab308")
-        else:
-            colors.append("#ef4444")
+    attempts = [d.attempted for d in active]
 
     config = {
         "type": "bar",
@@ -133,9 +126,24 @@ def build_quickchart_url(destinations: List[DestinationStats], w: int = 800, h: 
             "labels": labels,
             "datasets": [
                 {
-                    "label": "Success %",
+                    "type": "bar",
+                    "label": "Volume (Messages)",
+                    "data": attempts,
+                    "backgroundColor": "rgba(54, 162, 235, 0.5)",
+                    "borderColor": "rgba(54, 162, 235, 1)",
+                    "borderWidth": 1,
+                    "yAxisID": "yVolume",
+                },
+                {
+                    "type": "line",
+                    "label": "Success Rate (%)",
                     "data": rates,
-                    "backgroundColor": colors,
+                    "borderColor": "#10b981",
+                    "backgroundColor": "#10b981",
+                    "fill": False,
+                    "yAxisID": "ySuccess",
+                    "tension": 0.3,
+                    "pointRadius": 4,
                 }
             ],
         },
@@ -143,17 +151,38 @@ def build_quickchart_url(destinations: List[DestinationStats], w: int = 800, h: 
             "plugins": {
                 "title": {
                     "display": True,
-                    "text": "24h Delivery Success by Channel",
+                    "text": "24h Volume & Delivery Success by Channel",
                     "color": "#e5e7eb",
                 },
-                "legend": {"display": False},
+                "legend": {
+                    "display": True,
+                    "labels": {"color": "#e5e7eb"}
+                },
             },
             "scales": {
-                "y": {
-                    "min": 0,
-                    "max": 100,
+                "yVolume": {
+                    "type": "linear",
+                    "position": "left",
+                    "title": {
+                        "display": True,
+                        "text": "Messages Attempted",
+                        "color": "#9ca3af",
+                    },
                     "ticks": {"color": "#9ca3af"},
                     "grid": {"color": "#374151"},
+                },
+                "ySuccess": {
+                    "type": "linear",
+                    "position": "right",
+                    "min": 0,
+                    "max": 100,
+                    "title": {
+                        "display": True,
+                        "text": "Success Rate (%)",
+                        "color": "#9ca3af",
+                    },
+                    "ticks": {"color": "#9ca3af"},
+                    "grid": {"drawOnChartArea": False},
                 },
                 "x": {
                     "ticks": {"color": "#9ca3af"},
@@ -207,7 +236,7 @@ def format_report_html(m: DailyReportMetrics) -> str:
     # Use HTML mode carefully: put bars in <pre>
     text = (
         f"📊 <b>Daily Forward Health</b> — {m.report_date} · 08:00 {m.timezone_label}\n\n"
-        f"{narrative}\n\n"
+        f"<blockquote>{narrative}</blockquote>\n"
         f"{emoji} <b>OVERALL HEALTH</b>\n\n"
         f"<code>{labels}</code>\n"
         f"{icons}{disk_note}\n\n"

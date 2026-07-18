@@ -92,10 +92,30 @@ async def supervised_task(name: str, coro_factory, restart_delay: float = 5.0):
         except FloodWait as e:
             wait = e.value + 1
             logger.warning(f"Task '{name}' hit FloodWait({e.value}s), sleeping {wait}s")
+            try:
+                await health_monitor._send_telegram_alert(
+                    f"⏳ <b>FloodWait Encountered</b>\n\n"
+                    f"<blockquote><b>Task:</b> <code>{name}</code>\n"
+                    f"<b>Source:</b> MTProto (Hydrogram)\n"
+                    f"<b>Duration:</b> <tg-spoiler>{e.value}s</tg-spoiler></blockquote>\n"
+                    f"🕒 <i>System is pausing and will auto-resume.</i>"
+                )
+            except Exception:
+                pass
             await asyncio.sleep(wait)
         except TelegramFloodWait as e:
             wait = e.retry_after + 1
             logger.warning(f"Task '{name}' hit Bot API FloodWait({e.retry_after}s), sleeping {wait}s")
+            try:
+                await health_monitor._send_telegram_alert(
+                    f"⏳ <b>FloodWait Encountered</b>\n\n"
+                    f"<blockquote><b>Task:</b> <code>{name}</code>\n"
+                    f"<b>Source:</b> Bot API (Telegram)\n"
+                    f"<b>Duration:</b> <tg-spoiler>{e.retry_after}s</tg-spoiler></blockquote>\n"
+                    f"🕒 <i>System is pausing and will auto-resume.</i>"
+                )
+            except Exception:
+                pass
             await asyncio.sleep(wait)
         except asyncio.CancelledError:
             logger.info(f"Task '{name}' cancelled — shutting down")
@@ -104,9 +124,11 @@ async def supervised_task(name: str, coro_factory, restart_delay: float = 5.0):
             logger.critical(f"Task '{name}' hit fatal auth error: {e}")
             try:
                 await health_monitor._send_telegram_alert(
-                    f"🔴 <b>FATAL: Telegram Forwarder</b>\n\n"
-                    f"<b>Task:</b> {name}\n<b>Error:</b> {e}\n\n"
-                    f"<b>Action:</b> Re-authenticate Hydrogram session"
+                    f"🔴 <b>FATAL: Userbot Authentication Failed</b>\n\n"
+                    f"<blockquote><b>Task:</b> <code>{name}</code>\n"
+                    f"<b>Error:</b> <code>{e.__class__.__name__}</code>\n"
+                    f"<b>Details:</b> {e}</blockquote>\n"
+                    f"💡 <b>Required Action:</b> Re-authenticate Hydrogram session."
                 )
             except Exception:
                 pass
@@ -114,9 +136,17 @@ async def supervised_task(name: str, coro_factory, restart_delay: float = 5.0):
         except Exception as e:
             logger.error(f"Task '{name}' crashed: {e}", exc_info=True)
             try:
+                import traceback
+                import html
+                tb_str = traceback.format_exc()
+                tb_escaped = html.escape(tb_str)
                 await health_monitor._send_telegram_alert(
                     f"🟠 <b>Task Crashed: {name}</b>\n\n"
-                    f"<b>Error:</b> {e}\nAuto-restarting in {current_delay:.0f}s"
+                    f"<blockquote><b>Error:</b> <code>{e.__class__.__name__}</code>\n"
+                    f"<b>Message:</b> {e}</blockquote>\n"
+                    f"📝 <b>Traceback:</b>\n"
+                    f"<blockquote expandable><pre>{tb_escaped}</pre></blockquote>\n"
+                    f"🔄 Auto-restarting in <code>{current_delay:.0f}s</code>"
                 )
             except Exception:
                 pass
