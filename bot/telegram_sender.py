@@ -519,15 +519,25 @@ class TelegramBotSender:
         msg_id = int(payload["message_id"])
 
         if msg_type == "text":
-            # Use processed text if a replacement changed it, otherwise fall back
-            # to the original HTML string (which preserves all formatting entities).
             text_changed = processed_payload.get("text_changed", False)
-            if text_changed:
-                # Replacement may have altered the text; use plain processed text.
-                # Formatting entities that survived the replacement are lost here
-                # because offset tracking after substitution is unreliable.
+
+            if not text_changed and relay_message_ids and relay_chat_id:
+                # Message has rich entities (blockquotes, spoilers, dates, etc.)
+                # and was already relayed via Pyrogram copy_message (MTProto).
+                # Use Bot API copyMessage so ALL entities survive intact —
+                # the HTML parser in Pyrogram cannot encode these newer types.
+                sent_id = await self.copy_message(
+                    chat_id=dest_chat_id,
+                    from_chat_id=relay_chat_id,
+                    message_id=relay_message_ids[0],
+                    caption=None,  # text messages have no caption field
+                    parse_mode=None,  # entities are copied natively, not via parse_mode
+                    reply_to_message_id=reply_to_message_id,
+                )
+            elif text_changed:
+                # Replacement altered the text — send plain processed text.
+                # Formatting cannot be preserved after arbitrary text edits.
                 text = processed_payload.get("processed_text") or payload.get("text") or ""
-                # Send as plain text (no parse_mode) to avoid accidental HTML interpretation
                 sent_id = await self.send_message(
                     chat_id=dest_chat_id,
                     text=text,
@@ -535,8 +545,8 @@ class TelegramBotSender:
                     reply_to_message_id=reply_to_message_id,
                 )
             else:
-                # No replacement — use the pre-rendered HTML string from Pyrogram
-                # so bold, italic, links, block-quotes etc. are all preserved.
+                # No entities, no replacement — simple plain-text send.
+                # Falls back to text_html (bold/italic/links) if available.
                 text = payload.get("text_html") or payload.get("text") or ""
                 sent_id = await self.send_message(
                     chat_id=dest_chat_id,
