@@ -219,6 +219,7 @@ class TelegramBotSender:
         from_chat_id: Union[int, str],
         message_id: Union[int, str],
         caption: Optional[str] = None,
+        caption_entities: Optional[List[Dict[str, Any]]] = None,
         reply_to_message_id: Optional[Union[int, str]] = None,
     ) -> int:
         """Copy a single message. Returns the new message_id in the destination chat."""
@@ -229,6 +230,9 @@ class TelegramBotSender:
         }
         if caption is not None:
             payload["caption"] = caption
+            bot_ents = self._bot_api_entities(caption_entities)
+            if bot_ents:
+                payload["caption_entities"] = bot_ents
         reply_params = self._reply_params(reply_to_message_id)
         if reply_params:
             payload["reply_parameters"] = reply_params
@@ -427,15 +431,17 @@ class TelegramBotSender:
         chat_id: Union[int, str],
         message_id: Union[int, str],
         caption: str,
+        caption_entities: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
-        await self._call(
-            "editMessageCaption",
-            {
-                "chat_id": chat_id,
-                "message_id": int(message_id),
-                "caption": caption,
-            },
-        )
+        params: Dict[str, Any] = {
+            "chat_id": chat_id,
+            "message_id": int(message_id),
+            "caption": caption,
+        }
+        bot_ents = self._bot_api_entities(caption_entities)
+        if bot_ents:
+            params["caption_entities"] = bot_ents
+        await self._call("editMessageCaption", params)
 
     async def verify_bot_access(self, chat_id: Union[int, str]) -> bool:
         """Return True if the bot can access the given chat."""
@@ -512,7 +518,11 @@ class TelegramBotSender:
                 original = item.get("caption") or ""
                 processed = item.get("processed_caption") or original
                 if processed != original:
-                    await self.edit_message_caption(dest_chat_id, sent_id, processed)
+                    cap_entities = item.get("processed_caption_entities")
+                    await self.edit_message_caption(
+                        dest_chat_id, sent_id, processed,
+                        caption_entities=cap_entities,
+                    )
 
             reply_mappings = [
                 (int(item["message_id"]), sent_id)
@@ -526,19 +536,27 @@ class TelegramBotSender:
         msg_id = int(payload["message_id"])
 
         if msg_type == "text":
+            # Use processed text if a replacement changed it, otherwise original.
+            # Entities: use processed_entities (offset-adjusted) when text changed,
+            # or the original entities when text is unchanged.
+            text_changed = processed_payload.get("text_changed", False)
             text = (
                 processed_payload.get("processed_text")
-                if processed_payload.get("text_changed")
+                if text_changed
                 else payload.get("text")
             ) or ""
-            entities = None
-            if not processed_payload.get("text_changed"):
+
+            if text_changed:
+                # processed_entities may be [] (regex replacement wiped them) or
+                # a shifted list (plain replacement kept them adjusted)
+                entities = processed_payload.get("processed_entities") or []
+            else:
                 entities = payload.get("entities") or []
 
             sent_id = await self.send_message(
                 chat_id=dest_chat_id,
                 text=text,
-                entities=entities,
+                entities=entities or None,
                 reply_to_message_id=reply_to_message_id,
             )
         elif msg_type == "poll":
@@ -570,13 +588,17 @@ class TelegramBotSender:
                 raise RuntimeError("Media message requires userbot relay before Bot API delivery")
 
             caption = None
+            caption_entities = None
             if processed_payload.get("caption_changed"):
                 caption = processed_payload.get("processed_caption") or payload.get("caption")
+                # Carry adjusted caption entities for the overridden caption
+                caption_entities = processed_payload.get("processed_caption_entities")
             sent_id = await self.copy_message(
                 chat_id=dest_chat_id,
                 from_chat_id=relay_chat_id,
                 message_id=relay_message_ids[0],
                 caption=caption,
+                caption_entities=caption_entities,
                 reply_to_message_id=reply_to_message_id,
             )
 
