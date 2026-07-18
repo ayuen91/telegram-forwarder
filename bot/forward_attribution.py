@@ -23,7 +23,7 @@ _ADMIN_CACHE_TTL = 300
 
 def serialize_forward_origin(message) -> Optional[Dict[str, Any]]:
     """
-    Extract channel-forward metadata from a Pyrogram Message.
+    Extract channel-forward metadata from a Hydrogram Message.
 
     Supports both modern `forward_origin` (MessageOriginChannel) and
     legacy `forward_from_chat` / `forward_from_message_id` fields.

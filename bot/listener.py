@@ -19,8 +19,8 @@ from datetime import datetime, timezone
 from typing import Dict, Any, Optional, Literal
 
 import aiosqlite
-from pyrogram import Client, filters
-from pyrogram.types import Message
+from hydrogram import Client, filters
+from hydrogram.types import Message
 
 from media_relay import RelayConfig, relay_to_bot, cleanup_relay
 from replacements import build_processed_payload, needs_n8n
@@ -48,12 +48,12 @@ _RELAY_MEDIA_TYPES = frozenset({
 
 def normalize_message(message: Message) -> Optional[Dict[str, Any]]:
     """
-    Extract a consistent payload from any Pyrogram message type.
+    Extract a consistent payload from any Hydrogram message type.
 
     Returns None for unsupported message types (service messages, etc.)
 
     Formatting (bold, italic, links, block-quotes, etc.) is preserved by
-    storing Pyrogram's pre-rendered .html string for text and caption.
+    storing Hydrogram's pre-rendered .html string for text and caption.
     This is always a plain str and is always JSON-safe — no manual entity
     serialization is required.
     """
@@ -62,7 +62,7 @@ def normalize_message(message: Message) -> Optional[Dict[str, Any]]:
     if msg_type is None:
         return None
 
-    # Use Pyrogram's .html property to capture all formatting entities as
+    # Use Hydrogram's .html property to capture all formatting entities as
     # a plain HTML string.  Falls back to plain text when there are no
     # entities so the value is always a str or None.
     text_html: Optional[str] = None
@@ -106,7 +106,7 @@ def normalize_message(message: Message) -> Optional[Dict[str, Any]]:
 
 
 def _get_message_type(message: Message) -> Optional[str]:
-    """Map Pyrogram message to our type string."""
+    """Map Hydrogram message to our type string."""
     if message.text:
         return "text"
     elif message.photo:
@@ -200,7 +200,7 @@ def _serialize_contact(contact) -> Dict[str, Any]:
     return data
 
 
-# _serialize_entities removed: formatting is now preserved via Pyrogram's
+# _serialize_entities removed: formatting is now preserved via Hydrogram's
 # .html property (stored as text_html / caption_html in the payload).
 # This eliminates the "Object of type type is not JSON serializable" crash
 # that occurred when MessageEntityType enum values were placed into the
@@ -300,8 +300,8 @@ def _source_message_ids(payload: Dict[str, Any]) -> list:
         return [int(i["message_id"]) for i in sorted(items, key=lambda x: int(x.get("message_id", 0)))]
     if msg_type in _RELAY_MEDIA_TYPES:
         return [int(payload["message_id"])]
-    # Always relay text messages through Pyrogram's MTProto copy_message.
-    # Original Pyrogram does not parse newer entity types (blockquote,
+    # Always relay text messages through Hydrogram's MTProto copy_message.
+    # Original Hydrogram does not parse newer entity types (blockquote,
     # timestamp/date) so we cannot detect them from message.text.entities.
     # Relaying every text message is the only reliable way to ensure ALL
     # formatting — including blockquotes, dates, spoilers, custom emoji —
@@ -883,9 +883,9 @@ def register_listener(
     redis_client=None,
 ):
     """
-    Register the message handler on the Pyrogram (MTProto) client.
+    Register the message handler on the Hydrogram (MTProto) client.
 
-    In Pyrogram, on_message receives ALL incoming message updates including
+    In Hydrogram, on_message receives ALL incoming message updates including
     channel posts (UpdateNewChannelMessage) — there is no separate
     on_channel_post decorator (that is a Bot API / python-telegram-bot concept).
 
@@ -922,7 +922,7 @@ def register_listener(
             # Shouldn't happen with put() (it waits), but safety net
             logger.error(f"Message queue full, dropping message {message.id}")
 
-    # Pyrogram routes channel posts (UpdateNewChannelMessage) and regular
+    # Hydrogram routes channel posts (UpdateNewChannelMessage) and regular
     # messages (UpdateNewMessage) through the same on_message handler.
     # filters.chat() matches by numeric ID for both public and private channels.
     @app.on_message(filters.chat(source_chat_id))

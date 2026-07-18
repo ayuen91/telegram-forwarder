@@ -1,7 +1,7 @@
 """
 Main entry point for the Telegram Forwarder bot.
 
-Pipeline: Pyrogram listen → n8n word replace → Bot API send (via relay for media)
+Pipeline: Hydrogram listen → n8n word replace → Bot API send (via relay for media)
 
 Launched tasks:
   - message_worker × N   — queue → webhook → forward
@@ -19,8 +19,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-# Monkey patch Pyrogram to support 64-bit channel IDs (like -1002...)
-from pyrogram import utils
+# Monkey patch Hydrogram to support 64-bit channel IDs (like -1002...)
+from hydrogram import utils
 
 def get_peer_type_new(peer_id: int) -> str:
     peer_id_str = str(peer_id)
@@ -35,8 +35,8 @@ utils.get_peer_type = get_peer_type_new
 
 import aiosqlite
 import redis.asyncio as aioredis
-from pyrogram import Client
-from pyrogram.errors import (
+from hydrogram import Client
+from hydrogram.errors import (
     FloodWait,
     AuthKeyUnregistered,
     SessionRevoked,
@@ -106,7 +106,7 @@ async def supervised_task(name: str, coro_factory, restart_delay: float = 5.0):
                 await health_monitor._send_telegram_alert(
                     f"🔴 <b>FATAL: Telegram Forwarder</b>\n\n"
                     f"<b>Task:</b> {name}\n<b>Error:</b> {e}\n\n"
-                    f"<b>Action:</b> Re-authenticate Pyrogram session"
+                    f"<b>Action:</b> Re-authenticate Hydrogram session"
                 )
             except Exception:
                 pass
@@ -142,7 +142,7 @@ async def ensure_source_channel_membership(app: Client, source_chat_id: int) -> 
     """
     Ensure the userbot is a joined member of the source channel.
 
-    The Pyrogram MTProto client only receives UpdateNewChannelMessage push
+    The Hydrogram MTProto client only receives UpdateNewChannelMessage push
     events for channels it is actively subscribed/joined to. For public
     channels the userbot can *read* without joining — but it will NOT receive
     new-message updates until it joins.
@@ -181,7 +181,7 @@ async def ensure_source_channel_membership(app: Client, source_chat_id: int) -> 
 
 
 async def wait_for_critical_checks(monitor: HealthMonitor, max_attempts: int = 10) -> bool:
-    """Retry only critical health checks (pyrogram, redis, sender bot, sqlite)."""
+    """Retry only critical health checks (hydrogram, redis, sender bot, sqlite)."""
     for attempt in range(1, max_attempts + 1):
         if await monitor.startup_self_test():
             return True
@@ -312,7 +312,7 @@ async def main():
         api_id=settings.api_id,
         api_hash=settings.api_hash,
         phone_number=settings.phone_number,
-        workdir=os.getenv("PYROGRAM_WORKDIR", "/app/sessions"),
+        workdir=os.getenv("HYDROGRAM_WORKDIR", os.getenv("PYROGRAM_WORKDIR", "/app/sessions")),
     )
 
     health_monitor = HealthMonitor(
@@ -331,11 +331,11 @@ async def main():
     stale_albums = await album_buf.flush_stale_albums()
 
     # ── Connect and verify ────────────────────────────────────────────
-    logger.info("Connecting Pyrogram userbot...")
+    logger.info("Connecting Hydrogram userbot...")
     await app.start()
 
     me = await app.get_me()
-    logger.info(f"Pyrogram connected as {me.first_name} (id={me.id})")
+    logger.info(f"Hydrogram connected as {me.first_name} (id={me.id})")
 
     try:
         bot_me = await sender.get_me()
@@ -354,7 +354,7 @@ async def main():
         logger.error(f"Cannot access source channel {settings.source_chat_id}: {e}")
 
     # Ensure the userbot is a member so UpdateNewChannelMessage events are pushed.
-    # This is required for public channels — Pyrogram won't receive updates
+    # This is required for public channels — Hydrogram won't receive updates
     # for channels the userbot has not joined.
     await ensure_source_channel_membership(app, settings.source_chat_id)
 

@@ -88,7 +88,7 @@ class QueueManager:
 
         if retry_count > self.max_retries:
             # Use default=str to guard against any non-JSON-serializable values
-            # (e.g. Pyrogram enum types) that may have survived in the payload.
+            # (e.g. Hydrogram enum types) that may have survived in the payload.
             payload_json = json.dumps(payload, default=str)
             await self.redis.rpush(self.QUEUE_DEAD_LETTER, payload_json)
             logger.error(

@@ -54,7 +54,7 @@ class HealthMonitor:
         redis_client: aioredis.Redis,
         webhook_sender,  # WebhookSender instance
         config,  # Config instance
-        pyrogram_app=None,  # Pyrogram Client instance (set after app starts)
+        pyrogram_app=None,  # Hydrogram Client instance (set after app starts)
         bot_sender=None,  # TelegramBotSender instance
         alert_bot_token: str = "",
         alert_chat_id: int = 0,

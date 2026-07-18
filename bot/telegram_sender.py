@@ -166,7 +166,7 @@ class TelegramBotSender:
         """
         After userbot posts media to the bot DM, resolve message id(s) the Bot API can copy.
 
-        Pyrogram message ids in a user→bot DM do not always match Bot API ids.
+        Hydrogram message ids in a user→bot DM do not always match Bot API ids.
         """
         await asyncio.sleep(wait_seconds)
 
@@ -523,9 +523,9 @@ class TelegramBotSender:
 
             if not text_changed and relay_message_ids and relay_chat_id:
                 # Message has rich entities (blockquotes, spoilers, dates, etc.)
-                # and was already relayed via Pyrogram copy_message (MTProto).
+                # and was already relayed via Hydrogram copy_message (MTProto).
                 # Use Bot API copyMessage so ALL entities survive intact —
-                # the HTML parser in Pyrogram cannot encode these newer types.
+                # the HTML parser in Hydrogram cannot encode these newer types.
                 sent_id = await self.copy_message(
                     chat_id=dest_chat_id,
                     from_chat_id=relay_chat_id,

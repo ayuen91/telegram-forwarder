@@ -5,11 +5,11 @@ A production-ready system that listens to a Telegram source channel and forwards
 ## Architecture
 
 ```
-Source Channel → Pyrogram user (listen + media relay) → Redis Queue → n8n (word replace) → Sender Bot API → Destinations
+Source Channel → Hydrogram user (listen + media relay) → Redis Queue → n8n (word replace) → Sender Bot API → Destinations
 ```
 
 **Roles:**
-- **Pyrogram user account** — member of source channel (reads messages, relays media to bot via private chat)
+- **Hydrogram user account** — member of source channel (reads messages, relays media to bot via private chat)
 - **Sender bot (`BOT_TOKEN`)** — admin of **destination channels only**; receives text via `sendMessage`, media via `copyMessage` from relay chat
 - **n8n** — HMAC-verified webhook that applies word replacements from `replacements.yml` and returns JSON
 
@@ -29,7 +29,7 @@ Source Channel → Pyrogram user (listen + media relay) → Redis Queue → n8n 
 
 ### 1. Prerequisites
 - VPS with Docker & Docker Compose
-- Telegram user account (for Pyrogram — member of source channel)
+- Telegram user account (for Hydrogram — member of source channel)
 - Telegram Bot (sender) — admin of **destination channels only**; send `/start` to it from the user account
 - Telegram Bot (alerts) — sends health alerts to your personal chat
 
@@ -56,7 +56,7 @@ nano config/replacements.yml
 # Start services
 docker compose up -d
 
-# First time: authenticate Pyrogram (enter phone number + code)
+# First time: authenticate Hydrogram (enter phone number + code)
 docker compose run --rm bot python main.py
 
 # After authentication succeeds, restart normally
@@ -195,7 +195,7 @@ Manual backup: `bash scripts/backup.sh`
 telegram-forwarder/
 ├── Dockerfile             # Bot image (build context: repo root)
 ├── docker-compose.yml     # 3 services: bot, redis, n8n
-├── bot/                   # Pyrogram user bot
+├── bot/                   # Hydrogram user bot
 │   ├── main.py            # Entry point: supervisor + self-test
 │   ├── listener.py        # on_message → Queue → workers → Bot API forward
 │   ├── media_relay.py     # Userbot copy to relay chat (media only)
@@ -221,7 +221,7 @@ telegram-forwarder/
 | Bot not forwarding | `docker compose logs bot --tail 50` |
 | Messages in failed queue | `redis-cli LLEN queue:failed` — retry worker handles automatically |
 | Messages in dead letter | Alerts only — does **not** block the listener. Inspect: `docker compose exec redis redis-cli LRANGE queue:dead_letter 0 -1`. Clear after review: `docker compose exec redis redis-cli DEL queue:dead_letter` |
-| Listener not receiving | Check logs for `Workers running` — if missing, startup was blocked by a **critical** check (pyrogram/redis/sender bot/sqlite). Dead letter warnings are safe to ignore at startup |
+| Listener not receiving | Check logs for `Workers running` — if missing, startup was blocked by a **critical** check (hydrogram/redis/sender bot/sqlite). Dead letter warnings are safe to ignore at startup |
 | Media not forwarding | Set `RELAY_CHANNEL_ID` to a private channel (both userbot + sender bot as admins). Without it, DM relay is used — ensure `/start` was sent to the sender bot |
 | No alerts received | Verify `ALERT_BOT_TOKEN` and `ALERT_CHAT_ID` in `.env` |
 | n8n not processing | Check n8n workflow is **activated** |

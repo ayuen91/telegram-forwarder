@@ -12,8 +12,8 @@ import logging
 from dataclasses import dataclass
 from typing import List, Optional, TYPE_CHECKING
 
-from pyrogram import Client
-from pyrogram.errors import FloodWait
+from hydrogram import Client
+from hydrogram.errors import FloodWait
 
 if TYPE_CHECKING:
     from telegram_sender import TelegramBotSender
@@ -127,9 +127,9 @@ async def relay_to_bot(
                 from_chat_id=source_chat_id,
                 message_id=message_ids[0],
             )
-            pyrogram_ids = [msg.id for msg in copied]
+            hydrogram_ids = [msg.id for msg in copied]
             logger.info(
-                f"Relayed album ({len(pyrogram_ids)} items) "
+                f"Relayed album ({len(hydrogram_ids)} items) "
                 f"source={source_chat_id} → {relay.mode} {target}"
             )
         else:
@@ -138,19 +138,19 @@ async def relay_to_bot(
                 from_chat_id=source_chat_id,
                 message_id=message_ids[0],
             )
-            pyrogram_ids = [copied.id]
+            hydrogram_ids = [copied.id]
             logger.info(
                 f"Relayed message {message_ids[0]} "
-                f"source={source_chat_id} → {relay.mode} {target} (pyrogram id={copied.id})"
+                f"source={source_chat_id} → {relay.mode} {target} (hydrogram id={copied.id})"
             )
 
         if relay.mode == "channel":
-            return pyrogram_ids
+            return hydrogram_ids
 
         bot_ids = await sender.resolve_relay_message_ids(
-            relay.bot_from_chat, count=len(pyrogram_ids)
+            relay.bot_from_chat, count=len(hydrogram_ids)
         )
-        logger.info(f"Resolved Bot API relay ids: {bot_ids} (pyrogram {pyrogram_ids})")
+        logger.info(f"Resolved Bot API relay ids: {bot_ids} (hydrogram {hydrogram_ids})")
         return bot_ids
 
     except FloodWait:

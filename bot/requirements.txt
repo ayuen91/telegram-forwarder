@@ -1,5 +1,5 @@
-pyrogram==2.0.106
-tgcrypto==1.2.5
+hydrogram>=0.1.4
+tgcrypto>=1.2.5
 aiohttp>=3.9.5,<4.0
 redis[hiredis]==5.0.7
 python-json-logger==2.0.7

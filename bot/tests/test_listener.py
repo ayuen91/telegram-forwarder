@@ -7,28 +7,28 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 
-def _install_pyrogram_stub():
-    """Minimal Pyrogram stub so listener helpers can be imported in unit tests."""
-    if "pyrogram" in sys.modules and hasattr(sys.modules["pyrogram"], "Client"):
+def _install_hydrogram_stub():
+    """Minimal Hydrogram stub so listener helpers can be imported in unit tests."""
+    if "hydrogram" in sys.modules and hasattr(sys.modules["hydrogram"], "Client"):
         return
 
-    pyrogram = types.ModuleType("pyrogram")
-    pyrogram.Client = MagicMock()
-    pyrogram.filters = MagicMock()
-    pyrogram.filters.chat = MagicMock()
+    hydrogram = types.ModuleType("hydrogram")
+    hydrogram.Client = MagicMock()
+    hydrogram.filters = MagicMock()
+    hydrogram.filters.chat = MagicMock()
 
-    errors = types.ModuleType("pyrogram.errors")
+    errors = types.ModuleType("hydrogram.errors")
     errors.FloodWait = Exception
 
-    pyrogram_types = types.ModuleType("pyrogram.types")
-    pyrogram_types.Message = MagicMock()
+    hydrogram_types = types.ModuleType("hydrogram.types")
+    hydrogram_types.Message = MagicMock()
 
-    sys.modules["pyrogram"] = pyrogram
-    sys.modules["pyrogram.errors"] = errors
-    sys.modules["pyrogram.types"] = pyrogram_types
+    sys.modules["hydrogram"] = hydrogram
+    sys.modules["hydrogram.errors"] = errors
+    sys.modules["hydrogram.types"] = hydrogram_types
 
 
-_install_pyrogram_stub()
+_install_hydrogram_stub()
 
 from listener import (
     _get_message_type,

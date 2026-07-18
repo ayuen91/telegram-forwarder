@@ -1,12 +1,12 @@
 services:
-  # Pyrogram user bot (listen-only) + Bot API sender + health monitor
+  # Hydrogram user bot (listen-only) + Bot API sender + health monitor
   bot:
     build:
       context: .                         # Repo root — so COPY bot/ and db/ both work
       dockerfile: Dockerfile
     env_file: .env
     volumes:
-      - ./bot/sessions:/app/sessions     # Persist Pyrogram session
+      - ./bot/sessions:/app/sessions     # Persist Hydrogram session
       - ./data:/app/data                 # SQLite database + heartbeat file
       - ./config:/app/config             # channels.yml + replacements.yml (hot-reloadable)
       - ./logs:/app/logs                 # Log files
