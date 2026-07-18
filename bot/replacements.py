@@ -4,68 +4,21 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 
-def _shift_entities(
-    entities: List[Dict[str, Any]],
-    replace_start: int,
-    old_len: int,
-    new_len: int,
-) -> List[Dict[str, Any]]:
-    """
-    Adjust entity offsets/lengths after a single in-place text substitution.
-
-    Rules (mirrors Telegram's own entity-shift semantics):
-    - Entities that end before the replaced span → untouched.
-    - Entities that start after the replaced span → shift offset by delta.
-    - Entities that fully enclose the replaced span → grow/shrink by delta.
-    - Entities that *overlap* the replaced span are dropped (their bounds
-      are now undefined after the substitution).
-    """
-    replace_end = replace_start + old_len
-    delta = new_len - old_len
-    result: List[Dict[str, Any]] = []
-    for ent in entities:
-        e_start = ent["offset"]
-        e_end = e_start + ent["length"]
-
-        if e_end <= replace_start:
-            # Entity ends before replaced region — untouched
-            result.append(ent)
-        elif e_start >= replace_end:
-            # Entity starts after replaced region — shift
-            shifted = dict(ent)
-            shifted["offset"] = e_start + delta
-            result.append(shifted)
-        elif e_start <= replace_start and e_end >= replace_end:
-            # Entity fully encloses the replacement — expand/shrink length
-            enclosing = dict(ent)
-            enclosing["length"] = ent["length"] + delta
-            if enclosing["length"] > 0:
-                result.append(enclosing)
-        # else: entity overlaps the replaced region — drop it
-    return result
-
-
 def apply_replacements(
     text: Optional[str],
     rules: List[Dict[str, Any]],
-    entities: Optional[List[Dict[str, Any]]] = None,
-) -> Tuple[Optional[str], Optional[List[Dict[str, Any]]]]:
+) -> Tuple[Optional[str], bool]:
     """
-    Apply word replacement rules to *text*, returning (new_text, adjusted_entities).
+    Apply word replacement rules to *text*.
 
-    Entity offsets are shifted to match each plain-text substitution so that
-    formatting (bold, italic, underline, mono, links, etc.) is preserved after
-    replacement.  When a *regex* rule fires, entities are set to None because
-    arbitrary regex substitutions make offset tracking unpredictable.
-
-    Returns (text, entities) — both may be the original values if no rule matched.
+    Returns (new_text, changed) where changed is True if any rule fired.
+    Formatting is now carried as HTML strings (text_html / caption_html) so
+    entity-offset tracking is no longer required here.
     """
     if not text or not rules:
-        return text, entities
+        return text, False
 
     result = text
-    live_entities: Optional[List[Dict[str, Any]]] = list(entities) if entities else []
-    entities_valid = True  # flipped False on first regex hit
 
     for rule in rules:
         pattern = rule.get("pattern")
@@ -78,27 +31,11 @@ def apply_replacements(
                 new_result = re.sub(pattern, replacement, result, flags=re.MULTILINE)
             except re.error:
                 continue
-            if new_result != result:
-                result = new_result
-                # Regex changes make offset tracking impossible — drop entities
-                entities_valid = False
-                live_entities = []
+            result = new_result
         else:
-            # Plain-text replacement: find every occurrence and shift entities
-            old_len = len(pattern)
-            new_len = len(replacement)
-            search_start = 0
-            while True:
-                idx = result.find(pattern, search_start)
-                if idx == -1:
-                    break
-                result = result[:idx] + replacement + result[idx + old_len:]
-                if entities_valid and live_entities:
-                    live_entities = _shift_entities(live_entities, idx, old_len, new_len)
-                search_start = idx + new_len
+            result = result.replace(pattern, replacement)
 
-    final_entities = live_entities if (entities_valid and live_entities) else None
-    return result, final_entities
+    return result, result != text
 
 
 def build_processed_payload(payload: Dict[str, Any], config) -> Dict[str, Any]:
@@ -126,16 +63,9 @@ def build_processed_payload(payload: Dict[str, Any], config) -> Dict[str, Any]:
             item_copy = dict(item)
             caption = item_copy.get("caption")
             if caption:
-                orig_entities = item_copy.get("caption_entities") or []
-                processed, adj_entities = apply_replacements(caption, rules, orig_entities)
+                processed, changed = apply_replacements(caption, rules)
                 item_copy["processed_caption"] = processed
-                # Carry adjusted entities so the sender can re-apply them
-                if adj_entities is not None:
-                    item_copy["processed_caption_entities"] = adj_entities
-                elif processed != caption:
-                    # Regex replacement fired — entities are invalid, clear them
-                    item_copy["processed_caption_entities"] = []
-                if processed != caption:
+                if changed:
                     any_caption_changed = True
             items.append(item_copy)
         return {
@@ -150,27 +80,14 @@ def build_processed_payload(payload: Dict[str, Any], config) -> Dict[str, Any]:
     caption = payload.get("caption")
 
     if text:
-        orig_entities = payload.get("entities") or []
-        processed_text, adj_entities = apply_replacements(text, rules, orig_entities)
+        processed_text, changed = apply_replacements(text, rules)
         result["processed_text"] = processed_text
-        result["text_changed"] = processed_text != text
-        # Always store adjusted entities (None means use originals; [] means dropped)
-        if adj_entities is not None:
-            result["processed_entities"] = adj_entities
-        elif processed_text != text:
-            result["processed_entities"] = []
+        result["text_changed"] = changed
 
     if caption:
-        orig_caption_entities = payload.get("caption_entities") or []
-        processed_caption, adj_caption_entities = apply_replacements(
-            caption, rules, orig_caption_entities
-        )
+        processed_caption, changed = apply_replacements(caption, rules)
         result["processed_caption"] = processed_caption
-        result["caption_changed"] = processed_caption != caption
-        if adj_caption_entities is not None:
-            result["processed_caption_entities"] = adj_caption_entities
-        elif processed_caption != caption:
-            result["processed_caption_entities"] = []
+        result["caption_changed"] = changed
 
     result["destinations"] = destinations
     return result

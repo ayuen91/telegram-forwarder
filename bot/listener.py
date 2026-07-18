@@ -51,28 +51,38 @@ def normalize_message(message: Message) -> Optional[Dict[str, Any]]:
     Extract a consistent payload from any Pyrogram message type.
 
     Returns None for unsupported message types (service messages, etc.)
+
+    Formatting (bold, italic, links, block-quotes, etc.) is preserved by
+    storing Pyrogram's pre-rendered .html string for text and caption.
+    This is always a plain str and is always JSON-safe — no manual entity
+    serialization is required.
     """
     # Determine message type and media info
     msg_type = _get_message_type(message)
     if msg_type is None:
         return None
 
-    # Extract entities for formatting preservation
-    entities = _serialize_entities(message.entities) if message.entities else []
-    caption_entities = (
-        _serialize_entities(message.caption_entities)
-        if message.caption_entities
-        else []
-    )
+    # Use Pyrogram's .html property to capture all formatting entities as
+    # a plain HTML string.  Falls back to plain text when there are no
+    # entities so the value is always a str or None.
+    text_html: Optional[str] = None
+    if message.text:
+        text_html = str(message.text.html) if message.text.entities else str(message.text)
+
+    caption_html: Optional[str] = None
+    if message.caption:
+        caption_html = str(message.caption.html) if message.caption.entities else str(message.caption)
 
     payload = {
         "message_id": message.id,
         "chat_id": message.chat.id,
         "type": msg_type,
-        "text": message.text,
-        "caption": message.caption,
-        "entities": entities,
-        "caption_entities": caption_entities,
+        # plain text kept for DB storage / replacement matching
+        "text": str(message.text) if message.text else None,
+        "caption": str(message.caption) if message.caption else None,
+        # HTML-encoded text that carries all Telegram formatting entities
+        "text_html": text_html,
+        "caption_html": caption_html,
         "media_group_id": message.media_group_id,
         "has_media": msg_type in _RELAY_MEDIA_TYPES or msg_type == "album",
         "reply_to_message_id": message.reply_to_message_id if message.reply_to_message_id else None,
@@ -190,33 +200,11 @@ def _serialize_contact(contact) -> Dict[str, Any]:
     return data
 
 
-def _serialize_entities(entities) -> list:
-    """
-    Serialize Pyrogram MessageEntity objects to dicts for JSON transport.
-    These are needed by n8n to preserve formatting (bold, italic, links, etc.)
-    when using sendMessage or overriding captions.
-    """
-    if not entities:
-        return []
-
-    result = []
-    for entity in entities:
-        entry = {
-            "type": entity.type.value if hasattr(entity.type, "value") else str(entity.type),
-            "offset": entity.offset,
-            "length": entity.length,
-        }
-        # Optional fields
-        if entity.url:
-            entry["url"] = entity.url
-        if entity.user:
-            entry["user_id"] = entity.user.id
-        if entity.language:
-            entry["language"] = entity.language
-
-        result.append(entry)
-
-    return result
+# _serialize_entities removed: formatting is now preserved via Pyrogram's
+# .html property (stored as text_html / caption_html in the payload).
+# This eliminates the "Object of type type is not JSON serializable" crash
+# that occurred when MessageEntityType enum values were placed into the
+# payload dict and then passed to json.dumps / aiohttp's JSON serializer.
 
 
 def _to_int(val):

@@ -79,29 +79,9 @@ class TelegramBotSender:
             return None
         return {"message_id": int(reply_to_message_id)}
 
-    @staticmethod
-    def _bot_api_entities(entities: Optional[List[Dict[str, Any]]]) -> Optional[List[Dict[str, Any]]]:
-        """Convert serialized Pyrogram entities to Bot API MessageEntity objects."""
-        if not entities:
-            return None
-
-        result = []
-        for entity in entities:
-            entry: Dict[str, Any] = {
-                "type": entity["type"],
-                "offset": entity["offset"],
-                "length": entity["length"],
-            }
-            if entity.get("url"):
-                entry["url"] = entity["url"]
-            if entity.get("user_id"):
-                entry["user"] = {"id": entity["user_id"]}
-            if entity.get("language"):
-                entry["language"] = entity["language"]
-            if entity.get("custom_emoji_id"):
-                entry["custom_emoji_id"] = entity["custom_emoji_id"]
-            result.append(entry)
-        return result
+    # _bot_api_entities removed: formatting is now transported as an HTML
+    # string (text_html / caption_html) and decoded by Telegram via
+    # parse_mode="HTML".  No manual entity-object serialization is needed.
 
     async def get_me(self) -> Dict[str, Any]:
         return await self._call("getMe", {})
@@ -219,7 +199,7 @@ class TelegramBotSender:
         from_chat_id: Union[int, str],
         message_id: Union[int, str],
         caption: Optional[str] = None,
-        caption_entities: Optional[List[Dict[str, Any]]] = None,
+        parse_mode: Optional[str] = "HTML",
         reply_to_message_id: Optional[Union[int, str]] = None,
     ) -> int:
         """Copy a single message. Returns the new message_id in the destination chat."""
@@ -230,9 +210,8 @@ class TelegramBotSender:
         }
         if caption is not None:
             payload["caption"] = caption
-            bot_ents = self._bot_api_entities(caption_entities)
-            if bot_ents:
-                payload["caption_entities"] = bot_ents
+            if parse_mode:
+                payload["parse_mode"] = parse_mode
         reply_params = self._reply_params(reply_to_message_id)
         if reply_params:
             payload["reply_parameters"] = reply_params
@@ -280,17 +259,16 @@ class TelegramBotSender:
         self,
         chat_id: Union[int, str],
         text: str,
-        entities: Optional[List[Dict[str, Any]]] = None,
+        parse_mode: Optional[str] = "HTML",
         reply_to_message_id: Optional[Union[int, str]] = None,
     ) -> int:
-        """Send plain text with optional formatting entities."""
+        """Send a message with HTML formatting.  text should already be an HTML string."""
         payload: Dict[str, Any] = {
             "chat_id": chat_id,
             "text": text,
         }
-        bot_entities = self._bot_api_entities(entities)
-        if bot_entities:
-            payload["entities"] = bot_entities
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
         reply_params = self._reply_params(reply_to_message_id)
         if reply_params:
             payload["reply_parameters"] = reply_params
@@ -431,16 +409,15 @@ class TelegramBotSender:
         chat_id: Union[int, str],
         message_id: Union[int, str],
         caption: str,
-        caption_entities: Optional[List[Dict[str, Any]]] = None,
+        parse_mode: Optional[str] = "HTML",
     ) -> None:
         params: Dict[str, Any] = {
             "chat_id": chat_id,
             "message_id": int(message_id),
             "caption": caption,
         }
-        bot_ents = self._bot_api_entities(caption_entities)
-        if bot_ents:
-            params["caption_entities"] = bot_ents
+        if parse_mode:
+            params["parse_mode"] = parse_mode
         await self._call("editMessageCaption", params)
 
     async def verify_bot_access(self, chat_id: Union[int, str]) -> bool:
@@ -518,10 +495,16 @@ class TelegramBotSender:
                 original = item.get("caption") or ""
                 processed = item.get("processed_caption") or original
                 if processed != original:
-                    cap_entities = item.get("processed_caption_entities")
+                    # Replacement fired — send plain text (entities were dropped)
                     await self.edit_message_caption(
                         dest_chat_id, sent_id, processed,
-                        caption_entities=cap_entities,
+                        parse_mode=None,
+                    )
+                elif item.get("caption_html") and item.get("caption_html") != original:
+                    # No replacement but caption has formatting — push HTML
+                    await self.edit_message_caption(
+                        dest_chat_id, sent_id, item["caption_html"],
+                        parse_mode="HTML",
                     )
 
             reply_mappings = [
@@ -536,29 +519,31 @@ class TelegramBotSender:
         msg_id = int(payload["message_id"])
 
         if msg_type == "text":
-            # Use processed text if a replacement changed it, otherwise original.
-            # Entities: use processed_entities (offset-adjusted) when text changed,
-            # or the original entities when text is unchanged.
+            # Use processed text if a replacement changed it, otherwise fall back
+            # to the original HTML string (which preserves all formatting entities).
             text_changed = processed_payload.get("text_changed", False)
-            text = (
-                processed_payload.get("processed_text")
-                if text_changed
-                else payload.get("text")
-            ) or ""
-
             if text_changed:
-                # processed_entities may be [] (regex replacement wiped them) or
-                # a shifted list (plain replacement kept them adjusted)
-                entities = processed_payload.get("processed_entities") or []
+                # Replacement may have altered the text; use plain processed text.
+                # Formatting entities that survived the replacement are lost here
+                # because offset tracking after substitution is unreliable.
+                text = processed_payload.get("processed_text") or payload.get("text") or ""
+                # Send as plain text (no parse_mode) to avoid accidental HTML interpretation
+                sent_id = await self.send_message(
+                    chat_id=dest_chat_id,
+                    text=text,
+                    parse_mode=None,
+                    reply_to_message_id=reply_to_message_id,
+                )
             else:
-                entities = payload.get("entities") or []
-
-            sent_id = await self.send_message(
-                chat_id=dest_chat_id,
-                text=text,
-                entities=entities or None,
-                reply_to_message_id=reply_to_message_id,
-            )
+                # No replacement — use the pre-rendered HTML string from Pyrogram
+                # so bold, italic, links, block-quotes etc. are all preserved.
+                text = payload.get("text_html") or payload.get("text") or ""
+                sent_id = await self.send_message(
+                    chat_id=dest_chat_id,
+                    text=text,
+                    parse_mode="HTML" if payload.get("text_html") else None,
+                    reply_to_message_id=reply_to_message_id,
+                )
         elif msg_type == "poll":
             sent_id = await self.send_poll(
                 chat_id=dest_chat_id,
@@ -588,17 +573,20 @@ class TelegramBotSender:
                 raise RuntimeError("Media message requires userbot relay before Bot API delivery")
 
             caption = None
-            caption_entities = None
+            parse_mode = None
             if processed_payload.get("caption_changed"):
+                # Replacement changed the caption — use plain processed text
                 caption = processed_payload.get("processed_caption") or payload.get("caption")
-                # Carry adjusted caption entities for the overridden caption
-                caption_entities = processed_payload.get("processed_caption_entities")
+            elif payload.get("caption_html"):
+                # No replacement — forward the HTML caption so formatting is kept
+                caption = payload.get("caption_html")
+                parse_mode = "HTML"
             sent_id = await self.copy_message(
                 chat_id=dest_chat_id,
                 from_chat_id=relay_chat_id,
                 message_id=relay_message_ids[0],
                 caption=caption,
-                caption_entities=caption_entities,
+                parse_mode=parse_mode,
                 reply_to_message_id=reply_to_message_id,
             )
 
