@@ -888,13 +888,20 @@ def register_listener(
     """
     Register the message and channel post handlers on the Pyrogram client.
 
+    Two handlers are registered for the same source channel:
+      - on_message:       fires for private channels (UpdateNewMessage)
+      - on_channel_post:  fires for public channels (UpdateNewChannelMessage)
+
+    Public channels broadcast via UpdateNewChannelMessage, which Pyrogram routes
+    exclusively to on_channel_post — NOT on_message. Registering both ensures
+    the listener works regardless of whether the source channel is public or private.
+
     The handler is intentionally thin — validate, normalize, enqueue.
     Optionally increments a Redis daily received counter for metrics.
     """
 
-    @app.on_message(filters.chat(source_chat_id))
-    async def on_message(client: Client, message: Message):
-        """Validate, normalize, enqueue. No heavy work here."""
+    async def _handle(client: Client, message: Message):
+        """Shared handler: validate, normalize, enqueue. No heavy work here."""
         payload = normalize_message(message)
         if payload is None:
             return  # Unsupported message type
@@ -917,3 +924,15 @@ def register_listener(
         except asyncio.QueueFull:
             # Shouldn't happen with put() (it waits), but safety net
             logger.error(f"Message queue full, dropping message {message.id}")
+
+    # Private channel / group messages (UpdateNewMessage)
+    @app.on_message(filters.chat(source_chat_id))
+    async def on_message(client: Client, message: Message):
+        await _handle(client, message)
+
+    # Public channel posts (UpdateNewChannelMessage) — Pyrogram does NOT
+    # route these through on_message; a separate on_channel_post handler
+    # is required for public channels to work correctly.
+    @app.on_channel_post(filters.chat(source_chat_id))
+    async def on_channel_post(client: Client, message: Message):
+        await _handle(client, message)
