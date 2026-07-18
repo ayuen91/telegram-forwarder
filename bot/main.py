@@ -138,6 +138,48 @@ async def init_database(db_path: str):
         logger.info(f"Database initialized at {db_path}")
 
 
+async def ensure_source_channel_membership(app: Client, source_chat_id: int) -> bool:
+    """
+    Ensure the userbot is a joined member of the source channel.
+
+    The Pyrogram MTProto client only receives UpdateNewChannelMessage push
+    events for channels it is actively subscribed/joined to. For public
+    channels the userbot can *read* without joining — but it will NOT receive
+    new-message updates until it joins.
+
+    Returns True if already a member or joined successfully, False on failure.
+    """
+    try:
+        chat = await app.get_chat(source_chat_id)
+        # get_chat_member raises an error if not a member; catching it lets us
+        # decide whether to join.
+        try:
+            member = await app.get_chat_member(source_chat_id, "me")
+            status = str(getattr(member, "status", "")).lower()
+            if "left" in status or "banned" in status or "kicked" in status:
+                raise Exception(f"Status is '{status}'")
+            logger.info(
+                f"Userbot is already a member of source channel '{chat.title}' "
+                f"(status={status})"
+            )
+            return True
+        except Exception:
+            # Not a member — attempt to join (works for public channels)
+            logger.info(
+                f"Userbot is not a member of '{chat.title}' — joining now "
+                f"so push updates are received..."
+            )
+            await app.join_chat(source_chat_id)
+            logger.info(f"Joined source channel '{chat.title}' successfully")
+            return True
+    except Exception as e:
+        logger.error(
+            f"Could not verify/join source channel {source_chat_id}: {e}. "
+            "For private channels the userbot must already be a member."
+        )
+        return False
+
+
 async def wait_for_critical_checks(monitor: HealthMonitor, max_attempts: int = 10) -> bool:
     """Retry only critical health checks (pyrogram, redis, sender bot, sqlite)."""
     for attempt in range(1, max_attempts + 1):
@@ -310,6 +352,11 @@ async def main():
         logger.info(f"Source channel: '{source_chat.title}'")
     except Exception as e:
         logger.error(f"Cannot access source channel {settings.source_chat_id}: {e}")
+
+    # Ensure the userbot is a member so UpdateNewChannelMessage events are pushed.
+    # This is required for public channels — Pyrogram won't receive updates
+    # for channels the userbot has not joined.
+    await ensure_source_channel_membership(app, settings.source_chat_id)
 
     relay_ok = await ensure_relay_chat(app, sender, relay)
     if not relay_ok:

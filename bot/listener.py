@@ -886,15 +886,15 @@ def register_listener(
     redis_client=None,
 ):
     """
-    Register the message and channel post handlers on the Pyrogram client.
+    Register the message handler on the Pyrogram (MTProto) client.
 
-    Two handlers are registered for the same source channel:
-      - on_message:       fires for private channels (UpdateNewMessage)
-      - on_channel_post:  fires for public channels (UpdateNewChannelMessage)
+    In Pyrogram, on_message receives ALL incoming message updates including
+    channel posts (UpdateNewChannelMessage) — there is no separate
+    on_channel_post decorator (that is a Bot API / python-telegram-bot concept).
 
-    Public channels broadcast via UpdateNewChannelMessage, which Pyrogram routes
-    exclusively to on_channel_post — NOT on_message. Registering both ensures
-    the listener works regardless of whether the source channel is public or private.
+    For both public and private channels, the userbot MUST be a joined member
+    to receive push updates. ensure_source_channel_membership() in main.py
+    handles joining at startup when the userbot is not already a member.
 
     The handler is intentionally thin — validate, normalize, enqueue.
     Optionally increments a Redis daily received counter for metrics.
@@ -925,14 +925,10 @@ def register_listener(
             # Shouldn't happen with put() (it waits), but safety net
             logger.error(f"Message queue full, dropping message {message.id}")
 
-    # Private channel / group messages (UpdateNewMessage)
+    # Pyrogram routes channel posts (UpdateNewChannelMessage) and regular
+    # messages (UpdateNewMessage) through the same on_message handler.
+    # filters.chat() matches by numeric ID for both public and private channels.
     @app.on_message(filters.chat(source_chat_id))
     async def on_message(client: Client, message: Message):
         await _handle(client, message)
 
-    # Public channel posts (UpdateNewChannelMessage) — Pyrogram does NOT
-    # route these through on_message; a separate on_channel_post handler
-    # is required for public channels to work correctly.
-    @app.on_channel_post(filters.chat(source_chat_id))
-    async def on_channel_post(client: Client, message: Message):
-        await _handle(client, message)
