@@ -383,6 +383,25 @@ async def main():
     except Exception as e:
         logger.error(f"Cannot access source channel {settings.source_chat_id}: {e}")
 
+    # Force-refresh the peer access hash in the session cache.
+    # After a Pyrogram→Hydrogram migration (or any long downtime), the cached
+    # access hash for the source channel can be stale. Hydrogram then fails
+    # silently to receive UpdateNewChannelMessage events — the MTProto connection
+    # is healthy but Telegram doesn't push updates because the peer isn't
+    # correctly resolved. resolve_peer() triggers a fresh GetChannels RPC call
+    # and updates the local session's peer cache.
+    try:
+        peer = await app.resolve_peer(settings.source_chat_id)
+        logger.info(
+            f"Source channel peer resolved: type={type(peer).__name__} "
+            f"id={getattr(peer, 'channel_id', getattr(peer, 'chat_id', '?'))}"
+        )
+    except Exception as e:
+        logger.warning(
+            f"Could not resolve source channel peer {settings.source_chat_id}: {e}. "
+            "Updates may not flow if the session cache is stale."
+        )
+
     # Ensure the userbot is a member so UpdateNewChannelMessage events are pushed.
     # This is required for public channels — Hydrogram won't receive updates
     # for channels the userbot has not joined.

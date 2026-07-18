@@ -79,28 +79,31 @@ class HealthMonitor:
         # 1. User account status (listen)
         results.append(await self._check_pyrogram())
 
-        # 2. Sender bot status (destination delivery)
+        # 2. Listener liveness — session connected AND updates flowing
+        results.append(await self._check_listener_liveness())
+
+        # 3. Sender bot status (destination delivery)
         results.append(await self._check_sender_bot())
 
-        # 3. Redis connectivity
+        # 4. Redis connectivity
         results.append(await self._check_redis())
 
-        # 4. n8n webhook reachable
+        # 5. n8n webhook reachable
         results.append(await self._check_n8n())
 
-        # 5. Queue depth
+        # 6. Queue depth
         results.append(await self._check_queue_depth())
 
-        # 6. Failed queue
+        # 7. Failed queue
         results.append(await self._check_failed_queue())
 
-        # 7. Dead letter queue
+        # 8. Dead letter queue
         results.append(await self._check_dead_letter())
 
-        # 8. SQLite writable
+        # 9. SQLite writable
         results.append(await self._check_sqlite())
 
-        # 9. Disk space
+        # 10. Disk space
         results.append(self._check_disk_space())
 
         return results
@@ -200,6 +203,73 @@ class HealthMonitor:
                 passed=False,
                 level="critical",
                 message=f"get_me() failed: {e}",
+            )
+
+    async def _check_listener_liveness(self) -> HealthCheckResult:
+        """
+        Check that the listener is actually receiving message updates.
+
+        The pyrogram_session check only verifies the MTProto connection is alive.
+        This check verifies that updates are FLOWING by reading the timestamp
+        written by the listener's _handle() on every accepted message.
+
+        A silent failure (connected but no updates) is the most common symptom
+        of a stale session file — especially after migrating between Pyrogram
+        and Hydrogram, or after a long downtime.
+
+        Only fires during activity hours (08:00–23:59 local UTC+3) to avoid
+        false positives during quiet overnight periods.
+        """
+        # Only check during expected activity hours (08:00–23:59 UTC+3)
+        import datetime
+        now_utc3 = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=3)
+        if not (8 <= now_utc3.hour < 24):
+            return HealthCheckResult(
+                name="listener_liveness",
+                passed=True,
+                level="high",
+                message="Outside activity hours — liveness check skipped",
+            )
+
+        SILENCE_THRESHOLD = 1800  # 30 minutes
+        try:
+            from listener import LISTENER_LAST_RECEIVED_KEY
+            raw = await self.redis.get(LISTENER_LAST_RECEIVED_KEY)
+            if raw is None:
+                # Key doesn't exist yet — either the bot just started or no
+                # messages have ever been received on this session.
+                return HealthCheckResult(
+                    name="listener_liveness",
+                    passed=True,
+                    level="high",
+                    message="No messages received yet (new session or quiet channel)",
+                )
+            last_ts = float(raw)
+            silence_secs = time.time() - last_ts
+            silence_min = silence_secs / 60
+            if silence_secs > SILENCE_THRESHOLD:
+                return HealthCheckResult(
+                    name="listener_liveness",
+                    passed=False,
+                    level="high",
+                    message=(
+                        f"No messages received for {silence_min:.0f} min — "
+                        "session may be connected but updates are not flowing. "
+                        "Consider deleting the session file and re-authenticating."
+                    ),
+                )
+            return HealthCheckResult(
+                name="listener_liveness",
+                passed=True,
+                level="high",
+                message=f"Last message received {silence_min:.1f} min ago",
+            )
+        except Exception as e:
+            return HealthCheckResult(
+                name="listener_liveness",
+                passed=True,  # Don't block on Redis errors
+                level="high",
+                message=f"Liveness check skipped: {e}",
             )
 
     async def _check_sender_bot(self) -> HealthCheckResult:

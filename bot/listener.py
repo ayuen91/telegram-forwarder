@@ -882,6 +882,11 @@ async def message_worker(
             queue.task_done()
 
 
+# Redis key that tracks when the listener last received any message.
+# Used by the liveness health check to detect silent update failures.
+LISTENER_LAST_RECEIVED_KEY = "listener:last_received_at"
+
+
 def register_listener(
     app: Client,
     source_chat_id: int,
@@ -901,13 +906,35 @@ def register_listener(
 
     The handler is intentionally thin — validate, normalize, enqueue.
     Optionally increments a Redis daily received counter for metrics.
+
+    Diagnostic aids (added to detect silent update failures):
+      - catch-all on_raw_update logs every MTProto update type at DEBUG level
+      - LISTENER_LAST_RECEIVED_KEY is written to Redis on every accepted message
+        so the liveness health check can detect when updates silently stop
     """
+    logger.info(
+        f"Registering listener on source_chat_id={source_chat_id} "
+        f"(handler=on_message, filter=filters.chat)"
+    )
 
     async def _handle(client: Client, message: Message):
         """Shared handler: validate, normalize, enqueue. No heavy work here."""
         payload = normalize_message(message)
         if payload is None:
             return  # Unsupported message type
+
+        # Track liveness — write timestamp so health check can detect
+        # sessions that are connected but silently not delivering updates.
+        if redis_client is not None:
+            try:
+                import time
+                await redis_client.set(
+                    LISTENER_LAST_RECEIVED_KEY,
+                    str(time.time()),
+                    ex=86400,  # auto-expire after 24 h so new sessions start clean
+                )
+            except Exception as e:
+                logger.debug(f"Liveness timestamp write skipped: {e}")
 
         if redis_client is not None:
             try:
@@ -934,4 +961,16 @@ def register_listener(
     @app.on_message(filters.chat(source_chat_id))
     async def on_message(client: Client, message: Message):
         await _handle(client, message)
+
+    # ── Diagnostic catch-all raw update handler ───────────────────────
+    # Logs every MTProto update type at DEBUG level so you can verify that
+    # Telegram is actually delivering updates to this session — independently
+    # of whether they pass the filters.chat() filter above.
+    # Enable with LOG_LEVEL=DEBUG. Produces no output in INFO mode.
+    @app.on_raw_update()
+    async def _on_raw_update(client, update, users, chats):
+        logger.debug(
+            f"[RAW UPDATE] type={type(update).__name__} "
+            f"chats={list(chats.keys())} users={list(users.keys())}"
+        )
 
