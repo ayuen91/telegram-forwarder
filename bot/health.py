@@ -3,7 +3,7 @@ Health monitoring, heartbeat, config hot-reload, and alert bot.
 
 Runs as a single async task (wrapped by supervised_task in main.py).
 Each cycle (every 5 minutes) does four things:
-  1. Run all health checks (8 checks)
+  1. Run all health checks (9 checks)
   2. Write heartbeat file (for Docker HEALTHCHECK)
   3. Trigger config hot-reload (check file mtime)
   4. Send alerts for failures (with 15-min cooldown)

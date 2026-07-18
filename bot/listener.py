@@ -102,15 +102,6 @@ def normalize_message(message: Message) -> Optional[Dict[str, Any]]:
     if forward_origin:
         payload["forward_origin"] = forward_origin
 
-    # Flag whether the text/caption carries Telegram entity formatting.
-    # When True and no word-replacement fires, the message is relayed through
-    # Pyrogram's copy_message (MTProto) so blockquotes, spoilers, formatted
-    # dates, custom emoji, etc. are preserved — the HTML parser cannot.
-    payload["has_text_entities"] = bool(
-        (message.text and message.text.entities) or
-        (message.caption and message.caption.entities)
-    )
-
     return payload
 
 
@@ -309,11 +300,14 @@ def _source_message_ids(payload: Dict[str, Any]) -> list:
         return [int(i["message_id"]) for i in sorted(items, key=lambda x: int(x.get("message_id", 0)))]
     if msg_type in _RELAY_MEDIA_TYPES:
         return [int(payload["message_id"])]
-    # Text messages with Telegram entities (blockquotes, spoilers, formatted dates,
-    # custom emoji, etc.) are relayed through Pyrogram's copy_message (MTProto) so
-    # that ALL entity types survive intact.  If a word-replacement fires later the
-    # relay result is simply not used and is cleaned up after delivery.
-    if msg_type == "text" and payload.get("has_text_entities"):
+    # Always relay text messages through Pyrogram's MTProto copy_message.
+    # Original Pyrogram does not parse newer entity types (blockquote,
+    # timestamp/date) so we cannot detect them from message.text.entities.
+    # Relaying every text message is the only reliable way to ensure ALL
+    # formatting — including blockquotes, dates, spoilers, custom emoji —
+    # survives intact.  If a word-replacement fires, the relay result is
+    # discarded (sendMessage is used) and cleaned up after delivery.
+    if msg_type == "text":
         return [int(payload["message_id"])]
     return []
 

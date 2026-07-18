@@ -87,7 +87,9 @@ class QueueManager:
         payload["_failed_at"] = time.time()
 
         if retry_count > self.max_retries:
-            payload_json = json.dumps(payload)
+            # Use default=str to guard against any non-JSON-serializable values
+            # (e.g. Pyrogram enum types) that may have survived in the payload.
+            payload_json = json.dumps(payload, default=str)
             await self.redis.rpush(self.QUEUE_DEAD_LETTER, payload_json)
             logger.error(
                 f"Message {message_id} moved to dead letter queue "
@@ -95,7 +97,7 @@ class QueueManager:
             )
             return "dead_letter"
 
-        payload_json = json.dumps(payload)
+        payload_json = json.dumps(payload, default=str)
         await self.redis.rpush(self.QUEUE_FAILED, payload_json)
         logger.warning(
             f"Message {message_id} queued for retry "

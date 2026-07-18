@@ -54,6 +54,15 @@ class AlbumBuffer:
             logger.warning(f"Message {message_id} has no media_group_id, skipping album buffer")
             return None
 
+        sent_key = f"{self.ALBUM_PREFIX}:{group_id}:sent"
+        if await self.redis.exists(sent_key):
+            # This album was already flushed and dispatched.  The arriving item
+            # is a late straggler — drop it to prevent a duplicate send.
+            logger.debug(
+                f"Album {group_id} already sent, dropping late item {message_id}"
+            )
+            return None
+
         album_key = f"{self.ALBUM_PREFIX}:{group_id}"
         timer_key = f"{self.ALBUM_PREFIX}:{group_id}:first_seen"
 
@@ -129,6 +138,7 @@ class AlbumBuffer:
         """
         album_key = f"{self.ALBUM_PREFIX}:{group_id}"
         timer_key = f"{self.ALBUM_PREFIX}:{group_id}:first_seen"
+        sent_key = f"{self.ALBUM_PREFIX}:{group_id}:sent"
 
         try:
             # Get all items
@@ -155,6 +165,11 @@ class AlbumBuffer:
                 "timestamp": items[0].get("timestamp"),
                 "reply_to_message_id": items[0].get("reply_to_message_id"),
             }
+
+            # Write a 'sent' marker BEFORE deleting keys so that any item
+            # arriving in the tiny window between delete and marker creation
+            # is still caught.  60s TTL covers any realistic straggler window.
+            await self.redis.set(sent_key, "1", ex=60)
 
             # Clean up Redis keys
             await self.redis.delete(album_key, timer_key)
