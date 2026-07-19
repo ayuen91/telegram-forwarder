@@ -237,7 +237,7 @@ class HealthMonitor:
                 message="Outside activity hours — liveness check skipped",
             )
 
-        SILENCE_THRESHOLD = 1800  # 30 minutes
+        SILENCE_THRESHOLD = 5400  # 90 minutes — gives the silence watchdog (1 h) time to recover first
         try:
             from listener import LISTENER_LAST_RECEIVED_KEY
             raw = await self.redis.get(LISTENER_LAST_RECEIVED_KEY)
@@ -259,9 +259,11 @@ class HealthMonitor:
                     passed=False,
                     level="high",
                     message=(
-                        f"No messages received for {silence_min:.0f} min — "
-                        "session may be connected but updates are not flowing. "
-                        "Consider deleting the session file and re-authenticating."
+                        f"No messages received for {silence_min:.0f} min "
+                        f"(threshold={SILENCE_THRESHOLD // 60} min) — "
+                        "channel may be quiet, or session updates are not flowing. "
+                        "The silence watchdog will attempt recovery automatically. "
+                        "If this persists >3 h, consider deleting the session file and re-authenticating."
                     ),
                 )
             return HealthCheckResult(

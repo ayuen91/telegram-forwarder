@@ -1104,6 +1104,17 @@ def register_listener(
                 f"from channel history"
                 + (f" (skipped {skipped} pre-start backlog)" if skipped else "")
             )
+            # Update the liveness key so the health check doesn't keep
+            # flagging listener_liveness as failed right after recovery.
+            if fetched > 0 and redis_client is not None:
+                try:
+                    await redis_client.set(
+                        LISTENER_LAST_RECEIVED_KEY,
+                        str(time.time()),
+                        ex=86400,
+                    )
+                except Exception:
+                    pass
         except FloodWait as fw:
             logger.warning(
                 f"FloodWait {fw.value}s during UpdatesTooLong recovery — skipping"
