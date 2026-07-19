@@ -377,6 +377,19 @@ def make_silence_watchdog_factory(
                     await asyncio.sleep(5)  # allow socket to fully close
                     await app.start()
                     logger.info("Silence watchdog: client restarted — session recycled")
+                    # Reset the liveness key so the health check clock restarts
+                    # from now instead of the pre-recycle timestamp (which would
+                    # keep triggering alerts for 90 min even after a good recycle).
+                    try:
+                        import time as _time
+                        await redis_client.set(
+                            LISTENER_LAST_RECEIVED_KEY,
+                            str(_time.time()),
+                            ex=86400,
+                        )
+                        logger.info("Silence watchdog: liveness key reset after recycle")
+                    except Exception as lv_err:
+                        logger.warning(f"Silence watchdog: liveness key reset failed: {lv_err}")
                     # Refresh the access-hash cache after reconnect
                     try:
                         await app.resolve_peer(source_chat_id)

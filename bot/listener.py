@@ -159,9 +159,20 @@ def _get_message_type(message: Message) -> Optional[str]:
 
 def _serialize_poll(poll) -> Dict[str, Any]:
     poll_type = poll.type.value if hasattr(poll.type, "value") else str(poll.type or "regular")
+
+    # poll.question and each option's .text are Hydrogram TextWithEntities objects,
+    # not plain strings. Calling str() or accessing .text coerces them safely.
+    def _to_str(val) -> str:
+        """Safely extract a plain string from a TextWithEntities or plain str."""
+        if val is None:
+            return ""
+        # TextWithEntities exposes a .text attribute; plain strings don't.
+        raw = getattr(val, "text", None)
+        return str(raw) if raw is not None else str(val)
+
     data: Dict[str, Any] = {
-        "question": poll.question,
-        "options": [opt.text for opt in poll.options],
+        "question": _to_str(poll.question),
+        "options": [_to_str(getattr(opt, "text", opt)) for opt in poll.options],
         "is_anonymous": poll.is_anonymous if poll.is_anonymous is not None else True,
         "type": poll_type,
     }
@@ -170,7 +181,7 @@ def _serialize_poll(poll) -> Dict[str, Any]:
     if poll.correct_option_id is not None:
         data["correct_option_id"] = poll.correct_option_id
     if poll.explanation:
-        data["explanation"] = poll.explanation
+        data["explanation"] = _to_str(poll.explanation)
     if poll.open_period:
         data["open_period"] = poll.open_period
     if poll.close_date:
@@ -1238,6 +1249,10 @@ def make_fallback_poller_factory(
             except FloodWait as fw:
                 logger.warning(f"Fallback poller: FloodWait {fw.value}s — pausing poll cycle")
                 await asyncio.sleep(fw.value + 1)
+            except ConnectionError:
+                # Client is mid-recycle (stop→start window ~5s). Skip this cycle silently.
+                logger.debug("Fallback poller: client not ready — skipping poll cycle")
+                await asyncio.sleep(10)
             except Exception as ex:
                 logger.error(f"Fallback poller error: {ex}", exc_info=True)
 
