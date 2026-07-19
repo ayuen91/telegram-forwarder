@@ -958,6 +958,12 @@ LISTENER_LAST_RECEIVED_KEY = "listener:last_received_at"
 # Format: listener:last_msg_id:{chat_id}
 LISTENER_LAST_MSG_ID_PREFIX = "listener:last_msg_id"
 
+# Redis key that stores the last PTS value seen from updates.GetState().
+# Written by _do_channel_catchup() after every successful sync so the
+# silence watchdog can compare against the server-side PTS to distinguish
+# a genuine stall from an organically quiet channel.
+LISTENER_LAST_PTS_KEY = "listener:last_pts"
+
 
 def register_listener(
     app: Client,
@@ -1182,6 +1188,18 @@ async def _do_channel_catchup(
         except Exception:
             pass
 
+    # Snapshot the current server-side PTS after a successful catch-up.
+    # The silence watchdog reads this to confirm whether a stall is real
+    # (server PTS advanced past our snapshot) or organic silence.
+    if redis_client is not None:
+        try:
+            import hydrogram.raw.functions.updates as _upd
+            state = await client.invoke(_upd.GetState())
+            await redis_client.set(LISTENER_LAST_PTS_KEY, str(state.pts), ex=86400)
+            logger.debug(f"Channel catch-up: PTS snapshot written ({state.pts})")
+        except Exception as pts_err:
+            logger.debug(f"Channel catch-up: PTS snapshot skipped: {pts_err}")
+
     watermark_label = f" (watermark msg_id={last_msg_id})" if last_msg_id else ""
     logger.info(
         f"Channel catch-up {channel_chat_id}: re-queued {fetched} message(s){watermark_label}"
@@ -1189,71 +1207,10 @@ async def _do_channel_catchup(
     return fetched
 
 
-def make_fallback_poller_factory(
-    app: Client,
-    source_chat_id: int,
-    message_queue: asyncio.Queue,
-    redis_client=None,
-    bot_start_time: Optional[int] = None,
-    interval: int = 20,
-):
-    """
-    Returns a coroutine factory for the background fallback poller task.
-
-    Polls the last 15 messages from the source channel every `interval` seconds
-    alongside the real-time on_message push handler. The message_worker's Redis
-    SET NX dedup layer discards any message already delivered by the push path,
-    so there is no double-posting.
-
-    This makes the listener resilient to Telegram silently muting push updates
-    on large/active channels: even when the MTProto stream stalls, the poller
-    guarantees zero message loss within the polling window.
-    """
-    async def poller():
-        logger.info(
-            f"Fallback poller started: source={source_chat_id}, "
-            f"interval={interval}s, limit=15 msgs/poll"
-        )
-        while True:
-            await asyncio.sleep(interval)
-            try:
-                batch: list = []
-                async for message in app.get_chat_history(source_chat_id, limit=15):
-                    if bot_start_time is not None:
-                        msg_ts = (
-                            int(message.date.timestamp())
-                            if hasattr(message.date, "timestamp")
-                            else int(message.date)
-                        )
-                        if msg_ts < bot_start_time:
-                            continue
-                    payload = normalize_message(message)
-                    if payload is not None:
-                        batch.append(payload)
-
-                # Enqueue oldest-first for correct reply ordering
-                batch.reverse()
-                queued = 0
-                for payload in batch:
-                    try:
-                        message_queue.put_nowait(payload)
-                        queued += 1
-                    except asyncio.QueueFull:
-                        logger.warning("Fallback poller: queue full — skipping remaining in batch")
-                        break
-
-                logger.debug(
-                    f"Fallback poller: {queued}/{len(batch)} message(s) submitted from history"
-                )
-
-            except FloodWait as fw:
-                logger.warning(f"Fallback poller: FloodWait {fw.value}s — pausing poll cycle")
-                await asyncio.sleep(fw.value + 1)
-            except ConnectionError:
-                # Client is mid-recycle (stop→start window ~5s). Skip this cycle silently.
-                logger.debug("Fallback poller: client not ready — skipping poll cycle")
-                await asyncio.sleep(10)
-            except Exception as ex:
-                logger.error(f"Fallback poller error: {ex}", exc_info=True)
-
-    return poller
+# make_fallback_poller_factory removed.
+# The get_chat_history polling loop was a high-ban-risk approach (Method 4).
+# Recovery from missed updates is now handled exclusively by two safe mechanisms:
+#   1. UpdateChannelTooLong / UpdatesTooLong raw update → _do_channel_catchup()
+#      (event-driven, only fires when Telegram tells us we missed something)
+#   2. PTS-audited silence watchdog in main.py
+#      (compares updates.GetState() PTS vs listener:last_pts before recycling)

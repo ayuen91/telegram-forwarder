@@ -46,7 +46,7 @@ from hydrogram.errors import (
 
 from config import config
 from logging_config import setup_logging
-from listener import register_listener, message_worker, process_payload, retry_payload, make_fallback_poller_factory
+from listener import register_listener, message_worker, process_payload, retry_payload
 from album_buffer import AlbumBuffer
 from queue_manager import QueueManager
 from deduplication import Deduplication
@@ -311,22 +311,29 @@ def make_silence_watchdog_factory(
     source_chat_id: int,
     redis_client,
     silence_timeout: int,
+    health_monitor_ref,
 ):
     """
-    Watches the Redis liveness key written by the on_message handler.
-    If no push-delivered message has arrived for `silence_timeout` seconds,
-    the watchdog performs a FULL client recycle (stop → start) to close the
-    stale TCP socket and force a complete MTProto state-sync handshake.
+    PTS-audited silence watchdog.
 
-    This is the correct recovery for large/active channels where:
-      - resolve_peer() does not restart the underlying socket.
-      - join_chat() causes severe FloodWait on high-member channels.
-      - Only a full reconnect clears the PTS desync with Telegram's servers.
+    Every CHECK_INTERVAL seconds, checks whether the push update stream is
+    flowing by reading LISTENER_LAST_RECEIVED_KEY. If silence exceeds
+    `silence_timeout` seconds it calls updates.GetState() to compare the
+    server-side PTS against the locally stored `listener:last_pts` snapshot:
 
-    The fallback poller and catch-up handler cover any gap during the ~5s
-    restart window. Exponential back-off prevents rapid recycle loops.
+      - server_pts > local_pts → CONFIRMED STALL (Telegram sent updates we
+        never received). Recycles the MTProto client immediately and fires a
+        detailed Telegram alert.
+
+      - server_pts == local_pts → ORGANIC SILENCE (channel is genuinely quiet).
+        Skips the recycle and fires an informational alert so the operator
+        knows the watchdog ran and found nothing wrong.
+
+    Exponential back-off prevents rapid recycle loops after repeated failures.
     """
-    from listener import LISTENER_LAST_RECEIVED_KEY
+    from listener import LISTENER_LAST_RECEIVED_KEY, LISTENER_LAST_PTS_KEY
+    import hydrogram.raw.functions.updates as _upd
+
     CHECK_INTERVAL = 300        # check every 5 minutes
     _last_recycle: float = 0.0
     _recycle_backoff: float = 300.0   # start at 5 min, doubles each time
@@ -347,41 +354,113 @@ def make_silence_watchdog_factory(
             try:
                 last_ts_raw = await redis_client.get(LISTENER_LAST_RECEIVED_KEY)
                 if last_ts_raw is None:
-                    # Key not set yet — channel hasn’t posted anything or
-                    # the fallback poller hasn’t run yet on a fresh session.
+                    # Key not set yet — fresh session, nothing to audit yet.
                     continue
 
-                import time
+                import time as _time
                 last_ts = float(last_ts_raw)
-                elapsed = time.time() - last_ts
+                elapsed = _time.time() - last_ts
+                elapsed_min = elapsed / 60
 
                 if elapsed < silence_timeout:
                     # Push updates flowing normally — reset back-off
                     _recycle_backoff = 300.0
                     continue
 
-                # Silence detected — respect back-off between recycles
-                now = time.monotonic()
-                if now - _last_recycle < _recycle_backoff:
+                # ── Silence threshold crossed — PTS audit ─────────────────
+                logger.info(
+                    f"Silence watchdog: {elapsed_min:.1f} min since last message "
+                    f"(threshold={silence_timeout // 60} min) — auditing PTS..."
+                )
+
+                try:
+                    state = await app.invoke(_upd.GetState())
+                    server_pts = state.pts
+                except Exception as pts_err:
+                    logger.warning(
+                        f"Silence watchdog: GetState() failed ({pts_err}), "
+                        "assuming stall and recycling anyway."
+                    )
+                    server_pts = None
+
+                local_pts_raw = await redis_client.get(LISTENER_LAST_PTS_KEY)
+                local_pts = int(local_pts_raw) if local_pts_raw else 0
+
+                pts_delta = (server_pts - local_pts) if server_pts is not None else None
+                is_stall = (server_pts is None) or (server_pts > local_pts)
+
+                if not is_stall:
+                    # ── Organic silence — PTS matches, channel is quiet ───
+                    logger.info(
+                        f"Silence watchdog: PTS audit passed — "
+                        f"server_pts={server_pts} == local_pts={local_pts}. "
+                        "Channel is organically quiet. No recycle needed."
+                    )
+                    try:
+                        await health_monitor_ref._send_telegram_alert(
+                            f"ℹ️ <b>Listener: Organic Silence Confirmed</b>\n\n"
+                            f"<blockquote>"
+                            f"<b>Silence Duration:</b> <code>{elapsed_min:.1f} min</code>\n"
+                            f"<b>PTS Audit:</b> server=<code>{server_pts}</code> / "
+                            f"local=<code>{local_pts}</code> (matched ✅)\n"
+                            f"<b>Action:</b> No recycle — channel is simply quiet."
+                            f"</blockquote>\n"
+                            f"🕒 <i>{_time.strftime('%Y-%m-%d %H:%M:%S UTC', _time.gmtime())}</i>"
+                        )
+                    except Exception:
+                        pass
                     continue
 
-                logger.warning(
-                    f"Silence watchdog: no push message for {elapsed:.0f}s "
-                    f"(threshold={silence_timeout}s). Recycling MTProto client..."
+                # ── Confirmed stall — PTS has progressed ──────────────────
+                pts_info = (
+                    f"server_pts=<code>{server_pts}</code> / local_pts=<code>{local_pts}</code> "
+                    f"(delta=<code>+{pts_delta}</code>)"
+                    if pts_delta is not None
+                    else "<i>PTS unavailable (GetState failed)</i>"
                 )
+                logger.warning(
+                    f"Silence watchdog: CONFIRMED STALL — "
+                    f"server_pts={server_pts}, local_pts={local_pts}, "
+                    f"elapsed={elapsed_min:.1f} min. Recycling MTProto client..."
+                )
+
+                # Respect back-off between recycles
+                now = _time.monotonic()
+                if now - _last_recycle < _recycle_backoff:
+                    remaining = _recycle_backoff - (now - _last_recycle)
+                    logger.info(
+                        f"Silence watchdog: back-off active — "
+                        f"next recycle allowed in {remaining:.0f}s"
+                    )
+                    continue
+
                 _last_recycle = now
 
+                try:
+                    await health_monitor_ref._send_telegram_alert(
+                        f"🔴 <b>ALERT: Listener Stall Confirmed</b>\n\n"
+                        f"<blockquote>"
+                        f"<b>Silence Duration:</b> <code>{elapsed_min:.1f} min</code>\n"
+                        f"<b>PTS Audit:</b> {pts_info}\n"
+                        f"<b>Action:</b> Full MTProto client recycle initiated."
+                        f"</blockquote>\n"
+                        f"⚙️ <i>Telegram sent updates the listener never received. "
+                        f"Recycling the connection to force a full state-sync handshake.</i>\n"
+                        f"🕒 <i>{_time.strftime('%Y-%m-%d %H:%M:%S UTC', _time.gmtime())}</i>"
+                    )
+                except Exception:
+                    pass
+
+                # ── Perform client recycle ─────────────────────────────────
                 try:
                     await app.stop()
                     logger.info("Silence watchdog: client stopped")
                     await asyncio.sleep(5)  # allow socket to fully close
                     await app.start()
                     logger.info("Silence watchdog: client restarted — session recycled")
-                    # Reset the liveness key so the health check clock restarts
-                    # from now instead of the pre-recycle timestamp (which would
-                    # keep triggering alerts for 90 min even after a good recycle).
+
+                    # Reset liveness key so health check clock restarts from now
                     try:
-                        import time as _time
                         await redis_client.set(
                             LISTENER_LAST_RECEIVED_KEY,
                             str(_time.time()),
@@ -390,17 +469,62 @@ def make_silence_watchdog_factory(
                         logger.info("Silence watchdog: liveness key reset after recycle")
                     except Exception as lv_err:
                         logger.warning(f"Silence watchdog: liveness key reset failed: {lv_err}")
-                    # Refresh the access-hash cache after reconnect
+
+                    # Snapshot fresh PTS after reconnect so next audit has a clean baseline
+                    try:
+                        state_after = await app.invoke(_upd.GetState())
+                        await redis_client.set(
+                            LISTENER_LAST_PTS_KEY,
+                            str(state_after.pts),
+                            ex=86400,
+                        )
+                        logger.info(
+                            f"Silence watchdog: post-recycle PTS snapshot: {state_after.pts}"
+                        )
+                    except Exception as pts_snap_err:
+                        logger.warning(
+                            f"Silence watchdog: post-recycle PTS snapshot failed: {pts_snap_err}"
+                        )
+
+                    # Refresh access-hash cache after reconnect
                     try:
                         await app.resolve_peer(source_chat_id)
                         logger.info("Silence watchdog: peer re-resolved after recycle")
                     except Exception as rp_err:
                         logger.warning(f"Silence watchdog: resolve_peer failed: {rp_err}")
+
+                    try:
+                        await health_monitor_ref._send_telegram_alert(
+                            f"✅ <b>Listener Recycle Successful</b>\n\n"
+                            f"<blockquote>"
+                            f"<b>Stall Duration:</b> <code>{elapsed_min:.1f} min</code>\n"
+                            f"<b>PTS Before Recycle:</b> {pts_info}\n"
+                            f"<b>Status:</b> MTProto session recycled. Awaiting fresh updates."
+                            f"</blockquote>\n"
+                            f"🕒 <i>{_time.strftime('%Y-%m-%d %H:%M:%S UTC', _time.gmtime())}</i>"
+                        )
+                    except Exception:
+                        pass
+
                 except Exception as recycle_err:
                     logger.error(
                         f"Silence watchdog: client recycle failed: {recycle_err}",
                         exc_info=True,
                     )
+                    try:
+                        next_retry_min = _recycle_backoff / 60
+                        await health_monitor_ref._send_telegram_alert(
+                            f"🔴 <b>ALERT: Listener Recycle Failed</b>\n\n"
+                            f"<blockquote>"
+                            f"<b>Error:</b> <code>{recycle_err.__class__.__name__}</code>\n"
+                            f"<b>Details:</b> {recycle_err}\n"
+                            f"<b>Next Retry:</b> no sooner than <code>{next_retry_min:.0f} min</code>"
+                            f"</blockquote>\n"
+                            f"⚠️ <i>Manual restart may be required if this persists.</i>\n"
+                            f"🕒 <i>{_time.strftime('%Y-%m-%d %H:%M:%S UTC', _time.gmtime())}</i>"
+                        )
+                    except Exception:
+                        pass
 
                 _recycle_backoff = min(_recycle_backoff * 2, _MAX_BACKOFF)
                 logger.info(
@@ -620,31 +744,14 @@ async def main():
             f"{settings.daily_report_timezone}"
         )
 
-    # ── Fallback poller ────────────────────────────────────────────────
-    # Fetches the last 15 messages every LISTENER_POLLER_INTERVAL seconds.
-    # The Redis SET NX dedup in message_worker discards any message already
-    # delivered by the real-time push handler — zero double-posting risk.
-    # This closes any gap caused by Telegram silently muting push updates
-    # on large/active channels.
-    tasks.append(asyncio.create_task(
-        supervised_task(
-            "fallback-poller",
-            make_fallback_poller_factory(
-                app=app,
-                source_chat_id=settings.source_chat_id,
-                message_queue=message_queue,
-                redis_client=redis_client,
-                bot_start_time=bot_start_time,
-                interval=settings.listener_poller_interval,
-            ),
-        ),
-        name="fallback-poller",
-    ))
 
-    # ── Silence watchdog ────────────────────────────────────────────────
-    # Performs a full client.stop()→start() recycle when no push message has
-    # arrived for LISTENER_SILENCE_TIMEOUT seconds (default 1800s / 30 min).
-    # Disabled when silence_timeout=0.
+
+    # ── Silence watchdog (PTS-audited) ─────────────────────────────────
+    # Every 5 min, checks if updates are flowing by reading the liveness key.
+    # If silence > LISTENER_SILENCE_TIMEOUT (default 900s / 15 min), calls
+    # updates.GetState() to compare server PTS vs local snapshot:
+    #   - PTS delta > 0 → confirmed stall → full client recycle + alert
+    #   - PTS delta = 0 → organic quiet  → informational alert, no recycle
     tasks.append(asyncio.create_task(
         supervised_task(
             "silence-watchdog",
@@ -653,6 +760,7 @@ async def main():
                 source_chat_id=settings.source_chat_id,
                 redis_client=redis_client,
                 silence_timeout=settings.listener_silence_timeout,
+                health_monitor_ref=health_monitor,
             ),
         ),
         name="silence-watchdog",
@@ -661,8 +769,7 @@ async def main():
     logger.info(
         f"Workers running: {settings.worker_count} processors, album-flush, retry, health"
         + (", daily-report" if settings.daily_report_enabled else "")
-        + f", fallback-poller ({settings.listener_poller_interval}s)"
-        + (f", silence-watchdog ({settings.listener_silence_timeout}s recycle)" if settings.listener_silence_timeout > 0 else "")
+        + (f", silence-watchdog (PTS-audited, {settings.listener_silence_timeout}s threshold)" if settings.listener_silence_timeout > 0 else "")
     )
 
 

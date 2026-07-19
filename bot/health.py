@@ -213,20 +213,19 @@ class HealthMonitor:
 
     async def _check_listener_liveness(self) -> HealthCheckResult:
         """
-        Check that the listener is actually receiving message updates.
+        PTS-aware liveness check — distinguishes three states:
 
-        The pyrogram_session check only verifies the MTProto connection is alive.
-        This check verifies that updates are FLOWING by reading the timestamp
-        written by the listener's _handle() on every accepted message.
+          FLOWING       — updates received recently, all good.
+          ORGANIC_QUIET — no recent messages but server PTS matches local
+                          snapshot → the channel is simply silent.
+          POSSIBLE_STALL — no recent messages AND server PTS > local snapshot
+                           → Telegram sent updates we never received. The
+                           silence watchdog should be addressing this; if the
+                           alert persists the session may need re-authentication.
 
-        A silent failure (connected but no updates) is the most common symptom
-        of a stale session file — especially after migrating between Pyrogram
-        and Hydrogram, or after a long downtime.
-
-        Only fires during activity hours (08:00–23:59 local UTC+3) to avoid
+        Only fires during activity hours (08:00–23:59 UTC+3) to avoid
         false positives during quiet overnight periods.
         """
-        # Only check during expected activity hours (08:00–23:59 UTC+3)
         import datetime
         now_utc3 = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=3)
         if not (8 <= now_utc3.hour < 24):
@@ -237,42 +236,80 @@ class HealthMonitor:
                 message="Outside activity hours — liveness check skipped",
             )
 
-        SILENCE_THRESHOLD = 5400  # 90 min — the silence watchdog recycles at 30 min, so
-        # this only fires if the full client recycle itself failed to restore updates.
+        # 90 min threshold — the watchdog recycles at 15 min, so this only
+        # fires if the recycle itself failed to restore updates.
+        SILENCE_THRESHOLD = 5400
 
         try:
-            from listener import LISTENER_LAST_RECEIVED_KEY
+            from listener import LISTENER_LAST_RECEIVED_KEY, LISTENER_LAST_PTS_KEY
+
             raw = await self.redis.get(LISTENER_LAST_RECEIVED_KEY)
             if raw is None:
-                # Key doesn't exist yet — either the bot just started or no
-                # messages have ever been received on this session.
                 return HealthCheckResult(
                     name="listener_liveness",
                     passed=True,
                     level="high",
                     message="No messages received yet (new session or quiet channel)",
                 )
+
             last_ts = float(raw)
             silence_secs = time.time() - last_ts
             silence_min = silence_secs / 60
-            if silence_secs > SILENCE_THRESHOLD:
+
+            # ── FLOWING: updates received within threshold ─────────────────
+            if silence_secs <= SILENCE_THRESHOLD:
                 return HealthCheckResult(
                     name="listener_liveness",
-                    passed=False,
+                    passed=True,
                     level="high",
-                    message=(
-                        f"No messages received for {silence_min:.0f} min "
-                        f"(threshold={SILENCE_THRESHOLD // 60} min) — "
-                        "channel may be quiet, or session updates are not flowing. "
-                        "The silence watchdog will attempt recovery automatically. "
-                        "If this persists >3 h, consider deleting the session file and re-authenticating."
-                    ),
+                    message=f"FLOWING — last message received {silence_min:.1f} min ago",
                 )
+
+            # ── Threshold exceeded — run PTS audit ─────────────────────────
+            server_pts: int = 0
+            local_pts: int = 0
+            pts_status = "PTS audit unavailable"
+
+            try:
+                import hydrogram.raw.functions.updates as _upd
+                if self.pyrogram_app and self.pyrogram_app.is_connected:
+                    state = await self.pyrogram_app.invoke(_upd.GetState())
+                    server_pts = state.pts
+                    local_pts_raw = await self.redis.get(LISTENER_LAST_PTS_KEY)
+                    local_pts = int(local_pts_raw) if local_pts_raw else 0
+                    pts_delta = server_pts - local_pts
+                    if pts_delta <= 0:
+                        pts_status = (
+                            f"ORGANIC_QUIET — server_pts={server_pts} == "
+                            f"local_pts={local_pts} (channel is silent, not stalled)"
+                        )
+                    else:
+                        pts_status = (
+                            f"POSSIBLE_STALL — server_pts={server_pts}, "
+                            f"local_pts={local_pts}, delta=+{pts_delta} "
+                            f"(Telegram sent {pts_delta} pts worth of updates we never received)"
+                        )
+                else:
+                    pts_status = "PTS audit skipped — client not connected"
+            except Exception as pts_err:
+                pts_status = f"PTS audit failed: {pts_err}"
+
+            is_stall = "STALL" in pts_status or "unavailable" in pts_status
             return HealthCheckResult(
                 name="listener_liveness",
-                passed=True,
+                passed=not is_stall,
                 level="high",
-                message=f"Last message received {silence_min:.1f} min ago",
+                message=(
+                    f"No messages for {silence_min:.0f} min "
+                    f"(threshold={SILENCE_THRESHOLD // 60} min). "
+                    f"PTS audit: {pts_status}. "
+                    + (
+                        "Silence watchdog is attempting recovery automatically. "
+                        "If this persists >3 h, re-authenticate the session."
+                        if is_stall else
+                        "Channel is organically quiet — no action needed."
+                    )
+                ),
             )
         except Exception as e:
             return HealthCheckResult(
