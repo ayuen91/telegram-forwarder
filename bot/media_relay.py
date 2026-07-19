@@ -5,10 +5,17 @@ Preferred: private relay channel (RELAY_CHANNEL_ID) where userbot posts and
 the sender bot copies — message IDs match Bot API reliably.
 
 Fallback: userbot DM with sender bot + Bot API getUpdates to resolve message IDs.
+
+Protected content channels (Restrict Saving Content enabled) are handled by
+downloading media and re-uploading to the relay target instead of using
+copy_message / copy_media_group which Telegram blocks.
 """
 
 import asyncio
 import logging
+import os
+import shutil
+import tempfile
 from dataclasses import dataclass
 from typing import List, Optional, TYPE_CHECKING
 
@@ -28,6 +35,28 @@ class RelayConfig:
     userbot_target: int
     bot_from_chat: int
     mode: str = "channel"  # "channel" or "dm"
+
+
+# ── Error classification helpers ──────────────────────────────────────────
+
+
+def _is_forwards_restricted(exc: Exception) -> bool:
+    """True if the error is a CHAT_FORWARDS_RESTRICTED / protected content error."""
+    msg = str(exc).upper()
+    return "CHAT_FORWARDS_RESTRICTED" in msg or "FORWARDS_RESTRICTED" in msg
+
+
+def _is_peer_id_invalid(exc: Exception) -> bool:
+    """True if the error indicates a stale or missing peer cache entry."""
+    return "PEER_ID_INVALID" in str(exc).upper()
+
+
+def _is_message_ids_empty(exc: Exception) -> bool:
+    """True if the error is a MESSAGE_IDS_EMPTY bad request."""
+    return "MESSAGE_IDS_EMPTY" in str(exc).upper()
+
+
+# ── Config resolution ────────────────────────────────────────────────────
 
 
 async def resolve_relay_config(
@@ -104,6 +133,173 @@ async def ensure_relay_chat(
     return False
 
 
+# ── Internal relay helpers ────────────────────────────────────────────────
+
+
+async def _direct_copy(
+    app: Client,
+    target: int,
+    source_chat_id: int,
+    message_ids: List[int],
+    is_album: bool,
+) -> List[int]:
+    """Standard copy_message / copy_media_group (fast path)."""
+    if is_album or len(message_ids) > 1:
+        copied = await app.copy_media_group(
+            chat_id=target,
+            from_chat_id=source_chat_id,
+            message_id=message_ids[0],
+        )
+        return [msg.id for msg in copied]
+    else:
+        copied = await app.copy_message(
+            chat_id=target,
+            from_chat_id=source_chat_id,
+            message_id=message_ids[0],
+        )
+        return [copied.id]
+
+
+async def _relay_via_download(
+    app: Client,
+    target: int,
+    source_chat_id: int,
+    message_ids: List[int],
+    is_album: bool = False,
+) -> List[int]:
+    """
+    Fallback relay for protected-content channels.
+
+    Downloads media from the source channel and re-uploads to the relay
+    target.  This bypasses Telegram's CHAT_FORWARDS_RESTRICTED block
+    because the bot is creating a *new* message rather than copying.
+    """
+    temp_dir = tempfile.mkdtemp(prefix="tg_relay_")
+
+    try:
+        messages = await app.get_messages(source_chat_id, message_ids)
+        if not isinstance(messages, list):
+            messages = [messages]
+        # Filter out empty/service messages and sort by ID
+        messages = sorted(
+            [m for m in messages if m and not m.empty],
+            key=lambda m: m.id,
+        )
+
+        if not messages:
+            raise RuntimeError(
+                f"No fetchable messages for IDs {message_ids} "
+                f"in protected channel {source_chat_id}"
+            )
+
+        if is_album and len(messages) > 1:
+            return await _download_reupload_album(app, target, messages, temp_dir)
+        else:
+            return await _download_reupload_single(app, target, messages[0], temp_dir)
+
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+async def _download_reupload_single(
+    app: Client,
+    target: int,
+    msg,
+    temp_dir: str,
+) -> List[int]:
+    """Download one message's media and re-send to relay target."""
+    # Text-only messages (relayed for rich entities)
+    if msg.text and not any([
+        msg.photo, msg.video, msg.document, msg.audio,
+        msg.voice, msg.video_note, msg.animation, msg.sticker,
+    ]):
+        sent = await app.send_message(target, str(msg.text))
+        return [sent.id]
+
+    file_path = await app.download_media(
+        msg, file_name=os.path.join(temp_dir, f"{msg.id}_"),
+    )
+    if not file_path:
+        raise RuntimeError(
+            f"Failed to download media for message {msg.id} "
+            "(protected content channel)"
+        )
+
+    caption = str(msg.caption) if msg.caption else None
+
+    if msg.photo:
+        sent = await app.send_photo(target, file_path, caption=caption)
+    elif msg.video:
+        sent = await app.send_video(target, file_path, caption=caption)
+    elif msg.document:
+        sent = await app.send_document(target, file_path, caption=caption)
+    elif msg.audio:
+        sent = await app.send_audio(target, file_path, caption=caption)
+    elif msg.voice:
+        sent = await app.send_voice(target, file_path, caption=caption)
+    elif msg.video_note:
+        sent = await app.send_video_note(target, file_path)
+    elif msg.animation:
+        sent = await app.send_animation(target, file_path, caption=caption)
+    elif msg.sticker:
+        sent = await app.send_sticker(target, file_path)
+    else:
+        # Unknown media type — send as document
+        sent = await app.send_document(target, file_path, caption=caption)
+
+    return [sent.id]
+
+
+async def _download_reupload_album(
+    app: Client,
+    target: int,
+    messages: list,
+    temp_dir: str,
+) -> List[int]:
+    """Download album items and re-send as a media group."""
+    from hydrogram.types import (
+        InputMediaPhoto,
+        InputMediaVideo,
+        InputMediaDocument,
+        InputMediaAudio,
+    )
+
+    media_group = []
+    for msg in messages:
+        file_path = await app.download_media(
+            msg, file_name=os.path.join(temp_dir, f"{msg.id}_"),
+        )
+        if not file_path:
+            logger.warning(
+                f"Skipping album item {msg.id} — media download failed "
+                "(protected content)"
+            )
+            continue
+
+        caption = str(msg.caption) if msg.caption else ""
+
+        if msg.photo:
+            media_group.append(InputMediaPhoto(file_path, caption=caption))
+        elif msg.video:
+            media_group.append(InputMediaVideo(file_path, caption=caption))
+        elif msg.audio:
+            media_group.append(InputMediaAudio(file_path, caption=caption))
+        else:
+            # document, animation, etc.
+            media_group.append(InputMediaDocument(file_path, caption=caption))
+
+    if not media_group:
+        raise RuntimeError(
+            "No media items could be downloaded for protected-content album"
+        )
+
+    sent = await app.send_media_group(target, media_group)
+    return [m.id for m in sent]
+
+
+# ── Public API ────────────────────────────────────────────────────────────
+
+
 async def relay_to_bot(
     app: Client,
     sender: "TelegramBotSender",
@@ -114,53 +310,112 @@ async def relay_to_bot(
 ) -> List[int]:
     """
     Copy message(s) from source into relay, return Bot-API-compatible message ids.
+
+    Handles three common failure modes in large channels:
+      - PEER_ID_INVALID: re-resolves the peer access hash and retries
+      - CHAT_FORWARDS_RESTRICTED: downloads media and re-uploads instead of copying
+      - MESSAGE_IDS_EMPTY: validates IDs before attempting any API call
     """
     if not message_ids:
         return []
 
+    # Filter out invalid IDs (null, zero) — protects against MESSAGE_IDS_EMPTY
+    message_ids = [mid for mid in message_ids if mid and int(mid) > 0]
+    if not message_ids:
+        logger.warning("All message IDs were invalid (null/zero) — skipping relay")
+        return []
+
     target = relay.userbot_target
+    hydrogram_ids: Optional[List[int]] = None
 
+    # ── Step 1: Copy messages to relay target ──────────────────────────
     try:
-        if is_album or len(message_ids) > 1:
-            copied = await app.copy_media_group(
-                chat_id=target,
-                from_chat_id=source_chat_id,
-                message_id=message_ids[0],
-            )
-            hydrogram_ids = [msg.id for msg in copied]
-            logger.info(
-                f"Relayed album ({len(hydrogram_ids)} items) "
-                f"source={source_chat_id} → {relay.mode} {target}"
-            )
-        else:
-            copied = await app.copy_message(
-                chat_id=target,
-                from_chat_id=source_chat_id,
-                message_id=message_ids[0],
-            )
-            hydrogram_ids = [copied.id]
-            logger.info(
-                f"Relayed message {message_ids[0]} "
-                f"source={source_chat_id} → {relay.mode} {target} (hydrogram id={copied.id})"
-            )
-
-        if relay.mode == "channel":
-            return hydrogram_ids
-
-        bot_ids = await sender.resolve_relay_message_ids(
-            relay.bot_from_chat, count=len(hydrogram_ids)
+        hydrogram_ids = await _direct_copy(
+            app, target, source_chat_id, message_ids, is_album,
         )
-        logger.info(f"Resolved Bot API relay ids: {bot_ids} (hydrogram {hydrogram_ids})")
-        return bot_ids
-
     except FloodWait:
         raise
     except Exception as e:
-        logger.error(
-            f"Failed to relay message(s) {message_ids} from {source_chat_id}: {e}",
-            exc_info=True,
+        if _is_peer_id_invalid(e):
+            # Stale peer cache — re-resolve and retry once
+            logger.warning(
+                f"PEER_ID_INVALID for chat {source_chat_id} — "
+                "re-resolving peer and retrying relay"
+            )
+            try:
+                await app.resolve_peer(source_chat_id)
+                hydrogram_ids = await _direct_copy(
+                    app, target, source_chat_id, message_ids, is_album,
+                )
+            except FloodWait:
+                raise
+            except Exception as retry_err:
+                if _is_forwards_restricted(retry_err):
+                    # Protected content — will fall through to download path
+                    pass
+                else:
+                    logger.error(
+                        f"Relay retry after peer re-resolve failed: {retry_err}",
+                        exc_info=True,
+                    )
+                    raise
+
+        elif _is_forwards_restricted(e):
+            # Protected content — will fall through to download path
+            pass
+
+        elif _is_message_ids_empty(e):
+            logger.warning(
+                f"MESSAGE_IDS_EMPTY for {message_ids} from {source_chat_id} — "
+                "message may have been deleted"
+            )
+            raise
+
+        else:
+            logger.error(
+                f"Failed to relay message(s) {message_ids} from "
+                f"{source_chat_id}: {e}",
+                exc_info=True,
+            )
+            raise
+
+    # ── Step 1b: Protected content fallback (download + reupload) ──────
+    if hydrogram_ids is None:
+        logger.warning(
+            f"Source channel {source_chat_id} has restricted forwarding — "
+            "downloading media and re-uploading to relay target"
         )
-        raise
+        try:
+            hydrogram_ids = await _relay_via_download(
+                app, target, source_chat_id, message_ids, is_album,
+            )
+        except FloodWait:
+            raise
+        except Exception as dl_err:
+            logger.error(
+                f"Protected-content relay (download+reupload) failed: {dl_err}",
+                exc_info=True,
+            )
+            raise
+
+    count = len(hydrogram_ids)
+    logger.info(
+        f"Relayed {'album' if is_album else 'message'} "
+        f"({count} item{'s' if count != 1 else ''}) "
+        f"source={source_chat_id} → {relay.mode} {target}"
+    )
+
+    # ── Step 2: Resolve Bot API message IDs (DM mode only) ─────────────
+    if relay.mode == "channel":
+        return hydrogram_ids
+
+    bot_ids = await sender.resolve_relay_message_ids(
+        relay.bot_from_chat, count=len(hydrogram_ids),
+    )
+    logger.info(
+        f"Resolved Bot API relay ids: {bot_ids} (hydrogram {hydrogram_ids})"
+    )
+    return bot_ids
 
 
 async def cleanup_relay(

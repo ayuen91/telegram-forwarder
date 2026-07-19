@@ -130,10 +130,18 @@ class TelegramBotSender:
         Forward multiple messages (e.g. album) preserving attribution.
         Returns destination message_ids in order.
         """
+        # Validate before sending — an empty list causes MESSAGE_IDS_EMPTY
+        valid_ids = [int(mid) for mid in message_ids if mid and int(mid) > 0]
+        if not valid_ids:
+            raise RuntimeError(
+                "forward_messages called with no valid message_ids "
+                "(all were None or zero)"
+            )
+
         payload: Dict[str, Any] = {
             "chat_id": chat_id,
             "from_chat_id": from_chat_id,
-            "message_ids": [int(mid) for mid in message_ids],
+            "message_ids": valid_ids,
         }
         reply_params = self._reply_params(reply_to_message_id)
         if reply_params:
@@ -243,10 +251,18 @@ class TelegramBotSender:
         reply_to_message_id: Optional[Union[int, str]] = None,
     ) -> List[int]:
         """Copy an album (media group). Returns message_ids in destination chat, in order."""
+        # Validate before sending — an empty list causes MESSAGE_IDS_EMPTY
+        valid_ids = [int(mid) for mid in message_ids if mid and int(mid) > 0]
+        if not valid_ids:
+            raise RuntimeError(
+                "copy_messages called with no valid message_ids "
+                "(all were None or zero)"
+            )
+
         payload: Dict[str, Any] = {
             "chat_id": chat_id,
             "from_chat_id": from_chat_id,
-            "message_ids": [int(mid) for mid in message_ids],
+            "message_ids": valid_ids,
         }
         reply_params = self._reply_params(reply_to_message_id)
         if reply_params:
@@ -659,12 +675,28 @@ class TelegramBotSender:
             "reply_mappings": [(msg_id, sent_id)],
         }
 
-    async def call_with_flood_wait(self, coro_factory):
-        """Execute a coroutine, sleeping once on FloodWait and retrying."""
-        try:
-            return await coro_factory()
-        except TelegramFloodWait as e:
-            wait = e.retry_after + 1
-            logger.warning(f"Bot API FloodWait({e.retry_after}s), sleeping {wait}s")
-            await asyncio.sleep(wait)
-            return await coro_factory()
+    async def call_with_flood_wait(
+        self,
+        coro_factory,
+        max_retries: int = 3,
+    ):
+        """
+        Execute a coroutine, sleeping on FloodWait (up to max_retries times).
+
+        Each FloodWait resets the retry counter — we keep going as long as
+        Telegram tells us to wait, rather than giving up after a single 429.
+        """
+        for attempt in range(max_retries):
+            try:
+                return await coro_factory()
+            except TelegramFloodWait as e:
+                if attempt >= max_retries - 1:
+                    raise  # Exhaust retries — let the worker re-queue
+                wait = e.retry_after + 1
+                logger.warning(
+                    f"Bot API FloodWait({e.retry_after}s), "
+                    f"sleeping {wait}s (attempt {attempt + 1}/{max_retries})"
+                )
+                await asyncio.sleep(wait)
+        # Should never reach here, but satisfy type checker
+        return await coro_factory()

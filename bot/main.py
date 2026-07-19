@@ -479,8 +479,10 @@ async def main():
     )
 
     message_queue = asyncio.Queue(maxsize=100)
-    register_listener(app, settings.source_chat_id, message_queue, redis_client=redis_client)
-    stale_albums = await album_buf.flush_stale_albums()
+
+    # Record startup time BEFORE connecting so the listener can drop
+    # any backlog updates Telegram pushes upon reconnect.
+    bot_start_time = int(time.time())
 
     # ── Connect and verify ────────────────────────────────────────────
     logger.info("Connecting Hydrogram userbot...")
@@ -488,6 +490,10 @@ async def main():
 
     me = await app.get_me()
     logger.info(f"Hydrogram connected as {me.first_name} (id={me.id})")
+    logger.info(
+        f"Backlog filter active — messages older than t={bot_start_time} "
+        "will be silently dropped (no relay, no DB write, no flood risk)"
+    )
 
     try:
         bot_me = await sender.get_me()
@@ -532,6 +538,15 @@ async def main():
     relay_ok = await ensure_relay_chat(app, sender, relay)
     if not relay_ok:
         logger.warning("Media forwarding disabled until relay chat is accessible (text still works)")
+
+    register_listener(
+        app,
+        settings.source_chat_id,
+        message_queue,
+        redis_client=redis_client,
+        bot_start_time=bot_start_time,
+    )
+    stale_albums = await album_buf.flush_stale_albums()
 
     for err in await sender.verify_destinations(
         [{"chat_id": d.chat_id, "name": d.name, "enabled": d.enabled}

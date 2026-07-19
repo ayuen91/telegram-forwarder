@@ -21,7 +21,7 @@ from typing import Dict, Any, Optional, Literal
 
 import aiosqlite
 from hydrogram import Client, filters
-from hydrogram.errors import FloodWait
+from hydrogram.errors import FloodWait, MessageIdsEmpty
 from hydrogram.raw.types import UpdatesTooLong
 from hydrogram.types import Message
 
@@ -76,6 +76,16 @@ def normalize_message(message: Message) -> Optional[Dict[str, Any]]:
     if message.caption:
         caption_html = str(message.caption.html) if message.caption.entities else str(message.caption)
 
+    # Detect Restrict Saving Content (protected content) flag.
+    # When True, copy_message / copy_media_group will raise
+    # CHAT_FORWARDS_RESTRICTED — the relay layer falls back to
+    # download + reupload automatically, but capturing it here lets
+    # the worker log it early and avoids a surprise exception later.
+    has_protected_content: bool = bool(
+        getattr(message, "has_protected_content", False)
+        or getattr(message.chat, "has_protected_content", False)
+    )
+
     payload = {
         "message_id": message.id,
         "chat_id": message.chat.id,
@@ -88,6 +98,7 @@ def normalize_message(message: Message) -> Optional[Dict[str, Any]]:
         "caption_html": caption_html,
         "media_group_id": message.media_group_id,
         "has_media": msg_type in _RELAY_MEDIA_TYPES or msg_type == "album",
+        "has_protected_content": has_protected_content,
         "reply_to_message_id": message.reply_to_message_id if message.reply_to_message_id else None,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
@@ -355,15 +366,37 @@ async def forward_message_pipeline(
         if not pyrogram_app or relay is None:
             logger.error("Media forwarding requires Pyrogram client and relay config")
             return "failed"
+
+        # Guard against MESSAGE_IDS_EMPTY: drop zeroes / None before relay
+        valid_relay_ids = [mid for mid in source_ids_for_relay if mid and int(mid) > 0]
+        if not valid_relay_ids:
+            logger.warning(
+                f"All relay message IDs were invalid for payload "
+                f"{payload.get('message_id')} — skipping relay (message may be deleted)"
+            )
+            return "failed"
+
+        if payload.get("has_protected_content"):
+            logger.info(
+                f"Source channel has protected content — relay will use "
+                f"download+reupload fallback for message {payload.get('message_id')}"
+            )
+
         try:
             relay_message_ids = await relay_to_bot(
                 pyrogram_app,
                 sender,
                 source_chat_id,
-                source_ids_for_relay,
+                valid_relay_ids,
                 relay,
                 is_album=(msg_type == "album"),
             )
+        except MessageIdsEmpty:
+            logger.warning(
+                f"MESSAGE_IDS_EMPTY during relay for message "
+                f"{payload.get('message_id')} — message was likely deleted"
+            )
+            return "failed"
         except Exception as ex:
             logger.error(f"Userbot media relay failed: {ex}", exc_info=True)
             return "failed"
@@ -867,8 +900,23 @@ async def message_worker(
                     )
 
         except TelegramFloodWait as e:
+            # Bot API 429 — sleep the requested duration then re-queue
             wait = e.retry_after + 1
-            logger.warning(f"Worker-{worker_id}: FloodWait {wait}s")
+            logger.warning(
+                f"Worker-{worker_id}: Bot API FloodWait {wait}s — "
+                f"re-queuing message {message_id}"
+            )
+            await asyncio.sleep(wait)
+            await queue.put(payload)
+        except FloodWait as e:
+            # Hydrogram (MTProto) flood wait — also sleep + re-queue
+            # Previously this fell through to the generic Exception handler
+            # which moved the message to the failed queue instead of retrying.
+            wait = e.value + 1
+            logger.warning(
+                f"Worker-{worker_id}: MTProto FloodWait {wait}s — "
+                f"re-queuing message {message_id}"
+            )
             await asyncio.sleep(wait)
             await queue.put(payload)
         except Exception as e:
@@ -900,7 +948,15 @@ def register_listener(
     source_chat_id: int,
     message_queue: asyncio.Queue,
     redis_client=None,
+    bot_start_time: Optional[int] = None,
 ):
+    """
+    bot_start_time — Unix timestamp (seconds) recorded when the bot started.
+    Any message whose .date is strictly before this value is considered
+    backlog from a previous session and is silently dropped.  Pass
+    int(time.time()) from main.py just before app.start() to activate.
+    Defaults to None (disabled) so existing call sites are unaffected.
+    """
     """
     Register the message handler on the Hydrogram (MTProto) client.
 
@@ -927,6 +983,20 @@ def register_listener(
 
     async def _handle(client: Client, message: Message):
         """Shared handler: validate, normalize, enqueue. No heavy work here."""
+        # ── Startup backlog filter ────────────────────────────────────────
+        # Telegram pushes missed updates on reconnect.  For large channels
+        # this backlog can be huge and trigger flood-waits before we even
+        # start processing real-time messages.  Drop anything older than
+        # the moment the bot started.
+        if bot_start_time is not None:
+            msg_ts = int(message.date.timestamp()) if hasattr(message.date, "timestamp") else int(message.date)
+            if msg_ts < bot_start_time:
+                logger.debug(
+                    f"Dropping backlog message {message.id} "
+                    f"(date={msg_ts} < start={bot_start_time})"
+                )
+                return
+
         payload = normalize_message(message)
         if payload is None:
             return  # Unsupported message type
@@ -1005,7 +1075,18 @@ def register_listener(
 
         try:
             fetched = 0
-            async for message in client.get_chat_history(source_chat_id, limit=10):
+            skipped = 0
+            # Fetch up to 50 recent messages — large/active channels can
+            # post dozens of messages in the time it takes the MTProto
+            # session to fall behind and receive UpdatesTooLong.
+            async for message in client.get_chat_history(source_chat_id, limit=50):
+                # Honour the startup filter: skip pre-start history
+                if bot_start_time is not None:
+                    msg_ts = int(message.date.timestamp()) if hasattr(message.date, "timestamp") else int(message.date)
+                    if msg_ts < bot_start_time:
+                        skipped += 1
+                        continue
+
                 payload = normalize_message(message)
                 if payload is None:
                     continue
@@ -1020,7 +1101,8 @@ def register_listener(
                     break
             logger.info(
                 f"UpdatesTooLong recovery: re-queued {fetched} message(s) "
-                "from channel history"
+                f"from channel history"
+                + (f" (skipped {skipped} pre-start backlog)" if skipped else "")
             )
         except FloodWait as fw:
             logger.warning(
