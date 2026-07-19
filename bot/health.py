@@ -91,20 +91,26 @@ class HealthMonitor:
         # 5. n8n webhook reachable
         results.append(await self._check_n8n())
 
-        # 6. Queue depth
+        # 6. Queue depth (early surge warning)
+        results.append(await self._check_queue_surge())
+
+        # 7. Queue depth (critical overflow)
         results.append(await self._check_queue_depth())
 
-        # 7. Failed queue
+        # 8. Failed queue
         results.append(await self._check_failed_queue())
 
-        # 8. Dead letter queue
+        # 9. Dead letter queue
         results.append(await self._check_dead_letter())
 
-        # 9. SQLite writable
+        # 10. SQLite writable
         results.append(await self._check_sqlite())
 
-        # 10. Disk space
+        # 11. Disk space
         results.append(self._check_disk_space())
+
+        # 12. Sustained delivery failure rate (live mid-day check)
+        results.append(await self._check_sustained_failure_rate())
 
         return results
 
@@ -402,6 +408,103 @@ class HealthMonitor:
         except Exception as e:
             return HealthCheckResult(
                 name="disk_space", passed=True, level="high", message=str(e)
+            )
+
+    async def _check_queue_surge(self) -> HealthCheckResult:
+        """
+        Early warning when the pending queue climbs above 50 messages.
+
+        _check_queue_depth fires at 100 which is already too late —
+        by then the event loop is saturated. Firing at 50 gives the
+        operator time to investigate before messages start dropping.
+        """
+        try:
+            depth = await self.redis.llen("queue:messages")
+            album_depth = await self.redis.llen("queue:albums")
+            total = depth + album_depth
+            if total >= 100:
+                # Let _check_queue_depth handle the critical case
+                return HealthCheckResult(
+                    name="queue_surge", passed=True, level="high"
+                )
+            passed = total < 50
+            return HealthCheckResult(
+                name="queue_surge",
+                passed=passed,
+                level="high",
+                message=(
+                    f"Queue building up: {total} messages pending "
+                    "(threshold=50). Delivery may be slowing down."
+                ) if not passed else "",
+            )
+        except Exception as e:
+            return HealthCheckResult(
+                name="queue_surge", passed=True, level="high", message=str(e)
+            )
+
+    async def _check_sustained_failure_rate(self) -> HealthCheckResult:
+        """
+        Real-time delivery failure rate check.
+
+        Queries the last 20 message delivery attempts from SQLite and fires
+        a CRITICAL alert if more than 20% failed. This catches delivery
+        degradation mid-day without waiting for the 08:00 daily report.
+
+        Only runs when there has been recent activity (at least 10 attempts
+        in the last 20 rows) to avoid false positives during quiet periods.
+        """
+        SAMPLE_SIZE = 20
+        FAILURE_THRESHOLD = 0.20  # 20%
+        MIN_SAMPLE = 10           # need at least 10 attempts to be meaningful
+        try:
+            import aiosqlite
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute(
+                    """
+                    SELECT status FROM message_destinations
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (SAMPLE_SIZE,),
+                )
+                rows = await cursor.fetchall()
+
+            if len(rows) < MIN_SAMPLE:
+                return HealthCheckResult(
+                    name="delivery_failure_rate",
+                    passed=True,
+                    level="critical",
+                    message="Not enough samples yet",
+                )
+
+            failed = sum(1 for r in rows if r["status"] == "failed")
+            rate = failed / len(rows)
+
+            if rate > FAILURE_THRESHOLD:
+                return HealthCheckResult(
+                    name="delivery_failure_rate",
+                    passed=False,
+                    level="critical",
+                    message=(
+                        f"{failed}/{len(rows)} recent deliveries failed "
+                        f"({rate * 100:.0f}% failure rate, threshold={int(FAILURE_THRESHOLD * 100)}%). "
+                        "Check destination channels and bot permissions."
+                    ),
+                )
+
+            return HealthCheckResult(
+                name="delivery_failure_rate",
+                passed=True,
+                level="critical",
+                message=f"{failed}/{len(rows)} failed ({rate * 100:.0f}%)",
+            )
+        except Exception as e:
+            return HealthCheckResult(
+                name="delivery_failure_rate",
+                passed=True,
+                level="critical",
+                message=f"Check skipped: {e}",
             )
 
     # ── Heartbeat ─────────────────────────────────────────────────────

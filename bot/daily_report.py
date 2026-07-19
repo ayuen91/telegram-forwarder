@@ -201,12 +201,16 @@ def format_report_html(m: DailyReportMetrics) -> str:
     emoji = VERDICT_EMOJI.get(m.verdict, "⚪")
     narrative = build_narrative(m)
 
-    # Component row
-    labels = "  ".join(f"{c.label}" for c in m.components)
-    icons = "  ".join("🟢" if c.passed else "🔴" for c in m.components)
+    # Component status row — paired inline so emoji always aligns with its label.
+    # Rendering two separate rows (labels + icons) breaks in Telegram because emoji
+    # are double-width, causing the dots to drift under the wrong label.
+    component_pairs = "  ".join(
+        f"{'🟢' if c.passed else '🔴'} {c.label}"
+        for c in m.components
+    )
     disk_note = ""
     if m.disk_free_gb is not None:
-        disk_note = f"  {m.disk_free_gb:.1f} GB free"
+        disk_note = f"  │  {m.disk_free_gb:.1f} GB free"
 
     bar_24h = progress_bar(m.success_rate_24h)
     spark = sparkline(m.volume_7d)
@@ -238,8 +242,7 @@ def format_report_html(m: DailyReportMetrics) -> str:
         f"📊 <b>Daily Forward Health</b> — {m.report_date} · 08:00 {m.timezone_label}\n\n"
         f"<blockquote>{narrative}</blockquote>\n"
         f"{emoji} <b>OVERALL HEALTH</b>\n\n"
-        f"<code>{labels}</code>\n"
-        f"{icons}{disk_note}\n\n"
+        f"<code>{component_pairs}{disk_note}</code>\n\n"
         f"<b>QUEUES NOW</b>          <b>24H VOLUME</b>\n"
         f"<code>"
         f"Pending     {m.queues.pending:<5}  Received   {m.received_24h}\n"
