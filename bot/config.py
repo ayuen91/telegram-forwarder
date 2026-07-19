@@ -110,11 +110,11 @@ class Settings:
     max_retries: int = 3
     log_level: str = "INFO"
 
-    # Listener keep-alive & silence watchdog (from .env)
-    # keepalive: how often (seconds) to call get_chat() to keep MTProto warm
-    # silence_timeout: seconds of no messages before a forced re-sync (0 = disabled)
-    listener_keepalive_interval: int = 900   # 15 minutes — conservative, ban-safe
-    listener_silence_timeout: int = 3600     # 1 hour — only fires if no message at all
+    # Listener tuning (from .env)
+    # poller_interval: how often (seconds) the fallback history poller runs
+    # silence_timeout: seconds of no push messages before a full client recycle (0 = disabled)
+    listener_poller_interval: int = 20       # seconds between fallback history polls
+    listener_silence_timeout: int = 1800     # 30 minutes — triggers client.stop()→start() recycle
 
     # Daily health report (from .env)
     daily_report_enabled: bool = True
@@ -193,8 +193,8 @@ class Config:
         s.max_retries = _env_int("MAX_RETRIES", 3)
         s.log_level = os.getenv("LOG_LEVEL", "INFO").upper()
 
-        s.listener_keepalive_interval = _env_int("LISTENER_KEEPALIVE_INTERVAL", 900)
-        s.listener_silence_timeout = _env_int("LISTENER_SILENCE_TIMEOUT", 3600)
+        s.listener_poller_interval = _env_int("LISTENER_POLLER_INTERVAL", 20)
+        s.listener_silence_timeout = _env_int("LISTENER_SILENCE_TIMEOUT", 1800)
 
         s.daily_report_enabled = _env_bool("DAILY_REPORT_ENABLED", True)
         s.daily_report_hour = _env_int("DAILY_REPORT_HOUR", 8)

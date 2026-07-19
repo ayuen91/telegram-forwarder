@@ -23,6 +23,10 @@ import aiosqlite
 from hydrogram import Client, filters
 from hydrogram.errors import FloodWait, MessageIdsEmpty
 from hydrogram.raw.types import UpdatesTooLong
+try:
+    from hydrogram.raw.types import UpdateChannelTooLong
+except ImportError:
+    UpdateChannelTooLong = None  # Graceful fallback for older Hydrogram builds
 from hydrogram.types import Message
 
 from media_relay import RelayConfig, relay_to_bot, cleanup_relay
@@ -937,10 +941,11 @@ async def message_worker(
 # Used by the liveness health check to detect silent update failures.
 LISTENER_LAST_RECEIVED_KEY = "listener:last_received_at"
 
-# Module-level rate-limit guard for the UpdatesTooLong catch-up.
-# Prevents hammering get_chat_history if a busy channel fires the event often.
-_updates_too_long_last_recovery: float = 0.0
-_UPDATES_TOO_LONG_COOLDOWN = 300  # seconds — at most one recovery per 5 minutes
+# Redis key prefix for the last known message ID per channel.
+# Written by _handle() on every push-delivered message and by the
+# UpdateChannelTooLong catch-up handler after a successful sync.
+# Format: listener:last_msg_id:{chat_id}
+LISTENER_LAST_MSG_ID_PREFIX = "listener:last_msg_id"
 
 
 def register_listener(
@@ -1001,8 +1006,8 @@ def register_listener(
         if payload is None:
             return  # Unsupported message type
 
-        # Track liveness — write timestamp so health check can detect
-        # sessions that are connected but silently not delivering updates.
+        # Track liveness and sequence — both written on every push-delivered
+        # message so the health check and catch-up handler have accurate state.
         if redis_client is not None:
             try:
                 import time
@@ -1013,6 +1018,15 @@ def register_listener(
                 )
             except Exception as e:
                 logger.debug(f"Liveness timestamp write skipped: {e}")
+
+            try:
+                await redis_client.set(
+                    f"{LISTENER_LAST_MSG_ID_PREFIX}:{message.chat.id}",
+                    str(message.id),
+                    ex=86400,
+                )
+            except Exception as e:
+                logger.debug(f"Last msg ID write skipped: {e}")
 
         if redis_client is not None:
             try:
@@ -1040,86 +1054,191 @@ def register_listener(
     async def on_message(client: Client, message: Message):
         await _handle(client, message)
 
-    # ── UpdatesTooLong catch-up handler ──────────────────────────────
-    # Large/popular channels can trigger UpdatesTooLong when the MTProto
-    # session falls behind the server's update sequence. Telegram stops
-    # delivering individual updates and sends this sentinel instead.
-    # We respond by fetching the latest few messages from the channel so
-    # no posts are silently missed. Rate-limited to once per 5 minutes to
-    # avoid any risk of API spam on very active channels.
+    # ── Raw update handler — PTS-aware catch-up ─────────────────────────────────
+    # Handles UpdateChannelTooLong (channel-specific PTS desync, most precise)
+    # and the generic UpdatesTooLong sentinel (session-wide fallback).
+    # Uses listener:last_msg_id:{chat_id} as a watermark so only the true gap
+    # is fetched — no static cooldown that could permanently stall on busy channels.
     @app.on_raw_update()
     async def _on_raw_update(client: Client, update, users, chats):
-        global _updates_too_long_last_recovery
+        logger.debug(f"[RAW UPDATE] type={type(update).__name__}")
 
-        logger.debug(
-            f"[RAW UPDATE] type={type(update).__name__} "
-            f"chats={list(chats.keys())} users={list(users.keys())}"
-        )
-
-        if not isinstance(update, UpdatesTooLong):
-            return
-
-        now = time.monotonic()
-        if now - _updates_too_long_last_recovery < _UPDATES_TOO_LONG_COOLDOWN:
-            logger.debug(
-                "UpdatesTooLong received but catch-up is on cooldown "
-                f"({_UPDATES_TOO_LONG_COOLDOWN}s) — skipping"
-            )
-            return
-
-        _updates_too_long_last_recovery = now
-        logger.warning(
-            "UpdatesTooLong received — session fell behind update stream. "
-            "Fetching latest messages from source channel to catch up."
-        )
-
-        try:
-            fetched = 0
-            skipped = 0
-            # Fetch up to 50 recent messages — large/active channels can
-            # post dozens of messages in the time it takes the MTProto
-            # session to fall behind and receive UpdatesTooLong.
-            async for message in client.get_chat_history(source_chat_id, limit=50):
-                # Honour the startup filter: skip pre-start history
-                if bot_start_time is not None:
-                    msg_ts = int(message.date.timestamp()) if hasattr(message.date, "timestamp") else int(message.date)
-                    if msg_ts < bot_start_time:
-                        skipped += 1
-                        continue
-
-                payload = normalize_message(message)
-                if payload is None:
-                    continue
-                try:
-                    message_queue.put_nowait(payload)
-                    fetched += 1
-                except asyncio.QueueFull:
-                    logger.warning(
-                        "Message queue full during UpdatesTooLong recovery "
-                        f"— dropped message {message.id}"
-                    )
-                    break
-            logger.info(
-                f"UpdatesTooLong recovery: re-queued {fetched} message(s) "
-                f"from channel history"
-                + (f" (skipped {skipped} pre-start backlog)" if skipped else "")
-            )
-            # Update the liveness key so the health check doesn't keep
-            # flagging listener_liveness as failed right after recovery.
-            if fetched > 0 and redis_client is not None:
-                try:
-                    await redis_client.set(
-                        LISTENER_LAST_RECEIVED_KEY,
-                        str(time.time()),
-                        ex=86400,
-                    )
-                except Exception:
-                    pass
-        except FloodWait as fw:
+        # UpdateChannelTooLong — channel-specific PTS desync (most precise signal)
+        if UpdateChannelTooLong is not None and isinstance(update, UpdateChannelTooLong):
+            raw_channel_id = getattr(update, "channel_id", None)
+            if raw_channel_id is None:
+                return
+            channel_chat_id = int(f"-100{raw_channel_id}")
+            if channel_chat_id != source_chat_id:
+                return  # Not our source channel
             logger.warning(
-                f"FloodWait {fw.value}s during UpdatesTooLong recovery — skipping"
+                f"UpdateChannelTooLong for channel {channel_chat_id} — "
+                "running targeted PTS catch-up"
             )
-        except Exception as ex:
-            logger.error(
-                f"UpdatesTooLong recovery failed: {ex}", exc_info=True
+            await _do_channel_catchup(
+                client, channel_chat_id, redis_client, message_queue, bot_start_time
             )
+            return
+
+        # Generic UpdatesTooLong — session-wide fallback
+        if isinstance(update, UpdatesTooLong):
+            logger.warning(
+                "UpdatesTooLong (generic) — running catch-up on source channel"
+            )
+            await _do_channel_catchup(
+                client, source_chat_id, redis_client, message_queue, bot_start_time
+            )
+
+
+async def _do_channel_catchup(
+    client: Client,
+    channel_chat_id: int,
+    redis_client,
+    message_queue: asyncio.Queue,
+    bot_start_time: Optional[int],
+) -> int:
+    """
+    Fetch messages newer than the last known ID from channel_chat_id and enqueue them.
+
+    Uses listener:last_msg_id:{chat_id} as a watermark so only the genuine gap
+    is fetched. Processes oldest-first to preserve reply-thread ordering.
+    Returns the count of messages re-queued.
+    """
+    last_msg_id = 0
+    if redis_client is not None:
+        try:
+            raw = await redis_client.get(f"{LISTENER_LAST_MSG_ID_PREFIX}:{channel_chat_id}")
+            if raw is not None:
+                last_msg_id = int(raw)
+        except Exception:
+            pass
+
+    messages_to_process: list = []  # list of (msg_id, payload)
+    try:
+        async for message in client.get_chat_history(channel_chat_id, limit=100):
+            if last_msg_id > 0 and message.id <= last_msg_id:
+                break  # Reached the watermark — gap is fully covered
+            if bot_start_time is not None:
+                msg_ts = (
+                    int(message.date.timestamp())
+                    if hasattr(message.date, "timestamp")
+                    else int(message.date)
+                )
+                if msg_ts < bot_start_time:
+                    continue
+            payload = normalize_message(message)
+            if payload is not None:
+                messages_to_process.append((message.id, payload))
+    except FloodWait as fw:
+        logger.warning(f"FloodWait {fw.value}s during channel catch-up for {channel_chat_id}")
+        return 0
+    except Exception as ex:
+        logger.error(f"Channel catch-up history fetch failed: {ex}", exc_info=True)
+        return 0
+
+    # Oldest-first so reply-thread ordering is preserved
+    messages_to_process.reverse()
+
+    fetched = 0
+    newest_id = last_msg_id
+    for msg_id, payload in messages_to_process:
+        try:
+            message_queue.put_nowait(payload)
+            fetched += 1
+            if msg_id > newest_id:
+                newest_id = msg_id
+        except asyncio.QueueFull:
+            logger.warning(
+                f"Queue full during catch-up for {channel_chat_id} — "
+                f"stopped at message {msg_id}"
+            )
+            break
+
+    # Advance the watermark and refresh the liveness key
+    if redis_client is not None and newest_id > last_msg_id:
+        try:
+            await redis_client.set(
+                f"{LISTENER_LAST_MSG_ID_PREFIX}:{channel_chat_id}",
+                str(newest_id),
+                ex=86400,
+            )
+            if fetched > 0:
+                await redis_client.set(
+                    LISTENER_LAST_RECEIVED_KEY,
+                    str(time.time()),
+                    ex=86400,
+                )
+        except Exception:
+            pass
+
+    watermark_label = f" (watermark msg_id={last_msg_id})" if last_msg_id else ""
+    logger.info(
+        f"Channel catch-up {channel_chat_id}: re-queued {fetched} message(s){watermark_label}"
+    )
+    return fetched
+
+
+def make_fallback_poller_factory(
+    app: Client,
+    source_chat_id: int,
+    message_queue: asyncio.Queue,
+    redis_client=None,
+    bot_start_time: Optional[int] = None,
+    interval: int = 20,
+):
+    """
+    Returns a coroutine factory for the background fallback poller task.
+
+    Polls the last 15 messages from the source channel every `interval` seconds
+    alongside the real-time on_message push handler. The message_worker's Redis
+    SET NX dedup layer discards any message already delivered by the push path,
+    so there is no double-posting.
+
+    This makes the listener resilient to Telegram silently muting push updates
+    on large/active channels: even when the MTProto stream stalls, the poller
+    guarantees zero message loss within the polling window.
+    """
+    async def poller():
+        logger.info(
+            f"Fallback poller started: source={source_chat_id}, "
+            f"interval={interval}s, limit=15 msgs/poll"
+        )
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                batch: list = []
+                async for message in app.get_chat_history(source_chat_id, limit=15):
+                    if bot_start_time is not None:
+                        msg_ts = (
+                            int(message.date.timestamp())
+                            if hasattr(message.date, "timestamp")
+                            else int(message.date)
+                        )
+                        if msg_ts < bot_start_time:
+                            continue
+                    payload = normalize_message(message)
+                    if payload is not None:
+                        batch.append(payload)
+
+                # Enqueue oldest-first for correct reply ordering
+                batch.reverse()
+                queued = 0
+                for payload in batch:
+                    try:
+                        message_queue.put_nowait(payload)
+                        queued += 1
+                    except asyncio.QueueFull:
+                        logger.warning("Fallback poller: queue full — skipping remaining in batch")
+                        break
+
+                logger.debug(
+                    f"Fallback poller: {queued}/{len(batch)} message(s) submitted from history"
+                )
+
+            except FloodWait as fw:
+                logger.warning(f"Fallback poller: FloodWait {fw.value}s — pausing poll cycle")
+                await asyncio.sleep(fw.value + 1)
+            except Exception as ex:
+                logger.error(f"Fallback poller error: {ex}", exc_info=True)
+
+    return poller

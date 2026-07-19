@@ -237,7 +237,9 @@ class HealthMonitor:
                 message="Outside activity hours — liveness check skipped",
             )
 
-        SILENCE_THRESHOLD = 5400  # 90 minutes — gives the silence watchdog (1 h) time to recover first
+        SILENCE_THRESHOLD = 5400  # 90 min — the silence watchdog recycles at 30 min, so
+        # this only fires if the full client recycle itself failed to restore updates.
+
         try:
             from listener import LISTENER_LAST_RECEIVED_KEY
             raw = await self.redis.get(LISTENER_LAST_RECEIVED_KEY)

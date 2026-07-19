@@ -46,7 +46,7 @@ from hydrogram.errors import (
 
 from config import config
 from logging_config import setup_logging
-from listener import register_listener, message_worker, process_payload, retry_payload
+from listener import register_listener, message_worker, process_payload, retry_payload, make_fallback_poller_factory
 from album_buffer import AlbumBuffer
 from queue_manager import QueueManager
 from deduplication import Deduplication
@@ -306,35 +306,6 @@ def make_health_factory(monitor: HealthMonitor, interval: int):
     return health
 
 
-def make_channel_keepalive_factory(
-    app: Client,
-    source_chat_id: int,
-    interval: int,
-):
-    """
-    Periodically calls get_chat() on the source channel to keep the MTProto
-    session 'warm'. For large/popular channels Telegram can deprioritise update
-    delivery to sessions it considers inactive; a lightweight read every N
-    minutes is enough to prevent that without risking any rate-limit flags.
-
-    Equivalent to the Telegram app's background channel refresh — one read
-    RPC call, no write, no join, no history fetch.
-    """
-    async def keepalive():
-        while not shutdown_event.is_set():
-            await asyncio.sleep(interval)
-            if shutdown_event.is_set():
-                break
-            try:
-                chat = await app.get_chat(source_chat_id)
-                logger.debug(
-                    f"Keepalive ping: source channel '{chat.title}' is reachable"
-                )
-            except Exception as e:
-                logger.warning(f"Keepalive get_chat failed: {e}")
-    return keepalive
-
-
 def make_silence_watchdog_factory(
     app: Client,
     source_chat_id: int,
@@ -343,26 +314,26 @@ def make_silence_watchdog_factory(
 ):
     """
     Watches the Redis liveness key written by the on_message handler.
-    If no message has arrived from the source channel for `silence_timeout`
-    seconds (and the channel has previously been active), the watchdog assumes
-    the MTProto update stream has silently stalled and performs a lightweight
-    recovery:
-      1. Re-resolve the peer (refreshes the session's access-hash cache).
-      2. Re-join the channel (re-subscribes to UpdateNewChannelMessage).
+    If no push-delivered message has arrived for `silence_timeout` seconds,
+    the watchdog performs a FULL client recycle (stop → start) to close the
+    stale TCP socket and force a complete MTProto state-sync handshake.
 
-    Checks every 5 minutes. Does NOT call get_chat_history — that is handled
-    by the UpdatesTooLong raw-update handler in listener.py.
-    Uses exponential back-off between consecutive reconnect attempts so it
-    can never produce a burst of API calls.
+    This is the correct recovery for large/active channels where:
+      - resolve_peer() does not restart the underlying socket.
+      - join_chat() causes severe FloodWait on high-member channels.
+      - Only a full reconnect clears the PTS desync with Telegram's servers.
+
+    The fallback poller and catch-up handler cover any gap during the ~5s
+    restart window. Exponential back-off prevents rapid recycle loops.
     """
     from listener import LISTENER_LAST_RECEIVED_KEY
-    CHECK_INTERVAL = 300  # check every 5 minutes
-    _last_reconnect: float = 0.0
-    _reconnect_backoff: float = 60.0   # start at 1 min, doubles each time
-    _MAX_BACKOFF: float = 3600.0       # cap at 1 hour
+    CHECK_INTERVAL = 300        # check every 5 minutes
+    _last_recycle: float = 0.0
+    _recycle_backoff: float = 300.0   # start at 5 min, doubles each time
+    _MAX_BACKOFF: float = 3600.0      # cap at 1 hour
 
     async def watchdog():
-        nonlocal _last_reconnect, _reconnect_backoff
+        nonlocal _last_recycle, _recycle_backoff
 
         if silence_timeout <= 0:
             logger.info("Silence watchdog disabled (LISTENER_SILENCE_TIMEOUT=0)")
@@ -376,8 +347,8 @@ def make_silence_watchdog_factory(
             try:
                 last_ts_raw = await redis_client.get(LISTENER_LAST_RECEIVED_KEY)
                 if last_ts_raw is None:
-                    # Key not set yet — channel may not have posted anything;
-                    # don't trigger a false reconnect on a fresh session.
+                    # Key not set yet — channel hasn’t posted anything or
+                    # the fallback poller hasn’t run yet on a fresh session.
                     continue
 
                 import time
@@ -385,41 +356,42 @@ def make_silence_watchdog_factory(
                 elapsed = time.time() - last_ts
 
                 if elapsed < silence_timeout:
-                    # Messages flowing normally — reset back-off
-                    _reconnect_backoff = 60.0
+                    # Push updates flowing normally — reset back-off
+                    _recycle_backoff = 300.0
                     continue
 
-                # Silence detected — respect back-off between reconnects
+                # Silence detected — respect back-off between recycles
                 now = time.monotonic()
-                if now - _last_reconnect < _reconnect_backoff:
+                if now - _last_recycle < _recycle_backoff:
                     continue
 
                 logger.warning(
-                    f"Silence watchdog: no message received for {elapsed:.0f}s "
-                    f"(threshold={silence_timeout}s). Attempting recovery."
+                    f"Silence watchdog: no push message for {elapsed:.0f}s "
+                    f"(threshold={silence_timeout}s). Recycling MTProto client..."
                 )
-                _last_reconnect = now
+                _last_recycle = now
 
                 try:
-                    # Step 1 — re-resolve peer to refresh access-hash cache
-                    await app.resolve_peer(source_chat_id)
-                    logger.info("Silence watchdog: peer re-resolved")
-                except Exception as rp_err:
-                    logger.warning(f"Silence watchdog: resolve_peer failed: {rp_err}")
+                    await app.stop()
+                    logger.info("Silence watchdog: client stopped")
+                    await asyncio.sleep(5)  # allow socket to fully close
+                    await app.start()
+                    logger.info("Silence watchdog: client restarted — session recycled")
+                    # Refresh the access-hash cache after reconnect
+                    try:
+                        await app.resolve_peer(source_chat_id)
+                        logger.info("Silence watchdog: peer re-resolved after recycle")
+                    except Exception as rp_err:
+                        logger.warning(f"Silence watchdog: resolve_peer failed: {rp_err}")
+                except Exception as recycle_err:
+                    logger.error(
+                        f"Silence watchdog: client recycle failed: {recycle_err}",
+                        exc_info=True,
+                    )
 
-                try:
-                    # Step 2 — re-join to resubscribe to update delivery
-                    await app.join_chat(source_chat_id)
-                    logger.info("Silence watchdog: channel re-joined")
-                except Exception as join_err:
-                    # Likely already a member — that's fine
-                    logger.debug(f"Silence watchdog: join_chat: {join_err}")
-
-                # Back off exponentially so repeated failures don't loop fast
-                _reconnect_backoff = min(_reconnect_backoff * 2, _MAX_BACKOFF)
+                _recycle_backoff = min(_recycle_backoff * 2, _MAX_BACKOFF)
                 logger.info(
-                    f"Silence watchdog: recovery done. "
-                    f"Next attempt no sooner than {_reconnect_backoff:.0f}s."
+                    f"Silence watchdog: next recycle no sooner than {_recycle_backoff:.0f}s"
                 )
 
             except Exception as e:
@@ -635,25 +607,31 @@ async def main():
             f"{settings.daily_report_timezone}"
         )
 
-    # ── Channel keep-alive ────────────────────────────────────────────
-    # Calls get_chat() every LISTENER_KEEPALIVE_INTERVAL seconds to keep
-    # the MTProto session warm. Prevents Telegram from deprioritising update
-    # delivery to "inactive" sessions on large/popular channels.
+    # ── Fallback poller ────────────────────────────────────────────────
+    # Fetches the last 15 messages every LISTENER_POLLER_INTERVAL seconds.
+    # The Redis SET NX dedup in message_worker discards any message already
+    # delivered by the real-time push handler — zero double-posting risk.
+    # This closes any gap caused by Telegram silently muting push updates
+    # on large/active channels.
     tasks.append(asyncio.create_task(
         supervised_task(
-            "channel-keepalive",
-            make_channel_keepalive_factory(
+            "fallback-poller",
+            make_fallback_poller_factory(
                 app=app,
                 source_chat_id=settings.source_chat_id,
-                interval=settings.listener_keepalive_interval,
+                message_queue=message_queue,
+                redis_client=redis_client,
+                bot_start_time=bot_start_time,
+                interval=settings.listener_poller_interval,
             ),
         ),
-        name="channel-keepalive",
+        name="fallback-poller",
     ))
 
-    # ── Silence watchdog ──────────────────────────────────────────────
-    # Triggers a peer re-resolve + re-join when no message has arrived
-    # for LISTENER_SILENCE_TIMEOUT seconds. Disabled when timeout is 0.
+    # ── Silence watchdog ────────────────────────────────────────────────
+    # Performs a full client.stop()→start() recycle when no push message has
+    # arrived for LISTENER_SILENCE_TIMEOUT seconds (default 1800s / 30 min).
+    # Disabled when silence_timeout=0.
     tasks.append(asyncio.create_task(
         supervised_task(
             "silence-watchdog",
@@ -670,8 +648,8 @@ async def main():
     logger.info(
         f"Workers running: {settings.worker_count} processors, album-flush, retry, health"
         + (", daily-report" if settings.daily_report_enabled else "")
-        + f", channel-keepalive ({settings.listener_keepalive_interval}s)"
-        + (f", silence-watchdog ({settings.listener_silence_timeout}s)" if settings.listener_silence_timeout > 0 else "")
+        + f", fallback-poller ({settings.listener_poller_interval}s)"
+        + (f", silence-watchdog ({settings.listener_silence_timeout}s recycle)" if settings.listener_silence_timeout > 0 else "")
     )
 
 
