@@ -15,11 +15,14 @@ import asyncio
 import json
 import logging
 import random
+import time
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, Literal
 
 import aiosqlite
 from hydrogram import Client, filters
+from hydrogram.errors import FloodWait
+from hydrogram.raw.types import UpdatesTooLong
 from hydrogram.types import Message
 
 from media_relay import RelayConfig, relay_to_bot, cleanup_relay
@@ -886,6 +889,11 @@ async def message_worker(
 # Used by the liveness health check to detect silent update failures.
 LISTENER_LAST_RECEIVED_KEY = "listener:last_received_at"
 
+# Module-level rate-limit guard for the UpdatesTooLong catch-up.
+# Prevents hammering get_chat_history if a busy channel fires the event often.
+_updates_too_long_last_recovery: float = 0.0
+_UPDATES_TOO_LONG_COOLDOWN = 300  # seconds — at most one recovery per 5 minutes
+
 
 def register_listener(
     app: Client,
@@ -962,15 +970,63 @@ def register_listener(
     async def on_message(client: Client, message: Message):
         await _handle(client, message)
 
-    # ── Diagnostic catch-all raw update handler ───────────────────────
-    # Logs every MTProto update type at DEBUG level so you can verify that
-    # Telegram is actually delivering updates to this session — independently
-    # of whether they pass the filters.chat() filter above.
-    # Enable with LOG_LEVEL=DEBUG. Produces no output in INFO mode.
+    # ── UpdatesTooLong catch-up handler ──────────────────────────────
+    # Large/popular channels can trigger UpdatesTooLong when the MTProto
+    # session falls behind the server's update sequence. Telegram stops
+    # delivering individual updates and sends this sentinel instead.
+    # We respond by fetching the latest few messages from the channel so
+    # no posts are silently missed. Rate-limited to once per 5 minutes to
+    # avoid any risk of API spam on very active channels.
     @app.on_raw_update()
-    async def _on_raw_update(client, update, users, chats):
+    async def _on_raw_update(client: Client, update, users, chats):
+        global _updates_too_long_last_recovery
+
         logger.debug(
             f"[RAW UPDATE] type={type(update).__name__} "
             f"chats={list(chats.keys())} users={list(users.keys())}"
         )
 
+        if not isinstance(update, UpdatesTooLong):
+            return
+
+        now = time.monotonic()
+        if now - _updates_too_long_last_recovery < _UPDATES_TOO_LONG_COOLDOWN:
+            logger.debug(
+                "UpdatesTooLong received but catch-up is on cooldown "
+                f"({_UPDATES_TOO_LONG_COOLDOWN}s) — skipping"
+            )
+            return
+
+        _updates_too_long_last_recovery = now
+        logger.warning(
+            "UpdatesTooLong received — session fell behind update stream. "
+            "Fetching latest messages from source channel to catch up."
+        )
+
+        try:
+            fetched = 0
+            async for message in client.get_chat_history(source_chat_id, limit=10):
+                payload = normalize_message(message)
+                if payload is None:
+                    continue
+                try:
+                    message_queue.put_nowait(payload)
+                    fetched += 1
+                except asyncio.QueueFull:
+                    logger.warning(
+                        "Message queue full during UpdatesTooLong recovery "
+                        f"— dropped message {message.id}"
+                    )
+                    break
+            logger.info(
+                f"UpdatesTooLong recovery: re-queued {fetched} message(s) "
+                "from channel history"
+            )
+        except FloodWait as fw:
+            logger.warning(
+                f"FloodWait {fw.value}s during UpdatesTooLong recovery — skipping"
+            )
+        except Exception as ex:
+            logger.error(
+                f"UpdatesTooLong recovery failed: {ex}", exc_info=True
+            )

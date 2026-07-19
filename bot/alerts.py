@@ -51,30 +51,87 @@ async def send_photo(
     photo_url: str,
     caption: Optional[str] = None,
 ) -> None:
-    """Send a photo (e.g. QuickChart URL) via the alert bot. No cooldown."""
+    """Send a photo (e.g. QuickChart URL) via the alert bot. No cooldown.
+
+    Telegram's sendPhoto rejects URLs that are too long or that its servers
+    cannot fetch (e.g. QuickChart URLs with a large embedded JSON config).
+    To avoid the 400 "failed to get HTTP URL content" error we download the
+    image ourselves and upload the raw bytes as multipart/form-data instead.
+    Falls back to the plain URL method if the download step fails.
+    """
     if not token or not chat_id or not photo_url:
         return
 
-    url = f"https://api.telegram.org/bot{token}/sendPhoto"
-    payload = {"chat_id": chat_id, "photo": photo_url}
-    if caption:
-        # Captions support HTML; keep under Telegram's 1024-char limit
-        payload["caption"] = caption[:1024]
-        payload["parse_mode"] = "HTML"
+    api_url = f"https://api.telegram.org/bot{token}/sendPhoto"
 
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                url, json=payload, timeout=aiohttp.ClientTimeout(total=30)
-            ) as resp:
-                if resp.status == 200:
-                    logger.info("Alert photo sent")
+    async with aiohttp.ClientSession() as session:
+        # ── Step 1: download the image ────────────────────────────────
+        image_bytes: Optional[bytes] = None
+        try:
+            async with session.get(
+                photo_url, timeout=aiohttp.ClientTimeout(total=20)
+            ) as dl:
+                if dl.status == 200:
+                    image_bytes = await dl.read()
                 else:
-                    body = await resp.text()
-                    logger.error(f"Alert sendPhoto error {resp.status}: {body[:200]}")
-                    raise RuntimeError(f"sendPhoto failed: {resp.status}")
-    except RuntimeError:
-        raise
-    except Exception as e:
-        logger.error(f"Failed to send alert photo: {e}")
-        raise
+                    logger.warning(
+                        f"Chart download returned {dl.status} — "
+                        "falling back to URL upload"
+                    )
+        except Exception as dl_err:
+            logger.warning(
+                f"Chart download failed ({dl_err}) — falling back to URL upload"
+            )
+
+        # ── Step 2: upload (binary preferred, URL fallback) ───────────
+        try:
+            if image_bytes:
+                # Binary multipart upload — always accepted by Telegram
+                form = aiohttp.FormData()
+                form.add_field("chat_id", str(chat_id))
+                form.add_field(
+                    "photo",
+                    image_bytes,
+                    filename="chart.png",
+                    content_type="image/png",
+                )
+                if caption:
+                    form.add_field("caption", caption[:1024])
+                    form.add_field("parse_mode", "HTML")
+
+                async with session.post(
+                    api_url, data=form, timeout=aiohttp.ClientTimeout(total=30)
+                ) as resp:
+                    if resp.status == 200:
+                        logger.info("Alert photo sent (binary upload)")
+                    else:
+                        body = await resp.text()
+                        logger.error(
+                            f"Alert sendPhoto error {resp.status}: {body[:200]}"
+                        )
+                        raise RuntimeError(f"sendPhoto failed: {resp.status}")
+            else:
+                # URL fallback — may fail for very long QuickChart URLs
+                payload: dict = {"chat_id": chat_id, "photo": photo_url}
+                if caption:
+                    payload["caption"] = caption[:1024]
+                    payload["parse_mode"] = "HTML"
+
+                async with session.post(
+                    api_url,
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as resp:
+                    if resp.status == 200:
+                        logger.info("Alert photo sent (URL upload)")
+                    else:
+                        body = await resp.text()
+                        logger.error(
+                            f"Alert sendPhoto error {resp.status}: {body[:200]}"
+                        )
+                        raise RuntimeError(f"sendPhoto failed: {resp.status}")
+        except RuntimeError:
+            raise
+        except Exception as e:
+            logger.error(f"Failed to send alert photo: {e}")
+            raise
