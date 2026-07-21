@@ -45,8 +45,16 @@ from hydrogram.errors import (
 )
 
 from config import config
-from logging_config import setup_logging
-from listener import register_listener, message_worker, process_payload, retry_payload, overflow_drainer
+from listener import (
+    register_listener,
+    message_worker,
+    process_payload,
+    retry_payload,
+    overflow_drainer,
+    _do_channel_catchup,
+    LISTENER_LAST_RECEIVED_KEY,
+    LISTENER_LAST_PTS_KEY,
+)
 from album_buffer import AlbumBuffer
 from queue_manager import QueueManager
 from deduplication import Deduplication
@@ -304,6 +312,41 @@ def make_health_factory(monitor: HealthMonitor, interval: int):
                 logger.error(f"Health check error: {e}", exc_info=True)
             await asyncio.sleep(interval)
     return health
+
+
+def make_channel_sync_factory(
+    app: Client,
+    source_chat_id: int,
+    redis_client,
+    message_queue: asyncio.Queue,
+    bot_start_time: int,
+    interval: int = 30,
+):
+    """
+    Lightweight watermark-based channel sync task.
+
+    Runs every `interval` seconds (default 30s) to perform a watermark catchup
+    via `_do_channel_catchup()`. Because `_do_channel_catchup()` stops on the
+    very first message matching `message.id <= last_msg_id`, this uses only 1
+    tiny RPC call when no new messages exist.
+
+    This ensures 100% reliable message delivery on large Telegram channels
+    where Telegram MTProto servers do not push real-time UpdateNewChannelMessage
+    events to userbots.
+    """
+    async def channel_sync():
+        while not shutdown_event.is_set():
+            await asyncio.sleep(interval)
+            if shutdown_event.is_set():
+                break
+            try:
+                await _do_channel_catchup(
+                    app, source_chat_id, redis_client, message_queue, bot_start_time
+                )
+            except Exception as e:
+                logger.error(f"Channel sync error: {e}", exc_info=True)
+    return channel_sync
+
 
 
 def make_silence_watchdog_factory(
@@ -643,16 +686,16 @@ async def main():
         "will be silently dropped (no relay, no DB write, no flood risk)"
     )
 
-    # Snapshot initial PTS so the silence watchdog has a valid baseline
-    # from the very first cycle (otherwise local_pts=0 → always looks like a stall).
+    # Snapshot initial PTS and initialize liveness timestamp so the health check clock
+    # starts fresh from startup (preventing false liveness alerts from stale pre-restart timestamps).
     try:
         import hydrogram.raw.functions.updates as _upd
-        from listener import LISTENER_LAST_PTS_KEY
         _init_state = await app.invoke(_upd.GetState())
         await redis_client.set(LISTENER_LAST_PTS_KEY, str(_init_state.pts), ex=86400)
-        logger.info(f"Initial PTS snapshot: {_init_state.pts}")
+        await redis_client.set(LISTENER_LAST_RECEIVED_KEY, str(time.time()), ex=86400)
+        logger.info(f"Initial PTS snapshot: {_init_state.pts}, liveness timestamp initialized")
     except Exception as pts_init_err:
-        logger.warning(f"Initial PTS snapshot failed: {pts_init_err}")
+        logger.warning(f"Initial PTS/liveness snapshot failed: {pts_init_err}")
 
     try:
         bot_me = await sender.get_me()
@@ -705,6 +748,16 @@ async def main():
         redis_client=redis_client,
         bot_start_time=bot_start_time,
     )
+
+    # Initial channel catch-up to process any messages sent during startup
+    try:
+        init_caught = await _do_channel_catchup(
+            app, settings.source_chat_id, redis_client, message_queue, bot_start_time
+        )
+        logger.info(f"Startup channel sync complete: caught {init_caught} message(s)")
+    except Exception as e:
+        logger.warning(f"Startup channel sync failed: {e}")
+
     stale_albums = await album_buf.flush_stale_albums()
 
     for err in await sender.verify_destinations(
@@ -776,6 +829,21 @@ async def main():
     tasks.append(asyncio.create_task(
         supervised_task("overflow-drainer", _overflow_drainer_factory),
         name="overflow-drainer",
+    ))
+
+    tasks.append(asyncio.create_task(
+        supervised_task(
+            "channel-sync",
+            make_channel_sync_factory(
+                app=app,
+                source_chat_id=settings.source_chat_id,
+                redis_client=redis_client,
+                message_queue=message_queue,
+                bot_start_time=bot_start_time,
+                interval=30,
+            ),
+        ),
+        name="channel-sync",
     ))
 
     if settings.daily_report_enabled:

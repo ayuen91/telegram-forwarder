@@ -1017,10 +1017,12 @@ def register_listener(
         # the moment the bot started.
         if bot_start_time is not None:
             msg_ts = int(message.date.timestamp()) if hasattr(message.date, "timestamp") else int(message.date)
-            if msg_ts < bot_start_time:
+            # Allow a 300-second (5-minute) grace window for machine clock skew
+            # or startup latency so legitimate real-time messages are not discarded.
+            if msg_ts < (bot_start_time - 300):
                 logger.info(
                     f"Dropping backlog message {message.id} "
-                    f"(date={msg_ts} < start={bot_start_time}) — pre-startup, skipped"
+                    f"(date={msg_ts} < cutoff={bot_start_time - 300}) — pre-startup backlog, skipped"
                 )
                 return
 
@@ -1170,7 +1172,7 @@ async def _do_channel_catchup(
                     if hasattr(message.date, "timestamp")
                     else int(message.date)
                 )
-                if msg_ts < bot_start_time:
+                if msg_ts < (bot_start_time - 300):
                     continue
             payload = normalize_message(message)
             if payload is not None:
