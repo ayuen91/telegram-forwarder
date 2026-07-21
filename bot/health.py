@@ -213,18 +213,13 @@ class HealthMonitor:
 
     async def _check_listener_liveness(self) -> HealthCheckResult:
         """
-        PTS-aware liveness check — distinguishes three states:
+        Check that the listener is receiving message updates.
 
-          FLOWING       — updates received recently, all good.
-          ORGANIC_QUIET — no recent messages but server PTS matches local
-                          snapshot → the channel is simply silent.
-          POSSIBLE_STALL — no recent messages AND server PTS > local snapshot
-                           → Telegram sent updates we never received. The
-                           silence watchdog should be addressing this; if the
-                           alert persists the session may need re-authentication.
+        Reads listener:last_received_at to determine silence duration.
+        The silence watchdog in main.py handles the actual PTS audit and
+        client recycling — this check just reports the current state.
 
-        Only fires during activity hours (08:00–23:59 UTC+3) to avoid
-        false positives during quiet overnight periods.
+        Only fires during activity hours (08:00–23:59 UTC+3).
         """
         import datetime
         now_utc3 = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=3)
@@ -241,7 +236,7 @@ class HealthMonitor:
         SILENCE_THRESHOLD = 5400
 
         try:
-            from listener import LISTENER_LAST_RECEIVED_KEY, LISTENER_LAST_PTS_KEY
+            from listener import LISTENER_LAST_RECEIVED_KEY
 
             raw = await self.redis.get(LISTENER_LAST_RECEIVED_KEY)
             if raw is None:
@@ -256,59 +251,25 @@ class HealthMonitor:
             silence_secs = time.time() - last_ts
             silence_min = silence_secs / 60
 
-            # ── FLOWING: updates received within threshold ─────────────────
             if silence_secs <= SILENCE_THRESHOLD:
                 return HealthCheckResult(
                     name="listener_liveness",
                     passed=True,
                     level="high",
-                    message=f"FLOWING — last message received {silence_min:.1f} min ago",
+                    message=f"Last message received {silence_min:.1f} min ago",
                 )
 
-            # ── Threshold exceeded — run PTS audit ─────────────────────────
-            server_pts: int = 0
-            local_pts: int = 0
-            pts_status = "PTS audit unavailable"
-
-            try:
-                import hydrogram.raw.functions.updates as _upd
-                if self.pyrogram_app and self.pyrogram_app.is_connected:
-                    state = await self.pyrogram_app.invoke(_upd.GetState())
-                    server_pts = state.pts
-                    local_pts_raw = await self.redis.get(LISTENER_LAST_PTS_KEY)
-                    local_pts = int(local_pts_raw) if local_pts_raw else 0
-                    pts_delta = server_pts - local_pts
-                    if pts_delta <= 0:
-                        pts_status = (
-                            f"ORGANIC_QUIET — server_pts={server_pts} == "
-                            f"local_pts={local_pts} (channel is silent, not stalled)"
-                        )
-                    else:
-                        pts_status = (
-                            f"POSSIBLE_STALL — server_pts={server_pts}, "
-                            f"local_pts={local_pts}, delta=+{pts_delta} "
-                            f"(Telegram sent {pts_delta} pts worth of updates we never received)"
-                        )
-                else:
-                    pts_status = "PTS audit skipped — client not connected"
-            except Exception as pts_err:
-                pts_status = f"PTS audit failed: {pts_err}"
-
-            is_stall = "STALL" in pts_status or "unavailable" in pts_status
+            # Threshold exceeded — report as a problem.
+            # The silence watchdog handles the actual PTS audit and recycle.
             return HealthCheckResult(
                 name="listener_liveness",
-                passed=not is_stall,
+                passed=False,
                 level="high",
                 message=(
                     f"No messages for {silence_min:.0f} min "
                     f"(threshold={SILENCE_THRESHOLD // 60} min). "
-                    f"PTS audit: {pts_status}. "
-                    + (
-                        "Silence watchdog is attempting recovery automatically. "
-                        "If this persists >3 h, re-authenticate the session."
-                        if is_stall else
-                        "Channel is organically quiet — no action needed."
-                    )
+                    "The silence watchdog is handling recovery. "
+                    "If this persists >3 h, re-authenticate the session."
                 ),
             )
         except Exception as e:
