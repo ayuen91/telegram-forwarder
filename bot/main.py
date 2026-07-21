@@ -45,6 +45,7 @@ from hydrogram.errors import (
 )
 
 from config import config
+from logging_config import setup_logging
 from listener import (
     register_listener,
     message_worker,
