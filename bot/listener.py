@@ -964,6 +964,11 @@ LISTENER_LAST_MSG_ID_PREFIX = "listener:last_msg_id"
 # a genuine stall from an organically quiet channel.
 LISTENER_LAST_PTS_KEY = "listener:last_pts"
 
+# Redis list used as an overflow buffer when the asyncio.Queue is full.
+# _handle() pushes here instead of blocking; overflow_drainer() refills
+# the queue as workers free up slots. Messages are never lost.
+LISTENER_OVERFLOW_KEY = "listener:overflow"
+
 
 def register_listener(
     app: Client,
@@ -1013,9 +1018,9 @@ def register_listener(
         if bot_start_time is not None:
             msg_ts = int(message.date.timestamp()) if hasattr(message.date, "timestamp") else int(message.date)
             if msg_ts < bot_start_time:
-                logger.debug(
+                logger.info(
                     f"Dropping backlog message {message.id} "
-                    f"(date={msg_ts} < start={bot_start_time})"
+                    f"(date={msg_ts} < start={bot_start_time}) — pre-startup, skipped"
                 )
                 return
 
@@ -1054,15 +1059,39 @@ def register_listener(
                 logger.debug(f"Received counter skipped: {e}")
 
         try:
-            # Put to queue — blocks if queue is full (backpressure)
-            await message_queue.put(payload)
-            logger.debug(
+            # Non-blocking put — never suspends the dispatcher.
+            # If the queue is full, spill to Redis so no messages are lost
+            # and Hydrogram can immediately deliver the next update.
+            message_queue.put_nowait(payload)
+            logger.info(
                 f"Enqueued message {message.id} type={payload['type']} "
+                f"(queue={message_queue.qsize()}/{message_queue.maxsize}) "
                 f"media_group={payload.get('media_group_id')}"
             )
         except asyncio.QueueFull:
-            # Shouldn't happen with put() (it waits), but safety net
-            logger.error(f"Message queue full, dropping message {message.id}")
+            # Queue at capacity — spill to Redis overflow list.
+            # overflow_drainer() will refill the queue as workers drain it.
+            if redis_client is not None:
+                try:
+                    import json as _json
+                    overflow_depth = await redis_client.rpush(
+                        LISTENER_OVERFLOW_KEY,
+                        _json.dumps(payload, default=str),
+                    )
+                    logger.warning(
+                        f"Queue full — message {message.id} spilled to Redis overflow "
+                        f"(overflow depth={overflow_depth}, "
+                        f"queue={message_queue.qsize()}/{message_queue.maxsize})"
+                    )
+                except Exception as oe:
+                    logger.error(
+                        f"Queue full AND Redis overflow failed — "
+                        f"dropping message {message.id}: {oe}"
+                    )
+            else:
+                logger.error(
+                    f"Queue full, no Redis client — dropping message {message.id}"
+                )
 
     # Hydrogram routes channel posts (UpdateNewChannelMessage) and regular
     # messages (UpdateNewMessage) through the same on_message handler.
@@ -1165,11 +1194,32 @@ async def _do_channel_catchup(
             if msg_id > newest_id:
                 newest_id = msg_id
         except asyncio.QueueFull:
-            logger.warning(
-                f"Queue full during catch-up for {channel_chat_id} — "
-                f"stopped at message {msg_id}"
-            )
-            break
+            # Spill to Redis overflow instead of abandoning the catch-up.
+            if redis_client is not None:
+                try:
+                    import json as _json
+                    overflow_depth = await redis_client.rpush(
+                        LISTENER_OVERFLOW_KEY,
+                        _json.dumps(payload, default=str),
+                    )
+                    fetched += 1
+                    if msg_id > newest_id:
+                        newest_id = msg_id
+                    logger.warning(
+                        f"Catch-up queue full — message {msg_id} spilled to overflow "
+                        f"(depth={overflow_depth})"
+                    )
+                except Exception as oe:
+                    logger.error(
+                        f"Catch-up: queue full AND overflow failed for {msg_id}: {oe}"
+                    )
+                    break
+            else:
+                logger.warning(
+                    f"Queue full during catch-up for {channel_chat_id} — "
+                    f"stopped at message {msg_id} (no Redis to spill to)"
+                )
+                break
 
     # Advance the watermark and refresh the liveness key
     if redis_client is not None and newest_id > last_msg_id:
@@ -1205,6 +1255,68 @@ async def _do_channel_catchup(
         f"Channel catch-up {channel_chat_id}: re-queued {fetched} message(s){watermark_label}"
     )
     return fetched
+
+
+async def overflow_drainer(
+    message_queue: asyncio.Queue,
+    redis_client,
+    shutdown_event: asyncio.Event,
+):
+    """
+    Background task that drains the Redis overflow list back into the asyncio.Queue.
+
+    When on_message can't put_nowait() (queue is at capacity), messages spill
+    to LISTENER_OVERFLOW_KEY in Redis. This drainer polls Redis and refills
+    the asyncio.Queue as workers free up slots — ensuring no messages are lost
+    even during sustained high-volume bursts on large channels.
+
+    Design:
+      - Only attempts to drain when the queue has at least one free slot.
+      - If put_nowait() races and the queue fills between the check and the put,
+        the payload is pushed back to the FRONT of the Redis list (lpush) so
+        ordering is preserved.
+      - Polls at 200 ms when overflow is empty; tighter at 50 ms when draining.
+    """
+    import json as _json
+
+    logger.info("Overflow drainer started")
+    while not shutdown_event.is_set():
+        try:
+            # Wait for a free slot before even touching Redis
+            if message_queue.full():
+                await asyncio.sleep(0.1)
+                continue
+
+            payload_json = await redis_client.lpop(LISTENER_OVERFLOW_KEY)
+            if payload_json is None:
+                # Overflow list is empty — nothing to drain, sleep longer
+                await asyncio.sleep(0.2)
+                continue
+
+            payload = _json.loads(payload_json)
+            try:
+                message_queue.put_nowait(payload)
+                remaining = await redis_client.llen(LISTENER_OVERFLOW_KEY)
+                logger.info(
+                    f"Overflow drainer: requeued message {payload.get('message_id')} "
+                    f"(queue={message_queue.qsize()}/{message_queue.maxsize}, "
+                    f"overflow remaining={remaining})"
+                )
+                # Keep draining at high speed while overflow has items
+                if remaining > 0:
+                    continue
+                await asyncio.sleep(0.05)
+            except asyncio.QueueFull:
+                # Race: queue filled between our check and the put — push back to front
+                await redis_client.lpush(LISTENER_OVERFLOW_KEY, payload_json)
+                await asyncio.sleep(0.1)
+
+        except asyncio.CancelledError:
+            logger.info("Overflow drainer cancelled — shutting down")
+            return
+        except Exception as e:
+            logger.error(f"Overflow drainer error: {e}", exc_info=True)
+            await asyncio.sleep(1.0)
 
 
 # make_fallback_poller_factory removed.

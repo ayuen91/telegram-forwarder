@@ -46,7 +46,7 @@ from hydrogram.errors import (
 
 from config import config
 from logging_config import setup_logging
-from listener import register_listener, message_worker, process_payload, retry_payload
+from listener import register_listener, message_worker, process_payload, retry_payload, overflow_drainer
 from album_buffer import AlbumBuffer
 from queue_manager import QueueManager
 from deduplication import Deduplication
@@ -625,7 +625,8 @@ async def main():
         db_path=settings.db_path,
     )
 
-    message_queue = asyncio.Queue(maxsize=100)
+    message_queue = asyncio.Queue(maxsize=settings.queue_max_size)
+    logger.info(f"Message queue initialised (maxsize={settings.queue_max_size})")
 
     # Record startup time BEFORE connecting so the listener can drop
     # any backlog updates Telegram pushes upon reconnect.
@@ -767,6 +768,16 @@ async def main():
         name="health",
     ))
 
+    # Overflow drainer: refills the asyncio.Queue from Redis when the queue
+    # was full and messages had to be spilled. Runs independently of workers.
+    async def _overflow_drainer_factory():
+        await overflow_drainer(message_queue, redis_client, shutdown_event)
+
+    tasks.append(asyncio.create_task(
+        supervised_task("overflow-drainer", _overflow_drainer_factory),
+        name="overflow-drainer",
+    ))
+
     if settings.daily_report_enabled:
         tasks.append(asyncio.create_task(
             supervised_task(
@@ -815,7 +826,7 @@ async def main():
     ))
 
     logger.info(
-        f"Workers running: {settings.worker_count} processors, album-flush, retry, health"
+        f"Workers running: {settings.worker_count} processors, album-flush, retry, health, overflow-drainer"
         + (", daily-report" if settings.daily_report_enabled else "")
         + (f", silence-watchdog (PTS-audited, {settings.listener_silence_timeout}s threshold)" if settings.listener_silence_timeout > 0 else "")
     )

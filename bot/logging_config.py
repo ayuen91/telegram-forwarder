@@ -90,8 +90,11 @@ def setup_logging(log_level: str = "INFO"):
     error_handler.setFormatter(json_formatter)
     root_logger.addHandler(error_handler)
 
-    # Suppress noisy third-party loggers
-    logging.getLogger("pyrogram").setLevel(logging.WARNING)
+    # Allow Hydrogram/Pyrogram INFO so connection, disconnect, and session
+    # events are visible in production — critical for diagnosing update stalls.
+    # aiohttp and redis remain at WARNING to suppress request-level chatter.
+    logging.getLogger("pyrogram").setLevel(logging.INFO)
+    logging.getLogger("hydrogram").setLevel(logging.INFO)
     logging.getLogger("aiohttp").setLevel(logging.WARNING)
     logging.getLogger("redis").setLevel(logging.WARNING)
 

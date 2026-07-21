@@ -109,6 +109,8 @@ class Settings:
     health_check_interval: int = 300
     max_retries: int = 3
     log_level: str = "INFO"
+    # In-memory queue bound. When full, messages spill to Redis overflow.
+    queue_max_size: int = 100
 
     # Listener tuning (from .env)
     # silence_timeout: seconds of no push messages before PTS audit + client recycle (0 = disabled)
@@ -192,6 +194,7 @@ class Config:
         s.health_check_interval = _env_int("HEALTH_CHECK_INTERVAL", 300)
         s.max_retries = _env_int("MAX_RETRIES", 3)
         s.log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+        s.queue_max_size = _env_int("QUEUE_MAX_SIZE", 100)
 
         s.listener_silence_timeout = _env_int("LISTENER_SILENCE_TIMEOUT", 900)
 
