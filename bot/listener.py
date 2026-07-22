@@ -1271,9 +1271,14 @@ async def _do_channel_catchup(
             logger.debug(f"Channel catch-up: PTS snapshot skipped: {pts_err}")
 
     watermark_label = f" (watermark msg_id={last_msg_id})" if last_msg_id else ""
-    logger.info(
-        f"Channel catch-up {channel_chat_id}: re-queued {fetched} message(s){watermark_label}"
-    )
+    if fetched > 0:
+        logger.info(
+            f"Channel catch-up {channel_chat_id}: re-queued {fetched} message(s){watermark_label}"
+        )
+    else:
+        logger.debug(
+            f"Channel catch-up {channel_chat_id}: re-queued {fetched} message(s){watermark_label}"
+        )
     return fetched
 
 
