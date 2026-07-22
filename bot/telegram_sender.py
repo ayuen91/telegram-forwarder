@@ -510,17 +510,22 @@ class TelegramBotSender:
             for item, sent_id in zip(sorted_items, sent_ids):
                 original = item.get("caption") or ""
                 processed = item.get("processed_caption") or original
-                if processed != original:
-                    # Replacement fired — send plain text (entities were dropped)
-                    await self.edit_message_caption(
-                        dest_chat_id, sent_id, processed,
-                        parse_mode=None,
-                    )
-                elif item.get("caption_html") and item.get("caption_html") != original:
-                    # No replacement but caption has formatting — push HTML
-                    await self.edit_message_caption(
-                        dest_chat_id, sent_id, item["caption_html"],
-                        parse_mode="HTML",
+                try:
+                    if processed != original:
+                        # Replacement fired — send plain text (entities were dropped)
+                        await self.edit_message_caption(
+                            dest_chat_id, sent_id, processed,
+                            parse_mode=None,
+                        )
+                    elif item.get("caption_html") and item.get("caption_html") != original:
+                        # No replacement but caption has formatting — push HTML
+                        await self.edit_message_caption(
+                            dest_chat_id, sent_id, item["caption_html"],
+                            parse_mode="HTML",
+                        )
+                except Exception as cap_err:
+                    logger.warning(
+                        f"Failed to edit caption for album item {sent_id} in {dest_chat_id}: {cap_err}"
                     )
 
             reply_mappings = [

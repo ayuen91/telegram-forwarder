@@ -21,12 +21,30 @@ from typing import Dict, Any, Optional, Literal
 
 import aiosqlite
 from hydrogram import Client, filters
-from hydrogram.errors import FloodWait, MessageIdsEmpty
-from hydrogram.raw.types import UpdatesTooLong
+from hydrogram.errors import FloodWait
+try:
+    from hydrogram.errors import MessageIdsEmpty
+except ImportError:
+    try:
+        from hydrogram.errors.exceptions.bad_request_400 import MessageIdsEmpty
+    except ImportError:
+        class MessageIdsEmpty(Exception):
+            pass
+try:
+    from hydrogram.raw.types import UpdatesTooLong
+except (ImportError, ModuleNotFoundError, RuntimeError):
+    try:
+        from pyrogram.raw.types import UpdatesTooLong
+    except (ImportError, ModuleNotFoundError, RuntimeError):
+        UpdatesTooLong = None
+
 try:
     from hydrogram.raw.types import UpdateChannelTooLong
-except ImportError:
-    UpdateChannelTooLong = None  # Graceful fallback for older Hydrogram builds
+except (ImportError, ModuleNotFoundError, RuntimeError):
+    try:
+        from pyrogram.raw.types import UpdateChannelTooLong
+    except (ImportError, ModuleNotFoundError, RuntimeError):
+        UpdateChannelTooLong = None  # Graceful fallback
 from hydrogram.types import Message
 
 from media_relay import RelayConfig, relay_to_bot, cleanup_relay

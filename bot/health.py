@@ -476,7 +476,7 @@ class HealthMonitor:
                 return HealthCheckResult(
                     name="delivery_failure_rate",
                     passed=True,
-                    level="critical",
+                    level="high",
                     message="Not enough samples yet",
                 )
 
@@ -487,7 +487,7 @@ class HealthMonitor:
                 return HealthCheckResult(
                     name="delivery_failure_rate",
                     passed=False,
-                    level="critical",
+                    level="high",
                     message=(
                         f"{failed}/{len(rows)} recent deliveries failed "
                         f"({rate * 100:.0f}% failure rate, threshold={int(FAILURE_THRESHOLD * 100)}%). "
@@ -498,14 +498,14 @@ class HealthMonitor:
             return HealthCheckResult(
                 name="delivery_failure_rate",
                 passed=True,
-                level="critical",
+                level="high",
                 message=f"{failed}/{len(rows)} failed ({rate * 100:.0f}%)",
             )
         except Exception as e:
             return HealthCheckResult(
                 name="delivery_failure_rate",
                 passed=True,
-                level="critical",
+                level="high",
                 message=f"Check skipped: {e}",
             )
 
