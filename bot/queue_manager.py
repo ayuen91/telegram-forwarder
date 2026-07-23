@@ -172,8 +172,27 @@ class QueueManager:
 
     async def clear_dead_letter(self) -> int:
         """Remove all dead-letter entries (manual recovery). Returns count cleared."""
-        count = await self.redis.llen(self.QUEUE_DEAD_LETTER)
+        return await self.clear_queue(self.QUEUE_DEAD_LETTER)
+
+    async def clear_queue(self, queue_name: str) -> int:
+        """Clear a specific Redis queue by key name. Returns count cleared."""
+        count = await self.redis.llen(queue_name)
         if count:
-            await self.redis.delete(self.QUEUE_DEAD_LETTER)
-            logger.warning(f"Cleared {count} message(s) from dead letter queue")
+            await self.redis.delete(queue_name)
+            logger.warning(f"Cleared {count} message(s) from {queue_name}")
         return count
+
+    async def clear_all_queues(self) -> Dict[str, int]:
+        """Clear all message queues (messages, albums, failed, deferred, dead_letter, overflow)."""
+        queues_to_clear = [
+            self.QUEUE_MESSAGES,
+            self.QUEUE_ALBUMS,
+            self.QUEUE_FAILED,
+            self.QUEUE_DEFERRED,
+            self.QUEUE_DEAD_LETTER,
+            "listener:overflow",
+        ]
+        results = {}
+        for q in queues_to_clear:
+            results[q] = await self.clear_queue(q)
+        return results

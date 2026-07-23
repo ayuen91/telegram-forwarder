@@ -32,6 +32,7 @@ def get_admin_inline_keyboard() -> Dict[str, Any]:
                 {"text": "🗑️ Clear DLQ", "callback_data": "cmd_clear_deadletter"},
             ],
             [
+                {"text": "🧹 Clear All Queues", "callback_data": "cmd_clear_queues"},
                 {"text": "ℹ️ Help Menu", "callback_data": "cmd_help"},
             ],
         ]
@@ -239,6 +240,7 @@ class AlertBotCommandListener:
             {"command": "retry", "description": "Trigger retry of failed queue"},
             {"command": "deadletter", "description": "Inspect dead-letter queue"},
             {"command": "clear_deadletter", "description": "Clear dead-letter queue"},
+            {"command": "clear_queues", "description": "Clear all pending & failed queues"},
             {"command": "help", "description": "Show interactive control menu"},
         ]
         payload = {"commands": commands}
@@ -326,6 +328,7 @@ class AlertBotCommandListener:
             "cmd_retry": self._cmd_retry,
             "cmd_deadletter": self._cmd_deadletter,
             "cmd_clear_deadletter": self._cmd_clear_deadletter,
+            "cmd_clear_queues": self._cmd_clear_queues,
             "cmd_help": self._cmd_help,
         }
         handler = cmd_map.get(cb_data)
@@ -369,6 +372,8 @@ class AlertBotCommandListener:
             await self._cmd_deadletter(session)
         elif cmd == "/clear_deadletter":
             await self._cmd_clear_deadletter(session)
+        elif cmd in ("/clear_queues", "/clearall", "/clear_all"):
+            await self._cmd_clear_queues(session)
         elif cmd in ("/help", "/start"):
             await self._cmd_help(session)
 
@@ -481,6 +486,14 @@ class AlertBotCommandListener:
             session,
         )
 
+    async def _cmd_clear_queues(self, session: aiohttp.ClientSession):
+        results = await self.queue_mgr.clear_all_queues()
+        total_cleared = sum(results.values())
+        lines = [f"🧹 <b>All Message Queues Cleared</b> (Total: <code>{total_cleared}</code>)\n"]
+        for q, cnt in results.items():
+            lines.append(f"• <code>{q}</code>: <code>{cnt}</code> item(s)")
+        await self._reply("\n".join(lines), session)
+
     async def _cmd_help(self, session: aiohttp.ClientSession):
         msg = (
             f"🤖 <b>Telegram Forwarder Control Panel</b>\n\n"
@@ -492,6 +505,7 @@ class AlertBotCommandListener:
             f"• 🔄 <code>/retry</code> — Trigger retry of failed queue\n"
             f"• 🟠 <code>/deadletter</code> — Inspect dead-letter items\n"
             f"• 🗑️ <code>/clear_deadletter</code> — Clear dead-letter queue\n"
+            f"• 🧹 <code>/clear_queues</code> — Clear all pending & failed queues\n"
             f"• ℹ️ <code>/help</code> — Show this control menu"
         )
         await self._reply(msg, session, reply_markup=get_admin_inline_keyboard())

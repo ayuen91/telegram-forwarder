@@ -24,6 +24,7 @@ class TestAlertInlineKeyboard:
         assert "cmd_retry" in callbacks
         assert "cmd_deadletter" in callbacks
         assert "cmd_clear_deadletter" in callbacks
+        assert "cmd_clear_queues" in callbacks
         assert "cmd_help" in callbacks
 
     @pytest.mark.asyncio
