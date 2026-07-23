@@ -346,6 +346,7 @@ def make_channel_sync_factory(
                     app, source_chat_id, redis_client, message_queue, bot_start_time
                 )
             except Exception as e:
+                logger.error(f"Channel sync error: {e}", exc_info=True)
     return channel_sync
 
 
