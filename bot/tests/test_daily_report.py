@@ -25,7 +25,7 @@ UTC_PLUS_3 = timezone(timedelta(hours=3))
 
 def _ok_checks():
     return [
-        HealthCheckResult(name="pyrogram_session", passed=True, level="critical"),
+        HealthCheckResult(name="hydrogram_session", passed=True, level="critical"),
         HealthCheckResult(name="sender_bot", passed=True, level="critical"),
         HealthCheckResult(name="redis", passed=True, level="critical"),
         HealthCheckResult(name="sqlite", passed=True, level="critical"),
@@ -112,6 +112,7 @@ class TestQuickChart:
         url = build_quickchart_url(dests)
         assert url.startswith("https://quickchart.io/chart?")
         assert "type" in url or "%22type%22" in url
+        assert "v=3" in url
         assert "800" in url
 
 
@@ -136,7 +137,7 @@ def _sample_metrics(**overrides) -> DailyReportMetrics:
     base = dict(
         verdict="green",
         components=[
-            ComponentStatus("pyrogram_session", "Pyrogram", True),
+            ComponentStatus("hydrogram_session", "Hydrogram", True),
             ComponentStatus("sender_bot", "Sender", True),
             ComponentStatus("redis", "Redis", True),
             ComponentStatus("sqlite", "SQLite", True),

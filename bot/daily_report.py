@@ -193,7 +193,7 @@ def build_quickchart_url(destinations: List[DestinationStats], w: int = 800, h: 
         },
     }
     encoded = urllib.parse.quote(json.dumps(config, separators=(",", ":")))
-    return f"https://quickchart.io/chart?w={w}&h={h}&bkg=%231f2937&c={encoded}"
+    return f"https://quickchart.io/chart?w={w}&h={h}&bkg=%231f2937&v=3&c={encoded}"
 
 
 def format_report_html(m: DailyReportMetrics) -> str:

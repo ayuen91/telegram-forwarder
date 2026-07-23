@@ -198,7 +198,8 @@ def compute_verdict(
 
 
 _COMPONENT_LABELS = {
-    "pyrogram_session": "Pyrogram",
+    "hydrogram_session": "Hydrogram",
+    "pyrogram_session": "Hydrogram",
     "sender_bot": "Sender",
     "redis": "Redis",
     "sqlite": "SQLite",
@@ -209,6 +210,7 @@ _COMPONENT_LABELS = {
 
 def _pick_components(results: List[HealthCheckResult]) -> List[ComponentStatus]:
     wanted = (
+        "hydrogram_session",
         "pyrogram_session",
         "sender_bot",
         "redis",
@@ -218,19 +220,20 @@ def _pick_components(results: List[HealthCheckResult]) -> List[ComponentStatus]:
     )
     by_name = {r.name: r for r in results}
     out: List[ComponentStatus] = []
+    seen = set()
     for name in wanted:
+        label = _COMPONENT_LABELS.get(name, name)
+        if label in seen:
+            continue
         r = by_name.get(name)
-        if r is None:
-            out.append(ComponentStatus(name=name, label=_COMPONENT_LABELS[name], passed=False, message="missing"))
-        else:
-            out.append(
-                ComponentStatus(
-                    name=name,
-                    label=_COMPONENT_LABELS[name],
-                    passed=r.passed,
-                    message=r.message or "",
-                )
-            )
+        if r is not None:
+            seen.add(label)
+            out.append(ComponentStatus(name=name, label=label, passed=r.passed, message=r.message))
+    for name in wanted:
+        label = _COMPONENT_LABELS.get(name, name)
+        if label not in seen:
+            seen.add(label)
+            out.append(ComponentStatus(name=name, label=label, passed=False, message="missing"))
     return out
 
 

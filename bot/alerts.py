@@ -4,7 +4,8 @@ import asyncio
 import json
 import logging
 import time
-from typing import Dict, Optional
+import urllib.parse
+from typing import Any, Dict, Optional
 
 import aiohttp
 
@@ -98,21 +99,50 @@ async def send_photo(
     async with aiohttp.ClientSession() as session:
         # ── Step 1: download the image ────────────────────────────────
         image_bytes: Optional[bytes] = None
+        headers = {"User-Agent": "TelegramBot/1.0"}
         try:
             async with session.get(
-                photo_url, timeout=aiohttp.ClientTimeout(total=20)
+                photo_url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)
             ) as dl:
                 if dl.status == 200:
                     image_bytes = await dl.read()
                 else:
                     logger.warning(
                         f"Chart download returned {dl.status} — "
-                        "falling back to URL upload"
+                        "attempting QuickChart POST fallback"
                     )
         except Exception as dl_err:
             logger.warning(
-                f"Chart download failed ({dl_err}) — falling back to URL upload"
+                f"Chart download failed ({dl_err}) — attempting QuickChart POST fallback"
             )
+
+        # QuickChart POST API fallback if GET download failed
+        if not image_bytes and "quickchart.io" in photo_url:
+            try:
+                parsed = urllib.parse.urlparse(photo_url)
+                params = urllib.parse.parse_qs(parsed.query)
+                chart_param = params.get("c", [""])[0]
+                if chart_param:
+                    chart_json = json.loads(chart_param)
+                    post_payload = {
+                        "width": 800,
+                        "height": 400,
+                        "backgroundColor": "#1f2937",
+                        "version": "3",
+                        "format": "png",
+                        "chart": chart_json,
+                    }
+                    async with session.post(
+                        "https://quickchart.io/chart",
+                        json=post_payload,
+                        headers=headers,
+                        timeout=aiohttp.ClientTimeout(total=20),
+                    ) as qc_resp:
+                        if qc_resp.status == 200:
+                            image_bytes = await qc_resp.read()
+                            logger.info("Chart fetched via QuickChart POST API fallback")
+            except Exception as qc_err:
+                logger.warning(f"QuickChart POST fallback failed: {qc_err}")
 
         # ── Step 2: upload (binary preferred, URL fallback) ───────────
         try:
