@@ -142,6 +142,7 @@ class HealthMonitor:
         await self._process_state_transition_alerts(results)
 
         # Log summary
+        failed = [r for r in results if not r.passed]
         passed = sum(1 for r in results if r.passed)
         total = len(results)
         if failed:
@@ -553,7 +554,6 @@ class HealthMonitor:
             if trigger_alert:
                 try:
                     await self._send_telegram_alert(alert_msg)
-                    self._last_alert_times["delivery_failure_rate"] = time.time()
                 except Exception as alert_err:
                     logger.error(
                         f"Failed to send reactive failure rate alert: {alert_err}"
