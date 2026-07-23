@@ -200,7 +200,11 @@ class ForwardAttributionChecker:
                 if perms is False and status != "creator":
                     is_admin = False
         except Exception as e:
-            logger.warning(f"Admin check failed for origin {chat_id}: {e}")
+            err_msg = str(e)
+            if "chat not found" in err_msg.lower() or "chat_id_invalid" in err_msg.lower():
+                logger.debug(f"Sender bot is not a member of origin channel {chat_id} (normal for external forwards): {e}")
+            else:
+                logger.warning(f"Admin check failed for origin {chat_id}: {e}")
             is_admin = False
 
         self._admin_cache[chat_id] = (is_admin, now + _ADMIN_CACHE_TTL)
