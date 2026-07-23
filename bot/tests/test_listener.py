@@ -35,8 +35,10 @@ from listener import (
     _serialize_contact,
     _serialize_location,
     _serialize_poll,
+    _serialize_reply_markup,
     _serialize_venue,
     _source_message_ids,
+    normalize_message,
 )
 
 
@@ -44,6 +46,7 @@ def _msg(**attrs):
     """Build a minimal message-like object for type detection."""
     defaults = {
         "id": 1,
+        "chat": SimpleNamespace(id=-100123),
         "text": None,
         "photo": None,
         "video": None,
@@ -57,6 +60,10 @@ def _msg(**attrs):
         "contact": None,
         "venue": None,
         "location": None,
+        "pinned_message": None,
+        "media_group_id": None,
+        "reply_to_message_id": None,
+        "reply_markup": None,
     }
     defaults.update(attrs)
     return SimpleNamespace(**defaults)
@@ -76,6 +83,10 @@ class TestGetMessageType:
     def test_location(self):
         assert _get_message_type(_msg(location=object())) == "location"
 
+    def test_pin_message(self):
+        msg = _msg(pinned_message=SimpleNamespace(id=99))
+        assert _get_message_type(msg) == "pin"
+
     def test_unsupported_returns_none(self):
         assert _get_message_type(_msg()) is None
 
@@ -92,6 +103,9 @@ class TestSourceMessageIds:
 
     def test_contact_does_not_need_relay(self):
         assert _source_message_ids({"type": "contact", "message_id": 13}) == []
+
+    def test_pin_does_not_need_relay(self):
+        assert _source_message_ids({"type": "pin", "message_id": 14}) == []
 
     def test_text_needs_relay(self):
         assert _source_message_ids({"type": "text", "message_id": 14}) == [14]
@@ -153,3 +167,30 @@ class TestSerialization:
         assert data["phone_number"] == "+100"
         assert data["last_name"] == "Lovelace"
         assert data["vcard"] == "BEGIN:VCARD"
+
+    def test_serialize_reply_markup(self):
+        btn1 = SimpleNamespace(text="Google", url="https://google.com")
+        btn2 = SimpleNamespace(text="Click", callback_data=b"data_123")
+        markup = SimpleNamespace(inline_keyboard=[[btn1, btn2]])
+
+        res = _serialize_reply_markup(markup)
+        assert res == {
+            "inline_keyboard": [
+                [
+                    {"text": "Google", "url": "https://google.com"},
+                    {"text": "Click", "callback_data": "data_123"},
+                ]
+            ]
+        }
+
+    def test_normalize_message_pin(self):
+        msg = _msg(
+            id=500,
+            chat=SimpleNamespace(id=-1001),
+            pinned_message=SimpleNamespace(id=450),
+        )
+        payload = normalize_message(msg)
+        assert payload["type"] == "pin"
+        assert payload["message_id"] == 500
+        assert payload["chat_id"] == -1001
+        assert payload["pinned_message_id"] == 450

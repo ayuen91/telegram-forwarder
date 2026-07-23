@@ -276,3 +276,48 @@ class TestForwardToDestination:
         payload = sender._call.await_args.args[1]
         assert payload["type"] == "regular"
         assert "correct_option_id" not in payload
+
+    @pytest.mark.asyncio
+    async def test_pin_chat_message(self, sender):
+        sender._call = AsyncMock(return_value=True)
+
+        res = await sender.pin_chat_message(
+            chat_id=-1001,
+            message_id=50,
+            disable_notification=True,
+        )
+
+        assert res is True
+        sender._call.assert_awaited_once_with(
+            "pinChatMessage",
+            {
+                "chat_id": -1001,
+                "message_id": 50,
+                "disable_notification": True,
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_forward_to_destination_passes_reply_markup(self, sender):
+        sender.send_message = AsyncMock(return_value=123)
+        reply_markup = {"inline_keyboard": [[{"text": "Click", "url": "https://test.com"}]]}
+
+        result = await sender.forward_to_destination(
+            dest_chat_id=-1001,
+            msg_type="text",
+            payload={
+                "message_id": 36,
+                "text": "hello",
+                "reply_markup": reply_markup,
+            },
+            processed_payload={"text_changed": False},
+        )
+
+        sender.send_message.assert_awaited_once_with(
+            chat_id=-1001,
+            text="hello",
+            parse_mode=None,
+            reply_to_message_id=None,
+            reply_markup=reply_markup,
+        )
+        assert result == {"sent_message_id": 123, "reply_mappings": [(36, 123)]}

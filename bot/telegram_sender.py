@@ -202,6 +202,20 @@ class TelegramBotSender:
             f"(needed {count} id(s))"
         )
 
+    async def pin_chat_message(
+        self,
+        chat_id: Union[int, str],
+        message_id: Union[int, str],
+        disable_notification: bool = False,
+    ) -> bool:
+        """Pin a message in a chat using Telegram Bot API."""
+        payload: Dict[str, Any] = {
+            "chat_id": chat_id,
+            "message_id": int(message_id),
+            "disable_notification": disable_notification,
+        }
+        return await self._call("pinChatMessage", payload)
+
     async def copy_message(
         self,
         chat_id: Union[int, str],
@@ -210,6 +224,7 @@ class TelegramBotSender:
         caption: Optional[str] = None,
         parse_mode: Optional[str] = "HTML",
         reply_to_message_id: Optional[Union[int, str]] = None,
+        reply_markup: Optional[Dict[str, Any]] = None,
     ) -> int:
         """Copy a single message. Returns the new message_id in the destination chat."""
         payload: Dict[str, Any] = {
@@ -221,6 +236,8 @@ class TelegramBotSender:
             payload["caption"] = caption
             if parse_mode:
                 payload["parse_mode"] = parse_mode
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
         reply_params = self._reply_params(reply_to_message_id)
         if reply_params:
             payload["reply_parameters"] = reply_params
@@ -303,6 +320,7 @@ class TelegramBotSender:
         text: str,
         parse_mode: Optional[str] = "HTML",
         reply_to_message_id: Optional[Union[int, str]] = None,
+        reply_markup: Optional[Dict[str, Any]] = None,
     ) -> int:
         """Send a message with HTML formatting.  text should already be an HTML string."""
         payload: Dict[str, Any] = {
@@ -311,6 +329,8 @@ class TelegramBotSender:
         }
         if parse_mode:
             payload["parse_mode"] = parse_mode
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
         reply_params = self._reply_params(reply_to_message_id)
         if reply_params:
             payload["reply_parameters"] = reply_params
@@ -335,6 +355,7 @@ class TelegramBotSender:
         chat_id: Union[int, str],
         poll: Dict[str, Any],
         reply_to_message_id: Optional[Union[int, str]] = None,
+        reply_markup: Optional[Dict[str, Any]] = None,
     ) -> int:
         """Recreate a poll via sendPoll."""
         poll_type = poll.get("type", "regular")
@@ -365,6 +386,8 @@ class TelegramBotSender:
         if close_date is not None:
             payload["close_date"] = close_date
 
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
         reply_params = self._reply_params(reply_to_message_id)
         if reply_params:
             payload["reply_parameters"] = reply_params
@@ -377,6 +400,7 @@ class TelegramBotSender:
         chat_id: Union[int, str],
         location: Dict[str, Any],
         reply_to_message_id: Optional[Union[int, str]] = None,
+        reply_markup: Optional[Dict[str, Any]] = None,
     ) -> int:
         """Recreate a location pin via sendLocation."""
         payload: Dict[str, Any] = {
@@ -387,6 +411,8 @@ class TelegramBotSender:
         if location.get("horizontal_accuracy") is not None:
             payload["horizontal_accuracy"] = location["horizontal_accuracy"]
 
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
         reply_params = self._reply_params(reply_to_message_id)
         if reply_params:
             payload["reply_parameters"] = reply_params
@@ -399,6 +425,7 @@ class TelegramBotSender:
         chat_id: Union[int, str],
         venue: Dict[str, Any],
         reply_to_message_id: Optional[Union[int, str]] = None,
+        reply_markup: Optional[Dict[str, Any]] = None,
     ) -> int:
         """Recreate a venue via sendVenue."""
         payload: Dict[str, Any] = {
@@ -415,6 +442,8 @@ class TelegramBotSender:
         if venue.get("google_place_id"):
             payload["google_place_id"] = venue["google_place_id"]
 
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
         reply_params = self._reply_params(reply_to_message_id)
         if reply_params:
             payload["reply_parameters"] = reply_params
@@ -427,6 +456,7 @@ class TelegramBotSender:
         chat_id: Union[int, str],
         contact: Dict[str, Any],
         reply_to_message_id: Optional[Union[int, str]] = None,
+        reply_markup: Optional[Dict[str, Any]] = None,
     ) -> int:
         """Recreate a shared contact via sendContact."""
         payload: Dict[str, Any] = {
@@ -439,6 +469,8 @@ class TelegramBotSender:
         if contact.get("vcard"):
             payload["vcard"] = contact["vcard"]
 
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
         reply_params = self._reply_params(reply_to_message_id)
         if reply_params:
             payload["reply_parameters"] = reply_params
@@ -558,6 +590,8 @@ class TelegramBotSender:
             }
 
         msg_id = int(payload["message_id"])
+        reply_markup = processed_payload.get("reply_markup") or payload.get("reply_markup")
+        extra_kwargs = {"reply_markup": reply_markup} if reply_markup is not None else {}
 
         if msg_type == "text":
             text_changed = processed_payload.get("text_changed", False)
@@ -574,6 +608,7 @@ class TelegramBotSender:
                     caption=None,  # text messages have no caption field
                     parse_mode=None,  # entities are copied natively, not via parse_mode
                     reply_to_message_id=reply_to_message_id,
+                    **extra_kwargs,
                 )
             elif text_changed:
                 # Replacement altered the text — send processed HTML text if available.
@@ -593,6 +628,7 @@ class TelegramBotSender:
                     text=text,
                     parse_mode="HTML" if use_html else None,
                     reply_to_message_id=reply_to_message_id,
+                    **extra_kwargs,
                 )
             else:
                 # No entities, no replacement — simple plain-text send.
@@ -603,30 +639,35 @@ class TelegramBotSender:
                     text=text,
                     parse_mode="HTML" if payload.get("text_html") else None,
                     reply_to_message_id=reply_to_message_id,
+                    **extra_kwargs,
                 )
         elif msg_type == "poll":
             sent_id = await self.send_poll(
                 chat_id=dest_chat_id,
                 poll=payload["poll"],
                 reply_to_message_id=reply_to_message_id,
+                **extra_kwargs,
             )
         elif msg_type == "location":
             sent_id = await self.send_location(
                 chat_id=dest_chat_id,
                 location=payload["location"],
                 reply_to_message_id=reply_to_message_id,
+                **extra_kwargs,
             )
         elif msg_type == "venue":
             sent_id = await self.send_venue(
                 chat_id=dest_chat_id,
                 venue=payload["venue"],
                 reply_to_message_id=reply_to_message_id,
+                **extra_kwargs,
             )
         elif msg_type == "contact":
             sent_id = await self.send_contact(
                 chat_id=dest_chat_id,
                 contact=payload["contact"],
                 reply_to_message_id=reply_to_message_id,
+                **extra_kwargs,
             )
         else:
             if not relay_chat_id or not relay_message_ids:
@@ -637,11 +678,8 @@ class TelegramBotSender:
             if processed_payload.get("caption_changed"):
                 # Replacement changed the caption — send processed HTML caption if available
                 caption = (
-                    processed_payload.get("processed_caption_html")
-                    or processed_payload.get("processed_caption")
-                    or payload.get("caption_html")
-                    or payload.get("caption")
-                )
+                    processed_caption_html := processed_payload.get("processed_caption_html")
+                ) or processed_payload.get("processed_caption") or payload.get("caption_html") or payload.get("caption")
                 parse_mode = "HTML" if (processed_payload.get("processed_caption_html") or payload.get("caption_html")) else None
             # When caption_changed is False, caption=None & parse_mode=None are passed to copy_message.
             # This allows Telegram Bot API copyMessage to preserve the original relay message's
@@ -654,6 +692,7 @@ class TelegramBotSender:
                 caption=caption,
                 parse_mode=parse_mode,
                 reply_to_message_id=reply_to_message_id,
+                **extra_kwargs,
             )
 
         return {

@@ -65,6 +65,43 @@ _RELAY_MEDIA_TYPES = frozenset({
 })
 
 
+def _serialize_reply_markup(reply_markup) -> Optional[Dict[str, Any]]:
+    if not reply_markup or not getattr(reply_markup, "inline_keyboard", None):
+        return None
+    rows = []
+    for row in reply_markup.inline_keyboard:
+        serialized_row = []
+        for btn in row:
+            btn_dict: Dict[str, Any] = {"text": str(getattr(btn, "text", ""))}
+            if getattr(btn, "url", None):
+                btn_dict["url"] = str(btn.url)
+            if getattr(btn, "callback_data", None):
+                cb = btn.callback_data
+                if isinstance(cb, bytes):
+                    try:
+                        cb = cb.decode("utf-8")
+                    except Exception:
+                        cb = cb.hex()
+                btn_dict["callback_data"] = str(cb)
+            if getattr(btn, "switch_inline_query", None) is not None:
+                btn_dict["switch_inline_query"] = str(btn.switch_inline_query)
+            if getattr(btn, "switch_inline_query_current_chat", None) is not None:
+                btn_dict["switch_inline_query_current_chat"] = str(btn.switch_inline_query_current_chat)
+            if getattr(btn, "web_app", None) and getattr(btn.web_app, "url", None):
+                btn_dict["web_app"] = {"url": str(btn.web_app.url)}
+            if getattr(btn, "login_url", None) and getattr(btn.login_url, "url", None):
+                login_dict: Dict[str, Any] = {"url": str(btn.login_url.url)}
+                if getattr(btn.login_url, "forward_text", None):
+                    login_dict["forward_text"] = str(btn.login_url.forward_text)
+                btn_dict["login_url"] = login_dict
+            serialized_row.append(btn_dict)
+        if serialized_row:
+            rows.append(serialized_row)
+    if not rows:
+        return None
+    return {"inline_keyboard": rows}
+
+
 def normalize_message(message: Message) -> Optional[Dict[str, Any]]:
     """
     Extract a consistent payload from any Hydrogram message type.
@@ -80,6 +117,24 @@ def normalize_message(message: Message) -> Optional[Dict[str, Any]]:
     msg_type = _get_message_type(message)
     if msg_type is None:
         return None
+
+    if msg_type == "pin":
+        pinned_msg = getattr(message, "pinned_message", None)
+        pinned_msg_id = pinned_msg.id if pinned_msg else getattr(message, "action_message_id", None)
+        if not pinned_msg_id and hasattr(message, "action"):
+            action = message.action
+            if hasattr(action, "message_id"):
+                pinned_msg_id = action.message_id
+        if not pinned_msg_id:
+            logger.warning(f"Pin service message {message.id} missing target pinned_message ID")
+            return None
+        return {
+            "message_id": message.id,
+            "chat_id": message.chat.id,
+            "type": "pin",
+            "pinned_message_id": pinned_msg_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
 
     # Use Hydrogram's .html property to capture all formatting entities as
     # a plain HTML string.  Falls back to plain text when there are no
@@ -119,6 +174,10 @@ def normalize_message(message: Message) -> Optional[Dict[str, Any]]:
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
+    reply_markup = _serialize_reply_markup(getattr(message, "reply_markup", None))
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+
     if msg_type == "poll" and message.poll:
         payload["poll"] = _serialize_poll(message.poll)
     elif msg_type == "contact" and message.contact:
@@ -137,7 +196,12 @@ def normalize_message(message: Message) -> Optional[Dict[str, Any]]:
 
 def _get_message_type(message: Message) -> Optional[str]:
     """Map Hydrogram message to our type string."""
-    if message.text:
+    if getattr(message, "pinned_message", None) or (
+        getattr(message, "service", False) and "pin" in str(getattr(message, "action", "")).lower()
+    ):
+        return "pin"
+    elif message.text:
+        return "text"
         return "text"
     elif message.photo:
         return "photo"
@@ -361,6 +425,8 @@ async def forward_message_pipeline(
     dedup=None,
     hydrogram_app: Optional[Client] = None,
     relay: Optional[RelayConfig] = None,
+    alert_token: str = "",
+    alert_chat_id: int = 0,
 ) -> ForwardStatus:
     """
     Send the processed message/album to all destinations via Bot API.
@@ -381,6 +447,77 @@ async def forward_message_pipeline(
     if source_chat_id is None or telegram_id is None:
         logger.error("Invalid payload: missing chat_id or message identifier")
         return "failed"
+
+    if msg_type == "pin":
+        pinned_msg_id = payload.get("pinned_message_id")
+        if not pinned_msg_id or source_chat_id is None:
+            logger.error("Pin payload missing pinned_message_id or source chat_id")
+            return "failed"
+
+        async with aiosqlite.connect(db_path) as db:
+            db.row_factory = aiosqlite.Row
+
+            if dedup and await _is_reply_parent_pending(db, dedup, source_chat_id, pinned_msg_id):
+                logger.info(
+                    f"Pinned target message {pinned_msg_id} in {source_chat_id} is still pending — deferring pin"
+                )
+                return "defer"
+
+            any_failed = False
+            for dest in destinations:
+                if not dest.get("enabled", True):
+                    continue
+                dest_chat_id = _to_int(dest["chat_id"])
+                if dest_chat_id is None:
+                    continue
+                dest_name = dest.get("name", str(dest_chat_id))
+
+                sent_msg_id = await _lookup_reply_target(db, source_chat_id, pinned_msg_id, dest_chat_id)
+                if sent_msg_id is None:
+                    logger.warning(
+                        f"Pin failed: message {pinned_msg_id} from source {source_chat_id} "
+                        f"not found in destination {dest_name} ({dest_chat_id})"
+                    )
+                    any_failed = True
+                    cur_alert_token = alert_token or processed_payload.get("alert_token", "")
+                    cur_alert_chat_id = alert_chat_id or processed_payload.get("alert_chat_id", 0)
+                    if cur_alert_token and cur_alert_chat_id:
+                        await send_alert(
+                            cur_alert_token,
+                            cur_alert_chat_id,
+                            f"⚠️ <b>Message Not Pinned</b>\n\n"
+                            f"Message <code>{pinned_msg_id}</code> was pinned in source channel <code>{source_chat_id}</code>, "
+                            f"but it does not exist in destination channel <b>{dest_name}</b> (<code>{dest_chat_id}</code>).",
+                            alert_key=f"pin-missing-{source_chat_id}-{pinned_msg_id}-{dest_chat_id}",
+                        )
+                else:
+                    try:
+                        await sender.call_with_flood_wait(
+                            lambda: sender.pin_chat_message(dest_chat_id, sent_msg_id)
+                        )
+                        logger.info(
+                            f"Successfully pinned message {sent_msg_id} in destination {dest_name} "
+                            f"for source pin of message {pinned_msg_id}"
+                        )
+                    except Exception as pin_err:
+                        logger.error(
+                            f"Failed to pin message {sent_msg_id} in destination {dest_name}: {pin_err}"
+                        )
+                        any_failed = True
+                        cur_alert_token = alert_token or processed_payload.get("alert_token", "")
+                        cur_alert_chat_id = alert_chat_id or processed_payload.get("alert_chat_id", 0)
+                        if cur_alert_token and cur_alert_chat_id:
+                            await send_alert(
+                                cur_alert_token,
+                                cur_alert_chat_id,
+                                f"⚠️ <b>Message Pin Failed</b>\n\n"
+                                f"Message <code>{pinned_msg_id}</code> was pinned in source channel <code>{source_chat_id}</code>, "
+                                f"but pinning message <code>{sent_msg_id}</code> failed in destination <b>{dest_name}</b> (<code>{dest_chat_id}</code>).\n\n"
+                                f"<b>Error:</b> <code>{pin_err}</code>",
+                                alert_key=f"pin-error-{source_chat_id}-{pinned_msg_id}-{dest_chat_id}",
+                            )
+
+            return "failed" if any_failed else "success"
 
     any_failed = False
     any_deferred = False
@@ -778,6 +915,7 @@ async def process_payload(
         status = await forward_message_pipeline(
             sender, payload, processed_payload, db_path,
             dedup=dedup, hydrogram_app=hydrogram_app, relay=relay,
+            alert_token=alert_token, alert_chat_id=alert_chat_id,
         )
 
         if status == "success":
@@ -839,6 +977,7 @@ async def retry_payload(
         status = await forward_message_pipeline(
             sender, payload, processed_payload, db_path,
             dedup=dedup, hydrogram_app=hydrogram_app, relay=relay,
+            alert_token=alert_token, alert_chat_id=alert_chat_id,
         )
 
         if status == "success":
