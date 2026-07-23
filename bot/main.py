@@ -64,6 +64,7 @@ from health import HealthMonitor
 from media_relay import RelayConfig, ensure_relay_chat, resolve_relay_config
 from telegram_sender import TelegramBotSender, TelegramFloodWait
 from scheduler import make_daily_report_factory
+from alerts import send_alert, AlertBotCommandListener
 
 logger = logging.getLogger(__name__)
 
@@ -345,8 +346,23 @@ def make_channel_sync_factory(
                     app, source_chat_id, redis_client, message_queue, bot_start_time
                 )
             except Exception as e:
-                logger.error(f"Channel sync error: {e}", exc_info=True)
     return channel_sync
+
+
+def make_alert_listener_factory(ctx: WorkerContext, health_monitor, redis_client):
+    """Factory for the interactive Alert Bot command listener task."""
+    async def alert_listener():
+        listener = AlertBotCommandListener(
+            token=ctx.alert_token,
+            chat_id=ctx.alert_chat_id,
+            health_monitor=health_monitor,
+            config=ctx.config,
+            queue_mgr=ctx.queue_mgr,
+            redis_client=redis_client,
+            shutdown_event=shutdown_event,
+        )
+        await listener.start_listening()
+    return alert_listener
 
 
 
@@ -894,8 +910,18 @@ async def main():
         name="silence-watchdog",
     ))
 
+    if settings.alert_bot_token and settings.alert_chat_id:
+        tasks.append(asyncio.create_task(
+            supervised_task(
+                "alert-listener",
+                make_alert_listener_factory(ctx, health_monitor, redis_client),
+            ),
+            name="alert-listener",
+        ))
+
     logger.info(
         f"Workers running: {settings.worker_count} processors, album-flush, retry, health, overflow-drainer"
+        + (", alert-listener" if settings.alert_bot_token and settings.alert_chat_id else "")
         + (", daily-report" if settings.daily_report_enabled else "")
         + (f", silence-watchdog (PTS-audited, {settings.listener_silence_timeout}s threshold)" if settings.listener_silence_timeout > 0 else "")
     )

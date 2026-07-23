@@ -1,5 +1,7 @@
-"""Telegram alert delivery for operational failures and daily reports."""
+"""Telegram alert delivery for operational failures, daily reports, and interactive admin control."""
 
+import asyncio
+import json
 import logging
 import time
 from typing import Dict, Optional
@@ -135,3 +137,229 @@ async def send_photo(
         except Exception as e:
             logger.error(f"Failed to send alert photo: {e}")
             raise
+
+
+class AlertBotCommandListener:
+    """
+    Interactive polling listener for the Alert Bot (ALERT_BOT_TOKEN).
+    Allows the owner (ALERT_CHAT_ID) to send commands:
+      /status or /health - On-demand health check diagnostic report
+      /stats or /metrics - Real-time forwarding & queue metrics
+      /reload            - Instant config hot-reload (YAML files)
+      /retry             - Trigger retry of failed queue messages
+      /deadletter        - Inspect and optionally clear dead-letter queue
+      /help              - Command menu
+    """
+
+    def __init__(
+        self,
+        token: str,
+        chat_id: int,
+        health_monitor,
+        config,
+        queue_mgr,
+        redis_client,
+        shutdown_event: asyncio.Event,
+    ):
+        self.token = token
+        self.chat_id = chat_id
+        self.health_monitor = health_monitor
+        self.config = config
+        self.queue_mgr = queue_mgr
+        self.redis = redis_client
+        self.shutdown_event = shutdown_event
+        self.offset = 0
+
+    async def start_listening(self):
+        if not self.token or not self.chat_id:
+            logger.info("Alert bot command listener disabled (missing token/chat_id)")
+            return
+
+        logger.info("Alert bot command listener started (accepting commands from owner)")
+        url = f"https://api.telegram.org/bot{self.token}/getUpdates"
+
+        async with aiohttp.ClientSession() as session:
+            while not self.shutdown_event.is_set():
+                try:
+                    payload = {
+                        "offset": self.offset,
+                        "timeout": 5,
+                        "allowed_updates": ["message"],
+                    }
+                    async with session.post(
+                        url, json=payload, timeout=aiohttp.ClientTimeout(total=10)
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            for update in data.get("result", []):
+                                self.offset = update["update_id"] + 1
+                                msg = update.get("message", {})
+                                from_chat_id = msg.get("chat", {}).get("id")
+
+                                # Security check: only process messages from the authorized ALERT_CHAT_ID owner
+                                if from_chat_id == self.chat_id and msg.get("text"):
+                                    await self._handle_command(msg["text"].strip(), session)
+                        else:
+                            await asyncio.sleep(2)
+                except asyncio.CancelledError:
+                    return
+                except Exception as e:
+                    logger.error(f"Alert bot command listener error: {e}")
+                    await asyncio.sleep(2)
+
+    async def _reply(self, text: str, session: aiohttp.ClientSession):
+        send_url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+        payload = {
+            "chat_id": self.chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+        }
+        try:
+            async with session.post(
+                send_url, json=payload, timeout=aiohttp.ClientTimeout(total=10)
+            ):
+                pass
+        except Exception as e:
+            logger.error(f"Failed to reply to alert command: {e}")
+
+    async def _handle_command(self, cmd_text: str, session: aiohttp.ClientSession):
+        cmd = cmd_text.split()[0].lower()
+        # Strip bot username suffix if command sent in group e.g. /status@bot_name
+        cmd = cmd.split("@")[0]
+
+        if cmd in ("/status", "/health"):
+            await self._cmd_status(session)
+        elif cmd in ("/stats", "/metrics"):
+            await self._cmd_stats(session)
+        elif cmd == "/reload":
+            await self._cmd_reload(session)
+        elif cmd == "/retry":
+            await self._cmd_retry(session)
+        elif cmd == "/deadletter":
+            await self._cmd_deadletter(session)
+        elif cmd == "/clear_deadletter":
+            await self._cmd_clear_deadletter(session)
+        elif cmd in ("/help", "/start"):
+            await self._cmd_help(session)
+
+    async def _cmd_status(self, session: aiohttp.ClientSession):
+        results = await self.health_monitor.run_all_checks()
+        passed_count = sum(1 for r in results if r.passed)
+        total = len(results)
+
+        lines = [
+            f"🏥 <b>System Health Report</b> ({passed_count}/{total} Passed)\n"
+        ]
+
+        for r in results:
+            icon = "🟢" if r.passed else (
+                "🔴" if r.level == "critical" else "🟠"
+            )
+            msg_str = f" — <code>{r.message}</code>" if r.message else ""
+            lines.append(f"{icon} <b>{r.name}</b>{msg_str}")
+
+        lines.append(f"\n🕒 <i>{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}</i>")
+        await self._reply("\n".join(lines), session)
+
+    async def _cmd_stats(self, session: aiohttp.ClientSession):
+        depths = await self.queue_mgr.get_queue_depths()
+        overflow_depth = await self.redis.llen("listener:overflow")
+
+        sent_24h = 0
+        failed_24h = 0
+        try:
+            import aiosqlite
+
+            async with aiosqlite.connect(self.health_monitor.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                c1 = await db.execute(
+                    "SELECT COUNT(*) as cnt FROM message_destinations WHERE status = 'sent' AND sent_at >= datetime('now', '-1 day')"
+                )
+                r1 = await c1.fetchone()
+                sent_24h = r1["cnt"] if r1 else 0
+
+                c2 = await db.execute(
+                    "SELECT COUNT(*) as cnt FROM message_destinations WHERE status = 'failed' AND sent_at >= datetime('now', '-1 day')"
+                )
+                r2 = await c2.fetchone()
+                failed_24h = r2["cnt"] if r2 else 0
+        except Exception:
+            pass
+
+        total_24h = sent_24h + failed_24h
+        rate_24h = (sent_24h / total_24h * 100.0) if total_24h > 0 else 100.0
+
+        msg = (
+            f"📊 <b>Telegram Forwarder Metrics</b>\n\n"
+            f"<blockquote><b>24h Deliveries:</b> <code>{sent_24h}</code> sent / <code>{failed_24h}</code> failed (<b>{rate_24h:.1f}%</b> success)\n"
+            f"<b>Messages Queue:</b> <code>{depths.get('messages', 0)}</code>\n"
+            f"<b>Albums Queue:</b> <code>{depths.get('albums', 0)}</code>\n"
+            f"<b>Overflow Queue:</b> <code>{overflow_depth}</code>\n"
+            f"<b>Retry Queue:</b> <code>{depths.get('failed', 0)}</code>\n"
+            f"<b>Deferred Queue:</b> <code>{depths.get('deferred', 0)}</code>\n"
+            f"<b>Dead Letter Queue:</b> <code>{depths.get('dead_letter', 0)}</code></blockquote>\n\n"
+            f"🕒 <i>{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}</i>"
+        )
+        await self._reply(msg, session)
+
+    async def _cmd_reload(self, session: aiohttp.ClientSession):
+        self.config._load_channels()
+        self.config._load_replacements()
+        dest_count = len(self.config.get_active_destinations())
+        rules_count = len(self.config.settings.replacement_rules)
+        msg = (
+            f"⚙️ <b>Config Reloaded</b>\n\n"
+            f"<blockquote><b>Active Destinations:</b> <code>{dest_count}</code>\n"
+            f"<b>Replacement Rules:</b> <code>{rules_count}</code></blockquote>"
+        )
+        await self._reply(msg, session)
+
+    async def _cmd_retry(self, session: aiohttp.ClientSession):
+        count = await self.redis.llen(self.queue_mgr.QUEUE_FAILED)
+        msg = f"🔄 <b>Retry Triggered</b>\n\n<blockquote><code>{count}</code> message(s) in failed queue awaiting worker retry.</blockquote>"
+        await self._reply(msg, session)
+
+    async def _cmd_deadletter(self, session: aiohttp.ClientSession):
+        count = await self.redis.llen(self.queue_mgr.QUEUE_DEAD_LETTER)
+        if count == 0:
+            await self._reply(
+                "🟢 <b>Dead Letter Queue</b>\n\n<blockquote>No messages in dead letter queue.</blockquote>",
+                session,
+            )
+            return
+
+        items = await self.redis.lrange(self.queue_mgr.QUEUE_DEAD_LETTER, -5, -1)
+        lines = [f"🟠 <b>Dead Letter Queue</b> (Total: <code>{count}</code>)\n"]
+        lines.append("Recent items:")
+
+        for raw in items:
+            try:
+                payload = json.loads(raw)
+                mid = payload.get("message_id", payload.get("media_group_id", "?"))
+                err = payload.get("_last_error", "Unknown error")
+                lines.append(f"• ID <code>{mid}</code>: <i>{err[:80]}</i>")
+            except Exception:
+                pass
+
+        lines.append("\nUse /clear_deadletter to clear all dead-letter items.")
+        await self._reply("\n".join(lines), session)
+
+    async def _cmd_clear_deadletter(self, session: aiohttp.ClientSession):
+        cleared = await self.queue_mgr.clear_dead_letter()
+        await self._reply(
+            f"🗑️ <b>Dead Letter Cleared</b>\n\n<blockquote>Removed <code>{cleared}</code> item(s) from dead-letter queue.</blockquote>",
+            session,
+        )
+
+    async def _cmd_help(self, session: aiohttp.ClientSession):
+        msg = (
+            f"🤖 <b>Telegram Forwarder Control Commands</b>\n\n"
+            f"• /status — Real-time health diagnostic report\n"
+            f"• /stats — Delivery volume, success rates & queue depths\n"
+            f"• /reload — Reload channels.yml & replacements.yml\n"
+            f"• /retry — Trigger retry of failed queue\n"
+            f"• /deadletter — Inspect dead-letter items\n"
+            f"• /clear_deadletter — Clear dead-letter queue\n"
+            f"• /help — Show this command menu"
+        )
+        await self._reply(msg, session)
