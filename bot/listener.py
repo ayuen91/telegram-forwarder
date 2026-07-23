@@ -629,7 +629,7 @@ async def forward_message_pipeline(
 
         await db.commit()
 
-    if relay_message_ids and not any_failed and not any_deferred:
+    if relay_message_ids and not any_deferred:
         await cleanup_relay(pyrogram_app, relay, relay_message_ids)
 
     if any_deferred:

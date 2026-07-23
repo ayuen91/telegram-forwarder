@@ -8,6 +8,7 @@ so the sender bot never needs access to the source channel.
 
 import asyncio
 import logging
+import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Union
 
@@ -225,20 +226,45 @@ class TelegramBotSender:
             payload["reply_parameters"] = reply_params
 
         last_error = None
-        for attempt in range(4):
+        for attempt in range(6):
             try:
                 result = await self._call("copyMessage", payload)
                 return int(result["message_id"])
             except RuntimeError as e:
                 last_error = e
-                if "message to copy not found" in str(e).lower() and attempt < 3:
-                    wait = 1.0 * (attempt + 1)
+                err_msg = str(e).lower()
+                if (
+                    "message to copy not found" in err_msg
+                    or "media_empty" in err_msg
+                    or "photo_invalid" in err_msg
+                ) and attempt < 5:
+                    wait = 0.5 * (2**attempt)
                     logger.warning(
-                        f"copyMessage not found (from={from_chat_id}, id={message_id}), "
-                        f"retry in {wait}s"
+                        f"copyMessage delay/not found (from={from_chat_id}, id={message_id}), "
+                        f"retry in {wait:.1f}s (attempt {attempt + 1}/6)"
                     )
                     await asyncio.sleep(wait)
                     continue
+
+                if (
+                    "cannot_use_custom_emoji" in err_msg
+                    or "cannot use custom emoji" in err_msg
+                    or "failed to parse entities" in err_msg
+                    or "entity_bounds_invalid" in err_msg
+                ) and payload.get("caption"):
+                    logger.warning(
+                        f"copyMessage custom emoji/entity error ({e}) — "
+                        "retrying with sanitized caption and parse_mode=None"
+                    )
+                    sanitized = re.sub(r'<tg-emoji[^>]*>(.*?)</tg-emoji>', r'\1', payload["caption"], flags=re.DOTALL)
+                    sanitized = re.sub(r'<emoji[^>]*>(.*?)</emoji>', r'\1', sanitized, flags=re.DOTALL)
+                    payload["caption"] = re.sub(r'<[^>]+>', '', sanitized)
+                    payload.pop("parse_mode", None)
+                    try:
+                        result = await self._call("copyMessage", payload)
+                        return int(result["message_id"])
+                    except Exception:
+                        pass
                 raise
 
         raise last_error  # pragma: no cover
@@ -510,23 +536,17 @@ class TelegramBotSender:
             for item, sent_id in zip(sorted_items, sent_ids):
                 original = item.get("caption") or ""
                 processed = item.get("processed_caption") or original
-                try:
-                    if processed != original:
-                        # Replacement fired — send plain text (entities were dropped)
+                if processed != original:
+                    try:
+                        # Replacement fired — send plain text
                         await self.edit_message_caption(
                             dest_chat_id, sent_id, processed,
                             parse_mode=None,
                         )
-                    elif item.get("caption_html") and item.get("caption_html") != original:
-                        # No replacement but caption has formatting — push HTML
-                        await self.edit_message_caption(
-                            dest_chat_id, sent_id, item["caption_html"],
-                            parse_mode="HTML",
+                    except Exception as cap_err:
+                        logger.warning(
+                            f"Failed to edit caption for album item {sent_id} in {dest_chat_id}: {cap_err}"
                         )
-                except Exception as cap_err:
-                    logger.warning(
-                        f"Failed to edit caption for album item {sent_id} in {dest_chat_id}: {cap_err}"
-                    )
 
             reply_mappings = [
                 (int(item["message_id"]), sent_id)
@@ -608,10 +628,11 @@ class TelegramBotSender:
             if processed_payload.get("caption_changed"):
                 # Replacement changed the caption — use plain processed text
                 caption = processed_payload.get("processed_caption") or payload.get("caption")
-            elif payload.get("caption_html"):
-                # No replacement — forward the HTML caption so formatting is kept
-                caption = payload.get("caption_html")
-                parse_mode = "HTML"
+                parse_mode = None
+            # When caption_changed is False, caption=None & parse_mode=None are passed to copy_message.
+            # This allows Telegram Bot API copyMessage to preserve the original relay message's
+            # caption AND all native entities (premium emojis, custom emojis, animated emojis, etc.)
+            # directly without running the HTML parser or hitting CANNOT_USE_CUSTOM_EMOJI errors.
             sent_id = await self.copy_message(
                 chat_id=dest_chat_id,
                 from_chat_id=relay_chat_id,

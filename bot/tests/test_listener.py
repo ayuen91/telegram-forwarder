@@ -93,8 +93,8 @@ class TestSourceMessageIds:
     def test_contact_does_not_need_relay(self):
         assert _source_message_ids({"type": "contact", "message_id": 13}) == []
 
-    def test_text_does_not_need_relay(self):
-        assert _source_message_ids({"type": "text", "message_id": 14}) == []
+    def test_text_needs_relay(self):
+        assert _source_message_ids({"type": "text", "message_id": 14}) == [14]
 
     def test_photo_needs_relay(self):
         assert _source_message_ids({"type": "photo", "message_id": 15}) == [15]

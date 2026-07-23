@@ -11,6 +11,7 @@ class TestAlbumBuffer:
 
     def setup_method(self):
         self.mock_redis = AsyncMock()
+        self.mock_redis.exists.return_value = False
 
     @pytest.mark.asyncio
     async def test_first_item_sets_timer(self):
