@@ -14,12 +14,37 @@ _last_alert: Dict[str, float] = {}
 COOLDOWN_SECONDS = 300  # 5 minutes per alert key
 
 
+def get_admin_inline_keyboard() -> Dict[str, Any]:
+    """Build standard admin inline keyboard buttons for Alert Bot commands."""
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "🟢 Status", "callback_data": "cmd_status"},
+                {"text": "📊 Stats", "callback_data": "cmd_stats"},
+            ],
+            [
+                {"text": "⚙️ Reload", "callback_data": "cmd_reload"},
+                {"text": "🔄 Retry", "callback_data": "cmd_retry"},
+            ],
+            [
+                {"text": "🟠 Dead Letter", "callback_data": "cmd_deadletter"},
+                {"text": "🗑️ Clear DLQ", "callback_data": "cmd_clear_deadletter"},
+            ],
+            [
+                {"text": "ℹ️ Help Menu", "callback_data": "cmd_help"},
+            ],
+        ]
+    }
+
+
 async def send_alert(
     token: str,
     chat_id: int,
     message: str,
     alert_key: str = "",
     cooldown: int = COOLDOWN_SECONDS,
+    reply_markup: Optional[Dict[str, Any]] = None,
+    include_control_buttons: bool = True,
 ) -> None:
     if not token or not chat_id:
         return
@@ -30,7 +55,11 @@ async def send_alert(
         return
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
+    payload: Dict[str, Any] = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+    elif include_control_buttons:
+        payload["reply_markup"] = get_admin_inline_keyboard()
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -142,13 +171,13 @@ async def send_photo(
 class AlertBotCommandListener:
     """
     Interactive polling listener for the Alert Bot (ALERT_BOT_TOKEN).
-    Allows the owner (ALERT_CHAT_ID) to send commands:
+    Allows the owner (ALERT_CHAT_ID) to send commands or tap inline keyboard buttons:
       /status or /health - On-demand health check diagnostic report
       /stats or /metrics - Real-time forwarding & queue metrics
       /reload            - Instant config hot-reload (YAML files)
       /retry             - Trigger retry of failed queue messages
       /deadletter        - Inspect and optionally clear dead-letter queue
-      /help              - Command menu
+      /help              - Interactive command menu
     """
 
     def __init__(
@@ -170,21 +199,47 @@ class AlertBotCommandListener:
         self.shutdown_event = shutdown_event
         self.offset = 0
 
+    async def _setup_bot_commands(self, session: aiohttp.ClientSession):
+        """Register native Telegram bot commands so the '/' command menu appears in chat."""
+        url = f"https://api.telegram.org/bot{self.token}/setMyCommands"
+        commands = [
+            {"command": "status", "description": "Real-time health diagnostic report"},
+            {"command": "stats", "description": "Delivery volume & queue depths"},
+            {"command": "reload", "description": "Reload YAML configurations"},
+            {"command": "retry", "description": "Trigger retry of failed queue"},
+            {"command": "deadletter", "description": "Inspect dead-letter queue"},
+            {"command": "clear_deadletter", "description": "Clear dead-letter queue"},
+            {"command": "help", "description": "Show interactive control menu"},
+        ]
+        payload = {"commands": commands}
+        try:
+            async with session.post(
+                url, json=payload, timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                if resp.status == 200:
+                    logger.info("Alert bot command menu registered with Telegram (setMyCommands)")
+                else:
+                    body = await resp.text()
+                    logger.warning(f"Failed to set my commands: {resp.status} - {body[:100]}")
+        except Exception as e:
+            logger.warning(f"Failed to register bot commands menu: {e}")
+
     async def start_listening(self):
         if not self.token or not self.chat_id:
             logger.info("Alert bot command listener disabled (missing token/chat_id)")
             return
 
-        logger.info("Alert bot command listener started (accepting commands from owner)")
+        logger.info("Alert bot command listener started (accepting commands & callback buttons from owner)")
         url = f"https://api.telegram.org/bot{self.token}/getUpdates"
 
         async with aiohttp.ClientSession() as session:
+            await self._setup_bot_commands(session)
             while not self.shutdown_event.is_set():
                 try:
                     payload = {
                         "offset": self.offset,
                         "timeout": 5,
-                        "allowed_updates": ["message"],
+                        "allowed_updates": ["message", "callback_query"],
                     }
                     async with session.post(
                         url, json=payload, timeout=aiohttp.ClientTimeout(total=10)
@@ -193,12 +248,27 @@ class AlertBotCommandListener:
                             data = await resp.json()
                             for update in data.get("result", []):
                                 self.offset = update["update_id"] + 1
-                                msg = update.get("message", {})
-                                from_chat_id = msg.get("chat", {}).get("id")
 
-                                # Security check: only process messages from the authorized ALERT_CHAT_ID owner
-                                if from_chat_id == self.chat_id and msg.get("text"):
-                                    await self._handle_command(msg["text"].strip(), session)
+                                if "message" in update:
+                                    msg = update["message"]
+                                    from_chat_id = msg.get("chat", {}).get("id")
+
+                                    # Security check: only process messages from authorized owner
+                                    if from_chat_id == self.chat_id and msg.get("text"):
+                                        await self._handle_command(msg["text"].strip(), session)
+
+                                elif "callback_query" in update:
+                                    cb = update["callback_query"]
+                                    from_user_id = cb.get("from", {}).get("id")
+                                    cb_chat_id = cb.get("message", {}).get("chat", {}).get("id")
+
+                                    if from_user_id == self.chat_id or cb_chat_id == self.chat_id:
+                                        cb_id = cb.get("id")
+                                        cb_data = cb.get("data", "")
+                                        if cb_id:
+                                            await self._answer_callback_query(cb_id, session)
+                                        if cb_data:
+                                            await self._handle_callback(cb_data, session)
                         else:
                             await asyncio.sleep(2)
                 except asyncio.CancelledError:
@@ -207,12 +277,42 @@ class AlertBotCommandListener:
                     logger.error(f"Alert bot command listener error: {e}")
                     await asyncio.sleep(2)
 
-    async def _reply(self, text: str, session: aiohttp.ClientSession):
+    async def _answer_callback_query(self, callback_query_id: str, session: aiohttp.ClientSession, text: str = ""):
+        url = f"https://api.telegram.org/bot{self.token}/answerCallbackQuery"
+        payload = {"callback_query_id": callback_query_id}
+        if text:
+            payload["text"] = text
+        try:
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=5)):
+                pass
+        except Exception as e:
+            logger.debug(f"Failed to answer callback query: {e}")
+
+    async def _handle_callback(self, cb_data: str, session: aiohttp.ClientSession):
+        cmd_map = {
+            "cmd_status": self._cmd_status,
+            "cmd_stats": self._cmd_stats,
+            "cmd_reload": self._cmd_reload,
+            "cmd_retry": self._cmd_retry,
+            "cmd_deadletter": self._cmd_deadletter,
+            "cmd_clear_deadletter": self._cmd_clear_deadletter,
+            "cmd_help": self._cmd_help,
+        }
+        handler = cmd_map.get(cb_data)
+        if handler:
+            await handler(session)
+        else:
+            await self._handle_command(cb_data, session)
+
+    async def _reply(self, text: str, session: aiohttp.ClientSession, reply_markup: Optional[Dict[str, Any]] = None):
         send_url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+        if reply_markup is None:
+            reply_markup = get_admin_inline_keyboard()
         payload = {
             "chat_id": self.chat_id,
             "text": text,
             "parse_mode": "HTML",
+            "reply_markup": reply_markup,
         }
         try:
             async with session.post(
@@ -353,13 +453,15 @@ class AlertBotCommandListener:
 
     async def _cmd_help(self, session: aiohttp.ClientSession):
         msg = (
-            f"🤖 <b>Telegram Forwarder Control Commands</b>\n\n"
-            f"• /status — Real-time health diagnostic report\n"
-            f"• /stats — Delivery volume, success rates & queue depths\n"
-            f"• /reload — Reload channels.yml & replacements.yml\n"
-            f"• /retry — Trigger retry of failed queue\n"
-            f"• /deadletter — Inspect dead-letter items\n"
-            f"• /clear_deadletter — Clear dead-letter queue\n"
-            f"• /help — Show this command menu"
+            f"🤖 <b>Telegram Forwarder Control Panel</b>\n\n"
+            f"Select any action from the interactive inline keyboard buttons below, "
+            f"or type slash commands directly:\n\n"
+            f"• 🟢 <code>/status</code> — Real-time health diagnostic report\n"
+            f"• 📊 <code>/stats</code> — Delivery volume, success rates & queue depths\n"
+            f"• ⚙️ <code>/reload</code> — Reload channels.yml & replacements.yml\n"
+            f"• 🔄 <code>/retry</code> — Trigger retry of failed queue\n"
+            f"• 🟠 <code>/deadletter</code> — Inspect dead-letter items\n"
+            f"• 🗑️ <code>/clear_deadletter</code> — Clear dead-letter queue\n"
+            f"• ℹ️ <code>/help</code> — Show this control menu"
         )
-        await self._reply(msg, session)
+        await self._reply(msg, session, reply_markup=get_admin_inline_keyboard())
