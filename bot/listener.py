@@ -33,18 +33,12 @@ except ImportError:
 try:
     from hydrogram.raw.types import UpdatesTooLong
 except (ImportError, ModuleNotFoundError, RuntimeError):
-    try:
-        from pyrogram.raw.types import UpdatesTooLong
-    except (ImportError, ModuleNotFoundError, RuntimeError):
-        UpdatesTooLong = None
+    UpdatesTooLong = None
 
 try:
     from hydrogram.raw.types import UpdateChannelTooLong
 except (ImportError, ModuleNotFoundError, RuntimeError):
-    try:
-        from pyrogram.raw.types import UpdateChannelTooLong
-    except (ImportError, ModuleNotFoundError, RuntimeError):
-        UpdateChannelTooLong = None  # Graceful fallback
+    UpdateChannelTooLong = None  # Graceful fallback
 from hydrogram.types import Message
 
 from media_relay import RelayConfig, relay_to_bot, cleanup_relay
@@ -365,7 +359,7 @@ async def forward_message_pipeline(
     processed_payload: Dict[str, Any],
     db_path: str,
     dedup=None,
-    pyrogram_app: Optional[Client] = None,
+    hydrogram_app: Optional[Client] = None,
     relay: Optional[RelayConfig] = None,
 ) -> ForwardStatus:
     """
@@ -396,8 +390,8 @@ async def forward_message_pipeline(
     # Media relay only when not using native forward from origin channel
     source_ids_for_relay = [] if use_native else _source_message_ids(payload)
     if source_ids_for_relay:
-        if not pyrogram_app or relay is None:
-            logger.error("Media forwarding requires Pyrogram client and relay config")
+        if not hydrogram_app or relay is None:
+            logger.error("Media forwarding requires Hydrogram client and relay config")
             return "failed"
 
         # Guard against MESSAGE_IDS_EMPTY: drop zeroes / None before relay
@@ -417,7 +411,7 @@ async def forward_message_pipeline(
 
         try:
             relay_message_ids = await relay_to_bot(
-                pyrogram_app,
+                hydrogram_app,
                 sender,
                 source_chat_id,
                 valid_relay_ids,
@@ -554,7 +548,7 @@ async def forward_message_pipeline(
                             msg_type=msg_type,
                             dest_chat_id=dest_chat_id,
                             reply_to_id=reply_to_id,
-                            pyrogram_app=pyrogram_app,
+                            hydrogram_app=hydrogram_app,
                             relay=relay,
                             source_chat_id=source_chat_id,
                             relay_message_ids_holder=relay_holder,
@@ -630,7 +624,7 @@ async def forward_message_pipeline(
         await db.commit()
 
     if relay_message_ids and not any_deferred:
-        await cleanup_relay(pyrogram_app, relay, relay_message_ids)
+        await cleanup_relay(hydrogram_app, relay, relay_message_ids)
 
     if any_deferred:
         return "defer"
@@ -666,7 +660,7 @@ async def _deliver_with_native_fallback(
     msg_type: str,
     dest_chat_id: int,
     reply_to_id,
-    pyrogram_app: Optional[Client],
+    hydrogram_app: Optional[Client],
     relay: Optional[RelayConfig],
     source_chat_id: int,
     relay_message_ids_holder: list,
@@ -682,12 +676,12 @@ async def _deliver_with_native_fallback(
     relay_ids = relay_message_ids_holder[0]
     source_ids = _source_message_ids(fallback_payload)
     if source_ids and not relay_ids:
-        if not pyrogram_app or relay is None:
+        if not hydrogram_app or relay is None:
             raise RuntimeError(
-                "Native forward fallback needs Pyrogram/relay for media"
+                "Native forward fallback needs Hydrogram/relay for media"
             )
         relay_ids = await relay_to_bot(
-            pyrogram_app,
+            hydrogram_app,
             sender,
             source_chat_id,
             source_ids,
@@ -747,7 +741,7 @@ async def process_payload(
     db_path: str,
     config,
     dedup=None,
-    pyrogram_app: Optional[Client] = None,
+    hydrogram_app: Optional[Client] = None,
     relay: Optional[RelayConfig] = None,
     alert_token: str = "",
     alert_chat_id: int = 0,
@@ -783,7 +777,7 @@ async def process_payload(
 
         status = await forward_message_pipeline(
             sender, payload, processed_payload, db_path,
-            dedup=dedup, pyrogram_app=pyrogram_app, relay=relay,
+            dedup=dedup, hydrogram_app=hydrogram_app, relay=relay,
         )
 
         if status == "success":
@@ -817,7 +811,7 @@ async def retry_payload(
     db_path: str,
     config,
     dedup=None,
-    pyrogram_app: Optional[Client] = None,
+    hydrogram_app: Optional[Client] = None,
     relay: Optional[RelayConfig] = None,
     alert_token: str = "",
     alert_chat_id: int = 0,
@@ -844,7 +838,7 @@ async def retry_payload(
 
         status = await forward_message_pipeline(
             sender, payload, processed_payload, db_path,
-            dedup=dedup, pyrogram_app=pyrogram_app, relay=relay,
+            dedup=dedup, hydrogram_app=hydrogram_app, relay=relay,
         )
 
         if status == "success":
@@ -879,7 +873,7 @@ async def message_worker(
     sender: TelegramBotSender,
     db_path: str,
     config,
-    pyrogram_app: Optional[Client] = None,
+    hydrogram_app: Optional[Client] = None,
     relay: Optional[RelayConfig] = None,
     alert_token: str = "",
     alert_chat_id: int = 0,
@@ -912,7 +906,7 @@ async def message_worker(
                     await process_payload(
                         sender, queue_manager, webhook_sender, flush_result,
                         db_path, config, dedup=dedup,
-                        pyrogram_app=pyrogram_app, relay=relay,
+                        hydrogram_app=hydrogram_app, relay=relay,
                         alert_token=alert_token, alert_chat_id=alert_chat_id,
                     )
                 logger.debug(
@@ -923,7 +917,7 @@ async def message_worker(
                 status = await process_payload(
                     sender, queue_manager, webhook_sender, payload,
                     db_path, config, dedup=dedup,
-                    pyrogram_app=pyrogram_app, relay=relay,
+                    hydrogram_app=hydrogram_app, relay=relay,
                     alert_token=alert_token, alert_chat_id=alert_chat_id,
                 )
                 if status == "success":

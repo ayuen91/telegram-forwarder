@@ -80,7 +80,7 @@ class WorkerContext:
     queue_mgr: QueueManager
     dedup: Deduplication
     album_buf: AlbumBuffer
-    pyrogram_app: Client
+    hydrogram_app: Client
     relay: RelayConfig
     config: object
     db_path: str
@@ -244,7 +244,7 @@ def make_worker_factory(worker_id: int, queue: asyncio.Queue, ctx: WorkerContext
             sender=ctx.sender,
             db_path=ctx.db_path,
             config=ctx.config,
-            pyrogram_app=ctx.pyrogram_app,
+            hydrogram_app=ctx.hydrogram_app,
             relay=ctx.relay,
             alert_token=ctx.alert_token,
             alert_chat_id=ctx.alert_chat_id,
@@ -262,7 +262,7 @@ def make_album_flush_factory(ctx: WorkerContext):
                     await process_payload(
                         ctx.sender, ctx.queue_mgr, ctx.webhook, album_payload,
                         ctx.db_path, ctx.config, dedup=ctx.dedup,
-                        pyrogram_app=ctx.pyrogram_app, relay=ctx.relay,
+                        hydrogram_app=ctx.hydrogram_app, relay=ctx.relay,
                         alert_token=ctx.alert_token, alert_chat_id=ctx.alert_chat_id,
                     )
             except Exception as e:
@@ -280,7 +280,7 @@ def make_retry_factory(ctx: WorkerContext):
                     await retry_payload(
                         ctx.sender, ctx.queue_mgr, ctx.webhook, payload,
                         ctx.db_path, ctx.config, dedup=ctx.dedup,
-                        pyrogram_app=ctx.pyrogram_app, relay=ctx.relay,
+                        hydrogram_app=ctx.hydrogram_app, relay=ctx.relay,
                         alert_token=ctx.alert_token, alert_chat_id=ctx.alert_chat_id,
                     )
                     await asyncio.sleep(1)
@@ -291,7 +291,7 @@ def make_retry_factory(ctx: WorkerContext):
                     await retry_payload(
                         ctx.sender, ctx.queue_mgr, ctx.webhook, payload,
                         ctx.db_path, ctx.config, dedup=ctx.dedup,
-                        pyrogram_app=ctx.pyrogram_app, relay=ctx.relay,
+                        hydrogram_app=ctx.hydrogram_app, relay=ctx.relay,
                         alert_token=ctx.alert_token, alert_chat_id=ctx.alert_chat_id,
                     )
                 else:
@@ -662,7 +662,7 @@ async def main():
         redis_client=redis_client,
         webhook_sender=webhook,
         config=config,
-        pyrogram_app=app,
+        hydrogram_app=app,
         bot_sender=sender,
         alert_bot_token=settings.alert_bot_token,
         alert_chat_id=settings.alert_chat_id,
@@ -779,7 +779,7 @@ async def main():
         queue_mgr=queue_mgr,
         dedup=dedup,
         album_buf=album_buf,
-        pyrogram_app=app,
+        hydrogram_app=app,
         relay=relay,
         config=config,
         db_path=settings.db_path,
@@ -796,7 +796,7 @@ async def main():
             await process_payload(
                 ctx.sender, ctx.queue_mgr, ctx.webhook, album_payload,
                 ctx.db_path, ctx.config, dedup=ctx.dedup,
-                pyrogram_app=ctx.pyrogram_app, relay=ctx.relay,
+                hydrogram_app=ctx.hydrogram_app, relay=ctx.relay,
                 alert_token=ctx.alert_token, alert_chat_id=ctx.alert_chat_id,
             )
         except Exception as e:

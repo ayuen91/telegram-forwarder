@@ -576,13 +576,22 @@ class TelegramBotSender:
                     reply_to_message_id=reply_to_message_id,
                 )
             elif text_changed:
-                # Replacement altered the text — send plain processed text.
-                # Formatting cannot be preserved after arbitrary text edits.
-                text = processed_payload.get("processed_text") or payload.get("text") or ""
+                # Replacement altered the text — send processed HTML text if available.
+                text = (
+                    processed_payload.get("processed_text_html")
+                    or processed_payload.get("processed_text")
+                    or payload.get("text_html")
+                    or payload.get("text")
+                    or ""
+                )
+                use_html = bool(
+                    processed_payload.get("processed_text_html")
+                    or payload.get("text_html")
+                )
                 sent_id = await self.send_message(
                     chat_id=dest_chat_id,
                     text=text,
-                    parse_mode=None,
+                    parse_mode="HTML" if use_html else None,
                     reply_to_message_id=reply_to_message_id,
                 )
             else:
@@ -626,9 +635,14 @@ class TelegramBotSender:
             caption = None
             parse_mode = None
             if processed_payload.get("caption_changed"):
-                # Replacement changed the caption — use plain processed text
-                caption = processed_payload.get("processed_caption") or payload.get("caption")
-                parse_mode = None
+                # Replacement changed the caption — send processed HTML caption if available
+                caption = (
+                    processed_payload.get("processed_caption_html")
+                    or processed_payload.get("processed_caption")
+                    or payload.get("caption_html")
+                    or payload.get("caption")
+                )
+                parse_mode = "HTML" if (processed_payload.get("processed_caption_html") or payload.get("caption_html")) else None
             # When caption_changed is False, caption=None & parse_mode=None are passed to copy_message.
             # This allows Telegram Bot API copyMessage to preserve the original relay message's
             # caption AND all native entities (premium emojis, custom emojis, animated emojis, etc.)

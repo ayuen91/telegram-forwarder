@@ -11,31 +11,43 @@ def apply_replacements(
     """
     Apply word replacement rules to *text*.
 
+    Safely handles both plain text and HTML-formatted text (text_html / caption_html).
+    Splits content by HTML tags so replacements apply only to text between tags,
+    preserving all HTML entities, bold/italic markup, links, and custom emoji tags.
+
     Returns (new_text, changed) where changed is True if any rule fired.
-    Formatting is now carried as HTML strings (text_html / caption_html) so
-    entity-offset tracking is no longer required here.
     """
     if not text or not rules:
         return text, False
 
-    result = text
+    # Split text into HTML tags and non-tag text tokens
+    tokens = re.split(r"(<[^>]+>)", text)
+    result_tokens = []
 
-    for rule in rules:
-        pattern = rule.get("pattern")
-        if not pattern:
-            continue
-        replacement = rule.get("replacement", "")
-
-        if rule.get("is_regex"):
-            try:
-                new_result = re.sub(pattern, replacement, result, flags=re.MULTILINE)
-            except re.error:
-                continue
-            result = new_result
+    for token in tokens:
+        if token.startswith("<") and token.endswith(">"):
+            # HTML tag — preserve as-is
+            result_tokens.append(token)
         else:
-            result = result.replace(pattern, replacement)
+            # Text content between tags — apply replacement rules
+            chunk = token
+            for rule in rules:
+                pattern = rule.get("pattern")
+                if not pattern:
+                    continue
+                replacement = rule.get("replacement", "")
 
-    return result, result != text
+                if rule.get("is_regex"):
+                    try:
+                        chunk = re.sub(pattern, replacement, chunk, flags=re.MULTILINE)
+                    except re.error:
+                        continue
+                else:
+                    chunk = chunk.replace(pattern, replacement)
+            result_tokens.append(chunk)
+
+    new_text = "".join(result_tokens)
+    return new_text, new_text != text
 
 
 def build_processed_payload(payload: Dict[str, Any], config) -> Dict[str, Any]:
@@ -61,10 +73,12 @@ def build_processed_payload(payload: Dict[str, Any], config) -> Dict[str, Any]:
         any_caption_changed = False
         for item in payload.get("items", []):
             item_copy = dict(item)
-            caption = item_copy.get("caption")
-            if caption:
-                processed, changed = apply_replacements(caption, rules)
+            caption_src = item_copy.get("caption_html") or item_copy.get("caption")
+            if caption_src:
+                processed, changed = apply_replacements(caption_src, rules)
                 item_copy["processed_caption"] = processed
+                if item_copy.get("caption_html"):
+                    item_copy["processed_caption_html"] = processed
                 if changed:
                     any_caption_changed = True
             items.append(item_copy)
@@ -76,17 +90,21 @@ def build_processed_payload(payload: Dict[str, Any], config) -> Dict[str, Any]:
         }
 
     result = dict(payload)
-    text = payload.get("text")
-    caption = payload.get("caption")
+    text_src = payload.get("text_html") or payload.get("text")
+    caption_src = payload.get("caption_html") or payload.get("caption")
 
-    if text:
-        processed_text, changed = apply_replacements(text, rules)
+    if text_src:
+        processed_text, changed = apply_replacements(text_src, rules)
         result["processed_text"] = processed_text
+        if payload.get("text_html"):
+            result["processed_text_html"] = processed_text
         result["text_changed"] = changed
 
-    if caption:
-        processed_caption, changed = apply_replacements(caption, rules)
+    if caption_src:
+        processed_caption, changed = apply_replacements(caption_src, rules)
         result["processed_caption"] = processed_caption
+        if payload.get("caption_html"):
+            result["processed_caption_html"] = processed_caption
         result["caption_changed"] = changed
 
     result["destinations"] = destinations

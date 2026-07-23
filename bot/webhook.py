@@ -112,50 +112,65 @@ class WebhookSender:
 
         message_id = payload.get("message_id", payload.get("media_group_id", "unknown"))
 
-        try:
-            session = await self._get_session()
-            async with session.post(url, data=payload_json.encode("utf-8"), headers=headers) as resp:
-                body_text = await resp.text()
-                if 200 <= resp.status < 300:
-                    if not body_text or not body_text.strip():
-                        logger.warning(
-                            f"Webhook empty response: {endpoint} message_id={message_id} "
-                            f"(likely n8n HMAC rejection)"
-                        )
-                        return None
-                    try:
-                        result = json.loads(body_text)
-                        if not result.get("destinations"):
+        for attempt in range(2):
+            try:
+                session = await self._get_session()
+                async with session.post(url, data=payload_json.encode("utf-8"), headers=headers) as resp:
+                    body_text = await resp.text()
+                    if 200 <= resp.status < 300:
+                        if not body_text or not body_text.strip():
                             logger.warning(
-                                f"Webhook missing destinations: {endpoint} message_id={message_id}"
+                                f"Webhook empty response: {endpoint} message_id={message_id} "
+                                f"(likely n8n HMAC rejection)"
                             )
                             return None
-                        logger.info(
-                            f"Webhook sent: {endpoint} message_id={message_id} status={resp.status}"
-                        )
-                        return result
-                    except json.JSONDecodeError:
+                        try:
+                            result = json.loads(body_text)
+                            if not result.get("destinations"):
+                                logger.warning(
+                                    f"Webhook missing destinations: {endpoint} message_id={message_id}"
+                                )
+                                return None
+                            logger.info(
+                                f"Webhook sent: {endpoint} message_id={message_id} status={resp.status}"
+                            )
+                            return result
+                        except json.JSONDecodeError:
+                            logger.warning(
+                                f"Webhook non-JSON response: {endpoint} message_id={message_id} "
+                                f"body={body_text[:200]}"
+                            )
+                            return None
+                    elif resp.status in (502, 503, 504) and attempt == 0:
                         logger.warning(
-                            f"Webhook non-JSON response: {endpoint} message_id={message_id} "
-                            f"body={body_text[:200]}"
+                            f"Webhook transient server error ({resp.status}) for {message_id} — retrying in 500ms..."
+                        )
+                        await asyncio.sleep(0.5)
+                        continue
+                    else:
+                        logger.warning(
+                            f"Webhook failed: {endpoint} message_id={message_id} "
+                            f"status={resp.status} body={body_text[:200]}"
                         )
                         return None
-                else:
-                    logger.warning(
-                        f"Webhook failed: {endpoint} message_id={message_id} "
-                        f"status={resp.status} body={body_text[:200]}"
-                    )
-                    return None
 
-        except aiohttp.ClientConnectorError as e:
-            logger.warning(f"Webhook connection failed ({endpoint}): {e}")
-            return None
-        except aiohttp.ClientError as e:
-            logger.warning(f"Webhook error ({endpoint}): {e}")
-            return None
-        except Exception as e:
-            logger.error(f"Unexpected webhook error ({endpoint}): {e}", exc_info=True)
-            return None
+            except (aiohttp.ClientConnectorError, aiohttp.ServerTimeoutError, asyncio.TimeoutError) as e:
+                if attempt == 0:
+                    logger.warning(
+                        f"Webhook connector/timeout error ({e}) for {message_id} — retrying in 500ms..."
+                    )
+                    await asyncio.sleep(0.5)
+                    continue
+                logger.warning(f"Webhook connection failed ({endpoint}): {e}")
+                return None
+            except aiohttp.ClientError as e:
+                logger.warning(f"Webhook error ({endpoint}): {e}")
+                return None
+            except Exception as e:
+                logger.error(f"Unexpected webhook error ({endpoint}): {e}", exc_info=True)
+                return None
+
+        return None
 
     async def is_reachable(self) -> bool:
         """

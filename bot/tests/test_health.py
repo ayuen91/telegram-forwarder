@@ -27,7 +27,7 @@ class TestStartupSelfTest:
     async def test_dead_letter_does_not_block_startup(self):
         monitor = _monitor()
         monitor.run_all_checks = AsyncMock(return_value=[
-            HealthCheckResult(name="pyrogram_session", passed=True, level="critical"),
+            HealthCheckResult(name="hydrogram_session", passed=True, level="critical"),
             HealthCheckResult(name="sender_bot", passed=True, level="critical"),
             HealthCheckResult(name="redis", passed=True, level="critical"),
             HealthCheckResult(name="sqlite", passed=True, level="critical"),
@@ -45,7 +45,7 @@ class TestStartupSelfTest:
     async def test_critical_failure_blocks_startup(self):
         monitor = _monitor()
         monitor.run_all_checks = AsyncMock(return_value=[
-            HealthCheckResult(name="pyrogram_session", passed=False, level="critical", message="down"),
+            HealthCheckResult(name="hydrogram_session", passed=False, level="critical", message="down"),
             HealthCheckResult(name="dead_letter_queue", passed=False, level="high", message="1 msg"),
         ])
 

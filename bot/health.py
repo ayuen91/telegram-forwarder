@@ -46,15 +46,12 @@ class HealthMonitor:
 
     HEARTBEAT_FILE = Path("/app/data/heartbeat")
 
-    # Cooldown: don't repeat same alert type within this many seconds
-    ALERT_COOLDOWN = 900  # 15 minutes
-
     def __init__(
         self,
         redis_client: aioredis.Redis,
         webhook_sender,  # WebhookSender instance
         config,  # Config instance
-        pyrogram_app=None,  # Hydrogram Client instance (set after app starts)
+        hydrogram_app=None,  # Hydrogram Client instance (set after app starts)
         bot_sender=None,  # TelegramBotSender instance
         alert_bot_token: str = "",
         alert_chat_id: int = 0,
@@ -63,14 +60,16 @@ class HealthMonitor:
         self.redis = redis_client
         self.webhook_sender = webhook_sender
         self.config = config
-        self.pyrogram_app = pyrogram_app
+        self.hydrogram_app = hydrogram_app
         self.bot_sender = bot_sender
         self.alert_bot_token = alert_bot_token
         self.alert_chat_id = alert_chat_id
         self.db_path = db_path
 
-        # Track last alert time per alert type (for cooldown)
-        self._last_alert_times: dict = {}
+        # State transition tracking per health check (name -> passed)
+        # Alerts fire ONCE on True -> False (failure) and ONCE on False -> True (recovery).
+        # Eliminates repeated 15-minute alert spam while issues persist.
+        self._last_check_status: dict = {}
 
         # Reactive failure rate tracking
         self._last_failure_rate: Optional[float] = None
@@ -81,7 +80,7 @@ class HealthMonitor:
         results = []
 
         # 1. User account status (listen)
-        results.append(await self._check_pyrogram())
+        results.append(await self._check_hydrogram_session())
 
         # 2. Listener liveness — session connected AND updates flowing
         results.append(await self._check_listener_liveness())
@@ -139,11 +138,8 @@ class HealthMonitor:
         # Step 3: Write heartbeat file (Docker HEALTHCHECK reads this)
         self._write_heartbeat()
 
-        # Step 4: Alert on failures
-        failed = [r for r in results if not r.passed]
-        if failed:
-            for result in failed:
-                await self._send_alert_with_cooldown(result)
+        # Step 4: Evaluate state transitions for alerting (fire once on change)
+        await self._process_state_transition_alerts(results)
 
         # Log summary
         passed = sum(1 for r in results if r.passed)
@@ -189,27 +185,27 @@ class HealthMonitor:
 
     # ── Individual health checks ──────────────────────────────────────
 
-    async def _check_pyrogram(self) -> HealthCheckResult:
-        """Check if Pyrogram user account is accessible."""
+    async def _check_hydrogram_session(self) -> HealthCheckResult:
+        """Check if Hydrogram user account is accessible."""
         try:
-            if self.pyrogram_app and self.pyrogram_app.is_connected:
-                me = await self.pyrogram_app.get_me()
+            if self.hydrogram_app and self.hydrogram_app.is_connected:
+                me = await self.hydrogram_app.get_me()
                 return HealthCheckResult(
-                    name="pyrogram_session",
+                    name="hydrogram_session",
                     passed=True,
                     level="critical",
                     message=f"Connected as {me.first_name} (ID: {me.id})",
                 )
             else:
                 return HealthCheckResult(
-                    name="pyrogram_session",
+                    name="hydrogram_session",
                     passed=False,
                     level="critical",
-                    message="Pyrogram client not connected",
+                    message="Hydrogram client not connected",
                 )
         except Exception as e:
             return HealthCheckResult(
-                name="pyrogram_session",
+                name="hydrogram_session",
                 passed=False,
                 level="critical",
                 message=f"get_me() failed: {e}",
@@ -217,26 +213,12 @@ class HealthMonitor:
 
     async def _check_listener_liveness(self) -> HealthCheckResult:
         """
-        Check that the listener is receiving message updates.
+        Check that the listener is receiving message updates (monitored 24/7).
 
         Reads listener:last_received_at to determine silence duration.
         The silence watchdog in main.py handles the actual PTS audit and
-        client recycling — this check just reports the current state.
-
-        Only fires during activity hours (08:00–23:59 UTC+3).
+        client recycling — this check reports the current state.
         """
-        import datetime
-        now_utc3 = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=3)
-        if not (8 <= now_utc3.hour < 24):
-            return HealthCheckResult(
-                name="listener_liveness",
-                passed=True,
-                level="high",
-                message="Outside activity hours — liveness check skipped",
-            )
-
-        # 90 min threshold — the watchdog recycles at 15 min, so this only
-        # fires if the recycle itself failed to restore updates.
         SILENCE_THRESHOLD = 5400
 
         try:
@@ -263,8 +245,6 @@ class HealthMonitor:
                     message=f"Last message received {silence_min:.1f} min ago",
                 )
 
-            # Threshold exceeded — report as a problem.
-            # The silence watchdog handles the actual PTS audit and recycle.
             return HealthCheckResult(
                 name="listener_liveness",
                 passed=False,
@@ -272,41 +252,54 @@ class HealthMonitor:
                 message=(
                     f"No messages for {silence_min:.0f} min "
                     f"(threshold={SILENCE_THRESHOLD // 60} min). "
-                    "The silence watchdog is handling recovery. "
-                    "If this persists >3 h, re-authenticate the session."
+                    "The silence watchdog is handling recovery."
                 ),
             )
         except Exception as e:
             return HealthCheckResult(
                 name="listener_liveness",
-                passed=True,  # Don't block on Redis errors
+                passed=False,
                 level="high",
-                message=f"Liveness check skipped: {e}",
+                message=f"Liveness query error: {e}",
             )
 
     async def _check_sender_bot(self) -> HealthCheckResult:
-        """Check if the sender bot token is valid."""
+        """Check if the sender bot token is valid and relay channel accessible."""
         try:
-            if self.bot_sender:
-                me = await self.bot_sender.get_me()
+            if not self.bot_sender:
                 return HealthCheckResult(
                     name="sender_bot",
-                    passed=True,
+                    passed=False,
                     level="critical",
-                    message=f"Bot @{me.get('username', 'unknown')} (ID: {me.get('id')})",
+                    message="Sender bot not configured",
                 )
+
+            me = await self.bot_sender.get_me()
+            bot_name = f"@{me.get('username', 'unknown')} (ID: {me.get('id')})"
+
+            # Also verify relay channel permissions if configured
+            relay_id = getattr(self.config.settings, "relay_channel_id", 0)
+            if relay_id:
+                if not await self.bot_sender.verify_bot_access(relay_id):
+                    return HealthCheckResult(
+                        name="sender_bot",
+                        passed=False,
+                        level="critical",
+                        message=f"{bot_name} cannot access relay channel ({relay_id})",
+                    )
+
             return HealthCheckResult(
                 name="sender_bot",
-                passed=False,
+                passed=True,
                 level="critical",
-                message="Sender bot not configured",
+                message=f"Bot {bot_name} connected & verified",
             )
         except Exception as e:
             return HealthCheckResult(
                 name="sender_bot",
                 passed=False,
                 level="critical",
-                message=f"getMe() failed: {e}",
+                message=f"getMe() / relay access check failed: {e}",
             )
 
     async def _check_redis(self) -> HealthCheckResult:
@@ -337,21 +330,23 @@ class HealthMonitor:
             )
 
     async def _check_queue_depth(self) -> HealthCheckResult:
-        """Warn if message queue is building up."""
+        """Warn if message queue (including overflow) is building up."""
         try:
             depth = await self.redis.llen("queue:messages")
             album_depth = await self.redis.llen("queue:albums")
-            total = depth + album_depth
+            overflow_depth = await self.redis.llen("listener:overflow")
+            total = depth + album_depth + overflow_depth
             passed = total < 100
+            msg = f"Queue depth: {total} (messages={depth}, albums={album_depth}, overflow={overflow_depth})"
             return HealthCheckResult(
                 name="queue_depth",
                 passed=passed,
                 level="high",
-                message=f"Queue depth: {total} (messages={depth}, albums={album_depth})",
+                message=msg,
             )
         except Exception as e:
             return HealthCheckResult(
-                name="queue_depth", passed=False, level="high", message=str(e)
+                name="queue_depth", passed=False, level="high", message=f"Redis error: {e}"
             )
 
     async def _check_failed_queue(self) -> HealthCheckResult:
@@ -366,7 +361,7 @@ class HealthMonitor:
             )
         except Exception as e:
             return HealthCheckResult(
-                name="failed_queue", passed=True, level="medium", message=str(e)
+                name="failed_queue", passed=False, level="medium", message=f"Redis error: {e}"
             )
 
     async def _check_dead_letter(self) -> HealthCheckResult:
@@ -383,7 +378,7 @@ class HealthMonitor:
             )
         except Exception as e:
             return HealthCheckResult(
-                name="dead_letter_queue", passed=True, level="high", message=str(e)
+                name="dead_letter_queue", passed=False, level="high", message=f"Redis error: {e}"
             )
 
     async def _check_sqlite(self) -> HealthCheckResult:
@@ -413,21 +408,18 @@ class HealthMonitor:
             )
         except Exception as e:
             return HealthCheckResult(
-                name="disk_space", passed=True, level="high", message=str(e)
+                name="disk_space", passed=False, level="high", message=f"Disk check error: {e}"
             )
 
     async def _check_queue_surge(self) -> HealthCheckResult:
         """
-        Early warning when the pending queue climbs above 50 messages.
-
-        _check_queue_depth fires at 100 which is already too late —
-        by then the event loop is saturated. Firing at 50 gives the
-        operator time to investigate before messages start dropping.
+        Early warning when pending queue (including overflow) climbs above 50 messages.
         """
         try:
             depth = await self.redis.llen("queue:messages")
             album_depth = await self.redis.llen("queue:albums")
-            total = depth + album_depth
+            overflow_depth = await self.redis.llen("listener:overflow")
+            total = depth + album_depth + overflow_depth
             if total >= 100:
                 # Let _check_queue_depth handle the critical case
                 return HealthCheckResult(
@@ -440,12 +432,12 @@ class HealthMonitor:
                 level="high",
                 message=(
                     f"Queue building up: {total} messages pending "
-                    "(threshold=50). Delivery may be slowing down."
+                    f"(messages={depth}, albums={album_depth}, overflow={overflow_depth}). Delivery may be slowing down."
                 ) if not passed else "",
             )
         except Exception as e:
             return HealthCheckResult(
-                name="queue_surge", passed=True, level="high", message=str(e)
+                name="queue_surge", passed=False, level="high", message=f"Redis error: {e}"
             )
 
     async def _check_sustained_failure_rate(self) -> HealthCheckResult:
@@ -592,17 +584,30 @@ class HealthMonitor:
         except Exception as e:
             logger.error(f"Failed to write heartbeat: {e}")
 
-    # ── Alert delivery ────────────────────────────────────────────────
+    # ── Alert delivery (State-Transition Based) ───────────────────────
 
-    async def _send_alert_with_cooldown(self, result: HealthCheckResult):
-        """Send alert via Telegram bot, respecting cooldown per alert type."""
-        now = time.time()
-        last_time = self._last_alert_times.get(result.name, 0)
+    async def _process_state_transition_alerts(self, results: List[HealthCheckResult]):
+        """
+        Evaluate health check results and fire alerts ONLY on state transitions.
+        
+        - Fire ONCE when check transitions from Passed -> Failed (or first run failure)
+        - Fire ONCE when check transitions from Failed -> Passed (Recovery)
+        - Never repeat alerts every cycle / 15 min for persistent failures
+        """
+        for result in results:
+            prev_passed = self._last_check_status.get(result.name)
 
-        if now - last_time < self.ALERT_COOLDOWN:
-            logger.debug(f"Alert cooldown active for {result.name}, skipping")
-            return
+            if not result.passed and (prev_passed is None or prev_passed is True):
+                # State Transition: PASSED -> FAILED
+                await self._send_failure_alert(result)
+            elif result.passed and prev_passed is False:
+                # State Transition: FAILED -> PASSED (Recovery)
+                await self._send_recovery_alert(result)
 
+            self._last_check_status[result.name] = result.passed
+
+    async def _send_failure_alert(self, result: HealthCheckResult):
+        """Send alert on health check failure transition."""
         level_emoji = {"critical": "🔴", "high": "🟠", "medium": "🟡"}.get(
             result.level, "⚪"
         )
@@ -613,7 +618,7 @@ class HealthMonitor:
             details_html = f"<blockquote expandable><pre>{html.escape(result.message)}</pre></blockquote>"
 
         message = (
-            f"{level_emoji} <b>ALERT: Telegram Forwarder</b>\n\n"
+            f"{level_emoji} <b>ALERT: Health Check Failed</b>\n\n"
             f"<blockquote><b>Component:</b> <code>{result.name}</code>\n"
             f"<b>Status:</b> FAILED\n"
             f"<b>Severity:</b> <code>{result.level.upper()}</code></blockquote>\n"
@@ -623,10 +628,24 @@ class HealthMonitor:
 
         try:
             await self._send_telegram_alert(message)
-            self._last_alert_times[result.name] = now
-            logger.info(f"Alert sent for {result.name}")
+            logger.info(f"State-transition failure alert sent for {result.name}")
         except Exception as e:
-            logger.error(f"Failed to send alert for {result.name}: {e}")
+            logger.error(f"Failed to send failure alert for {result.name}: {e}")
+
+    async def _send_recovery_alert(self, result: HealthCheckResult):
+        """Send alert on health check recovery transition."""
+        message = (
+            f"🟢 <b>RECOVERY: Component Restored</b>\n\n"
+            f"<blockquote><b>Component:</b> <code>{result.name}</code>\n"
+            f"<b>Status:</b> PASSED ✓</blockquote>\n"
+            f"🕒 <i>{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}</i>"
+        )
+
+        try:
+            await self._send_telegram_alert(message)
+            logger.info(f"State-transition recovery alert sent for {result.name}")
+        except Exception as e:
+            logger.error(f"Failed to send recovery alert for {result.name}: {e}")
 
     async def _send_telegram_alert(self, message: str):
         """Send a message via the alert bot to your personal chat."""
