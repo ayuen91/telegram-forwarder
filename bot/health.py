@@ -72,6 +72,10 @@ class HealthMonitor:
         # Track last alert time per alert type (for cooldown)
         self._last_alert_times: dict = {}
 
+        # Reactive failure rate tracking
+        self._last_failure_rate: Optional[float] = None
+        self._last_failure_state: str = "normal"
+
     async def run_all_checks(self) -> List[HealthCheckResult]:
         """Run all health checks and return results."""
         results = []
@@ -446,20 +450,24 @@ class HealthMonitor:
 
     async def _check_sustained_failure_rate(self) -> HealthCheckResult:
         """
-        Real-time delivery failure rate check.
+        Real-time delivery failure rate check with reactive alerts.
 
-        Queries the last 20 message delivery attempts from SQLite and fires
-        a CRITICAL alert if more than 20% failed. This catches delivery
-        degradation mid-day without waiting for the 08:00 daily report.
-
-        Only runs when there has been recent activity (at least 10 attempts
-        in the last 20 rows) to avoid false positives during quiet periods.
+        Queries the last 50 message delivery attempts from SQLite and calculates
+        the failure percentage. Immediately sends an alert when:
+          - Failure rate crosses warning (20%) or critical (50%) threshold
+          - Failure rate recovers back below warning threshold (<20%)
+          - Failure rate changes by 10% or more (increase or decrease)
         """
-        SAMPLE_SIZE = 20
-        FAILURE_THRESHOLD = 0.20  # 20%
-        MIN_SAMPLE = 10           # need at least 10 attempts to be meaningful
+        settings = getattr(self.config, "settings", self.config)
+        sample_size = getattr(settings, "failure_rate_sample_size", 50)
+        min_samples = getattr(settings, "failure_rate_min_samples", 10)
+        warning_thresh = getattr(settings, "failure_rate_warning_threshold", 0.20)
+        critical_thresh = getattr(settings, "failure_rate_critical_threshold", 0.50)
+        delta_thresh = getattr(settings, "failure_rate_delta_threshold", 0.10)
+
         try:
             import aiosqlite
+
             async with aiosqlite.connect(self.db_path) as db:
                 db.row_factory = aiosqlite.Row
                 cursor = await db.execute(
@@ -468,38 +476,103 @@ class HealthMonitor:
                     ORDER BY id DESC
                     LIMIT ?
                     """,
-                    (SAMPLE_SIZE,),
+                    (sample_size,),
                 )
                 rows = await cursor.fetchall()
 
-            if len(rows) < MIN_SAMPLE:
+            if len(rows) < min_samples:
                 return HealthCheckResult(
                     name="delivery_failure_rate",
                     passed=True,
                     level="high",
-                    message="Not enough samples yet",
+                    message=f"Not enough samples yet ({len(rows)}/{min_samples})",
                 )
 
             failed = sum(1 for r in rows if r["status"] == "failed")
             rate = failed / len(rows)
+            pct = rate * 100.0
 
-            if rate > FAILURE_THRESHOLD:
-                return HealthCheckResult(
-                    name="delivery_failure_rate",
-                    passed=False,
-                    level="high",
-                    message=(
-                        f"{failed}/{len(rows)} recent deliveries failed "
-                        f"({rate * 100:.0f}% failure rate, threshold={int(FAILURE_THRESHOLD * 100)}%). "
-                        "Check destination channels and bot permissions."
-                    ),
+            # Determine current failure severity state
+            if rate >= critical_thresh:
+                curr_state = "critical"
+            elif rate >= warning_thresh:
+                curr_state = "warning"
+            else:
+                curr_state = "normal"
+
+            prev_rate = self._last_failure_rate
+            prev_state = self._last_failure_state
+
+            trigger_alert = False
+            alert_msg = ""
+            alert_emoji = "🟠"
+
+            # 1. Recovery transition (degraded/critical -> normal)
+            if prev_state in ("warning", "critical") and curr_state == "normal":
+                trigger_alert = True
+                alert_msg = (
+                    f"🟢 <b>Delivery Failure Rate Recovered</b>\n\n"
+                    f"<blockquote><b>Failure Rate:</b> <code>{pct:.1f}%</code> ({failed}/{len(rows)})\n"
+                    f"<b>Status:</b> Recovered (Back below {warning_thresh * 100:.0f}% threshold)</blockquote>"
                 )
+            # 2. State transition into Warning or Critical
+            elif prev_state == "normal" and curr_state in ("warning", "critical"):
+                trigger_alert = True
+                alert_emoji = "🔴" if curr_state == "critical" else "🟠"
+                alert_msg = (
+                    f"{alert_emoji} <b>Delivery Failure Rate Warning</b>\n\n"
+                    f"<blockquote><b>Failure Rate:</b> <code>{pct:.1f}%</code> ({failed}/{len(rows)})\n"
+                    f"<b>Threshold:</b> <code>{warning_thresh * 100:.0f}%</code>\n"
+                    f"<b>Severity:</b> <code>{curr_state.upper()}</code></blockquote>"
+                )
+            elif prev_state == "warning" and curr_state == "critical":
+                trigger_alert = True
+                alert_msg = (
+                    f"🔴 <b>CRITICAL: Delivery Failure Rate Spike</b>\n\n"
+                    f"<blockquote><b>Failure Rate:</b> <code>{pct:.1f}%</code> ({failed}/{len(rows)})\n"
+                    f"<b>Threshold:</b> <code>{critical_thresh * 100:.0f}%</code>\n"
+                    f"<b>Severity:</b> CRITICAL</blockquote>"
+                )
+            # 3. Delta change trigger (>= 10% change increase or decrease)
+            elif prev_rate is not None:
+                delta = rate - prev_rate
+                if abs(delta) >= delta_thresh:
+                    trigger_alert = True
+                    prev_pct = prev_rate * 100.0
+                    if delta > 0:
+                        alert_msg = (
+                            f"📈 <b>Delivery Failure Rate Increased</b>\n\n"
+                            f"<blockquote><b>Change:</b> <code>{prev_pct:.1f}% ➔ {pct:.1f}%</code> (+{delta * 100:.1f}%)\n"
+                            f"<b>Recent Failures:</b> {failed}/{len(rows)}\n"
+                            f"<b>Status:</b> <code>{curr_state.upper()}</code></blockquote>"
+                        )
+                    else:
+                        alert_msg = (
+                            f"📉 <b>Delivery Failure Rate Improved</b>\n\n"
+                            f"<blockquote><b>Change:</b> <code>{prev_pct:.1f}% ➔ {pct:.1f}%</code> ({delta * 100:.1f}%)\n"
+                            f"<b>Recent Failures:</b> {failed}/{len(rows)}\n"
+                            f"<b>Status:</b> <code>{curr_state.upper()}</code></blockquote>"
+                        )
 
+            # Update tracked state
+            self._last_failure_rate = rate
+            self._last_failure_state = curr_state
+
+            if trigger_alert:
+                try:
+                    await self._send_telegram_alert(alert_msg)
+                    self._last_alert_times["delivery_failure_rate"] = time.time()
+                except Exception as alert_err:
+                    logger.error(
+                        f"Failed to send reactive failure rate alert: {alert_err}"
+                    )
+
+            passed = curr_state == "normal"
             return HealthCheckResult(
                 name="delivery_failure_rate",
-                passed=True,
-                level="high",
-                message=f"{failed}/{len(rows)} failed ({rate * 100:.0f}%)",
+                passed=passed,
+                level="critical" if curr_state == "critical" else "high",
+                message=f"{failed}/{len(rows)} recent deliveries failed ({pct:.1f}%)",
             )
         except Exception as e:
             return HealthCheckResult(

@@ -124,6 +124,13 @@ class Settings:
     daily_report_timezone: str = "Etc/GMT-3"  # fixed UTC+3
     daily_report_run_on_start: bool = False
 
+    # Failure Rate Alerting (reactive thresholds)
+    failure_rate_warning_threshold: float = 0.20
+    failure_rate_critical_threshold: float = 0.50
+    failure_rate_delta_threshold: float = 0.10    # 10% change trigger
+    failure_rate_sample_size: int = 50            # last 50 messages
+    failure_rate_min_samples: int = 10
+
     # Hot-reloadable (from YAML)
     destinations: List[Destination] = field(default_factory=list)
     replacement_rules: List[ReplacementRule] = field(default_factory=list)
@@ -202,6 +209,12 @@ class Config:
         s.daily_report_hour = _env_int("DAILY_REPORT_HOUR", 8)
         s.daily_report_timezone = os.getenv("DAILY_REPORT_TIMEZONE", "Etc/GMT-3")
         s.daily_report_run_on_start = _env_bool("DAILY_REPORT_RUN_ON_START", False)
+
+        s.failure_rate_warning_threshold = _env_float("FAILURE_RATE_WARNING_THRESHOLD", 0.20)
+        s.failure_rate_critical_threshold = _env_float("FAILURE_RATE_CRITICAL_THRESHOLD", 0.50)
+        s.failure_rate_delta_threshold = _env_float("FAILURE_RATE_DELTA_THRESHOLD", 0.10)
+        s.failure_rate_sample_size = _env_int("FAILURE_RATE_SAMPLE_SIZE", 50)
+        s.failure_rate_min_samples = _env_int("FAILURE_RATE_MIN_SAMPLES", 10)
 
         if not s.api_id:
             raise EnvironmentError("Missing required environment variable: API_ID")
