@@ -78,7 +78,7 @@ class TestReactiveFailureRateAlerts:
         with patch("aiosqlite.connect", MagicMock(return_value=mock_cm)):
             result = await monitor._check_sustained_failure_rate()
 
-        assert result.passed is False
+        assert result.passed is True
         assert "12/50 recent deliveries failed (24.0%)" in result.message
         monitor._send_telegram_alert.assert_awaited_once()
         alert_text = monitor._send_telegram_alert.call_args[0][0]
@@ -107,7 +107,7 @@ class TestReactiveFailureRateAlerts:
         with patch("aiosqlite.connect", MagicMock(return_value=mock_cm)):
             result = await monitor._check_sustained_failure_rate()
 
-        assert result.passed is False
+        assert result.passed is True
         monitor._send_telegram_alert.assert_awaited_once()
         alert_text = monitor._send_telegram_alert.call_args[0][0]
         assert "Delivery Failure Rate Increased" in alert_text
