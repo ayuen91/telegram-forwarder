@@ -47,12 +47,14 @@ class AlbumBuffer:
         Returns:
             List of payloads if album is full (10 items), None otherwise.
         """
-        group_id = payload.get("media_group_id")
+        group_id = str(payload.get("media_group_id")) if payload.get("media_group_id") is not None else None
         message_id = payload.get("message_id")
 
         if not group_id:
             logger.warning(f"Message {message_id} has no media_group_id, skipping album buffer")
             return None
+
+        payload["media_group_id"] = group_id
 
         sent_key = f"{self.ALBUM_PREFIX}:{group_id}:sent"
         if await self.redis.exists(sent_key):
@@ -150,20 +152,33 @@ class AlbumBuffer:
 
             # Parse items and sort by message_id to preserve order
             items = []
+            reply_to_id = None
             for msg_id, payload_json in raw_items.items():
                 payload = json.loads(payload_json)
+                if payload.get("media_group_id") is not None:
+                    payload["media_group_id"] = str(payload["media_group_id"])
+                if reply_to_id is None and payload.get("reply_to_message_id"):
+                    try:
+                        reply_to_id = int(payload["reply_to_message_id"])
+                    except (ValueError, TypeError):
+                        reply_to_id = payload["reply_to_message_id"]
                 items.append(payload)
 
             items.sort(key=lambda x: x.get("message_id", 0))
 
+            if reply_to_id is not None:
+                for item in items:
+                    if not item.get("reply_to_message_id"):
+                        item["reply_to_message_id"] = reply_to_id
+
             album_payload = {
                 "type": "album",
-                "media_group_id": group_id,
+                "media_group_id": str(group_id),
                 "chat_id": items[0].get("chat_id"),
                 "item_count": len(items),
                 "items": items,
                 "timestamp": items[0].get("timestamp"),
-                "reply_to_message_id": items[0].get("reply_to_message_id"),
+                "reply_to_message_id": reply_to_id,
             }
 
             # Write a 'sent' marker BEFORE deleting keys so that any item

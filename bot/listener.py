@@ -167,10 +167,10 @@ def normalize_message(message: Message) -> Optional[Dict[str, Any]]:
         # HTML-encoded text that carries all Telegram formatting entities
         "text_html": text_html,
         "caption_html": caption_html,
-        "media_group_id": message.media_group_id,
+        "media_group_id": str(message.media_group_id) if message.media_group_id is not None else None,
         "has_media": msg_type in _RELAY_MEDIA_TYPES or msg_type == "album",
         "has_protected_content": has_protected_content,
-        "reply_to_message_id": message.reply_to_message_id if message.reply_to_message_id else None,
+        "reply_to_message_id": int(message.reply_to_message_id) if message.reply_to_message_id else None,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 

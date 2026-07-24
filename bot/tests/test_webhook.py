@@ -128,3 +128,37 @@ class TestWebhookSignature:
         assert verify_signature(py_json, sig, self.SECRET) is True
         assert verify_signature(js_style, sig, self.SECRET) is True
 
+    def test_album_64bit_media_group_id_signature(self):
+        """Album payload with 64-bit media_group_id string must maintain precision in HMAC."""
+        payload = {
+            "type": "album",
+            "media_group_id": "14279032192983933",
+            "chat_id": -1001774783341,
+            "item_count": 2,
+            "items": [
+                {
+                    "message_id": 29964,
+                    "chat_id": -1001774783341,
+                    "type": "photo",
+                    "caption": "Test caption",
+                    "media_group_id": "14279032192983933",
+                    "reply_to_message_id": 29960,
+                },
+                {
+                    "message_id": 29965,
+                    "chat_id": -1001774783341,
+                    "type": "photo",
+                    "media_group_id": "14279032192983933",
+                    "reply_to_message_id": 29960,
+                },
+            ],
+            "reply_to_message_id": 29960,
+        }
+        py_json = _canonical_json(payload)
+        js_style = stable_stringify(payload)
+        assert py_json == js_style
+        sig = generate_signature(payload, self.SECRET)
+        assert verify_signature(py_json, sig, self.SECRET) is True
+        assert verify_signature(js_style, sig, self.SECRET) is True
+
+

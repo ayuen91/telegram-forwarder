@@ -154,3 +154,25 @@ class TestAlbumBuffer:
         assert result is not None
         ids = [item["message_id"] for item in result["items"]]
         assert ids == [10, 20, 30]
+
+    @pytest.mark.asyncio
+    async def test_reply_to_message_id_resolution(self):
+        """Album flush should resolve reply_to_message_id across all items and cast group_id to str."""
+        from album_buffer import AlbumBuffer
+
+        self.mock_redis.hgetall.return_value = {
+            "10": json.dumps({"message_id": 10, "chat_id": -100, "type": "photo", "reply_to_message_id": None, "media_group_id": 14279032192983933}),
+            "20": json.dumps({"message_id": 20, "chat_id": -100, "type": "photo", "reply_to_message_id": 29960, "media_group_id": 14279032192983933}),
+        }
+
+        buffer = AlbumBuffer(self.mock_redis, buffer_seconds=2.0)
+        result = await buffer._flush_album(14279032192983933)
+
+        assert result is not None
+        assert result["media_group_id"] == "14279032192983933"
+        assert result["reply_to_message_id"] == 29960
+        assert result["items"][0]["reply_to_message_id"] == 29960
+        assert result["items"][0]["media_group_id"] == "14279032192983933"
+        assert result["items"][1]["reply_to_message_id"] == 29960
+        assert result["items"][1]["media_group_id"] == "14279032192983933"
+

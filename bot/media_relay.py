@@ -201,6 +201,26 @@ async def _relay_via_download(
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+def _get_download_path(msg, temp_dir: str) -> str:
+    """Determine a safe target path with a valid file extension."""
+    ext = ".bin"
+    if getattr(msg, "photo", None):
+        ext = ".jpg"
+    elif getattr(msg, "video", None) or getattr(msg, "video_note", None) or getattr(msg, "animation", None):
+        ext = ".mp4"
+    elif getattr(msg, "audio", None):
+        ext = ".mp3"
+    elif getattr(msg, "voice", None):
+        ext = ".ogg"
+    elif getattr(msg, "sticker", None):
+        ext = ".webp"
+    elif getattr(msg, "document", None) and getattr(msg.document, "file_name", None):
+        orig_name = msg.document.file_name
+        if "." in orig_name:
+            ext = "." + orig_name.rsplit(".", 1)[-1]
+    return os.path.join(temp_dir, f"{msg.id}{ext}")
+
+
 async def _download_reupload_single(
     app: Client,
     target: int,
@@ -217,7 +237,7 @@ async def _download_reupload_single(
         return [sent.id]
 
     file_path = await app.download_media(
-        msg, file_name=os.path.join(temp_dir, f"{msg.id}_"),
+        msg, file_name=_get_download_path(msg, temp_dir),
     )
     if not file_path:
         raise RuntimeError(
@@ -267,7 +287,7 @@ async def _download_reupload_album(
     media_group = []
     for msg in messages:
         file_path = await app.download_media(
-            msg, file_name=os.path.join(temp_dir, f"{msg.id}_"),
+            msg, file_name=_get_download_path(msg, temp_dir),
         )
         if not file_path:
             logger.warning(
