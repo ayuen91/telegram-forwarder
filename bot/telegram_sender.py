@@ -75,10 +75,22 @@ class TelegramBotSender:
             return body["result"]
 
     @staticmethod
-    def _reply_params(reply_to_message_id: Optional[Union[int, str]]) -> Optional[Dict[str, Any]]:
+    def _reply_params(
+        reply_to_message_id: Optional[Union[int, str]],
+        quote: Optional[str] = None,
+        quote_parse_mode: Optional[str] = "HTML",
+        quote_position: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
         if reply_to_message_id is None:
             return None
-        return {"message_id": int(reply_to_message_id)}
+        params: Dict[str, Any] = {"message_id": int(reply_to_message_id)}
+        if quote:
+            params["quote"] = quote
+            if quote_parse_mode:
+                params["quote_parse_mode"] = quote_parse_mode
+            if quote_position is not None:
+                params["quote_position"] = int(quote_position)
+        return params
 
     # _bot_api_entities removed: formatting is now transported as an HTML
     # string (text_html / caption_html) and decoded by Telegram via
@@ -103,6 +115,9 @@ class TelegramBotSender:
         from_chat_id: Union[int, str],
         message_id: Union[int, str],
         reply_to_message_id: Optional[Union[int, str]] = None,
+        quote: Optional[str] = None,
+        quote_parse_mode: Optional[str] = "HTML",
+        quote_position: Optional[int] = None,
     ) -> int:
         """
         Forward a message preserving the 'Forwarded from' attribution.
@@ -113,7 +128,9 @@ class TelegramBotSender:
             "from_chat_id": from_chat_id,
             "message_id": int(message_id),
         }
-        reply_params = self._reply_params(reply_to_message_id)
+        reply_params = self._reply_params(
+            reply_to_message_id, quote=quote, quote_parse_mode=quote_parse_mode, quote_position=quote_position
+        )
         if reply_params:
             payload["reply_parameters"] = reply_params
 
@@ -126,6 +143,9 @@ class TelegramBotSender:
         from_chat_id: Union[int, str],
         message_ids: List[Union[int, str]],
         reply_to_message_id: Optional[Union[int, str]] = None,
+        quote: Optional[str] = None,
+        quote_parse_mode: Optional[str] = "HTML",
+        quote_position: Optional[int] = None,
     ) -> List[int]:
         """
         Forward multiple messages (e.g. album) preserving attribution.
@@ -144,7 +164,9 @@ class TelegramBotSender:
             "from_chat_id": from_chat_id,
             "message_ids": valid_ids,
         }
-        reply_params = self._reply_params(reply_to_message_id)
+        reply_params = self._reply_params(
+            reply_to_message_id, quote=quote, quote_parse_mode=quote_parse_mode, quote_position=quote_position
+        )
         if reply_params:
             payload["reply_parameters"] = reply_params
 
@@ -225,6 +247,9 @@ class TelegramBotSender:
         parse_mode: Optional[str] = "HTML",
         reply_to_message_id: Optional[Union[int, str]] = None,
         reply_markup: Optional[Dict[str, Any]] = None,
+        quote: Optional[str] = None,
+        quote_parse_mode: Optional[str] = "HTML",
+        quote_position: Optional[int] = None,
     ) -> int:
         """Copy a single message. Returns the new message_id in the destination chat."""
         payload: Dict[str, Any] = {
@@ -238,7 +263,9 @@ class TelegramBotSender:
                 payload["parse_mode"] = parse_mode
         if reply_markup is not None:
             payload["reply_markup"] = reply_markup
-        reply_params = self._reply_params(reply_to_message_id)
+        reply_params = self._reply_params(
+            reply_to_message_id, quote=quote, quote_parse_mode=quote_parse_mode, quote_position=quote_position
+        )
         if reply_params:
             payload["reply_parameters"] = reply_params
 
@@ -284,7 +311,8 @@ class TelegramBotSender:
                         pass
                 raise
 
-        raise last_error  # pragma: no cover
+        if last_error is not None:
+            raise last_error  # pragma: no cover
 
     async def copy_messages(
         self,
@@ -292,6 +320,9 @@ class TelegramBotSender:
         from_chat_id: Union[int, str],
         message_ids: List[Union[int, str]],
         reply_to_message_id: Optional[Union[int, str]] = None,
+        quote: Optional[str] = None,
+        quote_parse_mode: Optional[str] = "HTML",
+        quote_position: Optional[int] = None,
     ) -> List[int]:
         """Copy an album (media group). Returns message_ids in destination chat, in order."""
         # Validate before sending — an empty list causes MESSAGE_IDS_EMPTY
@@ -307,7 +338,9 @@ class TelegramBotSender:
             "from_chat_id": from_chat_id,
             "message_ids": valid_ids,
         }
-        reply_params = self._reply_params(reply_to_message_id)
+        reply_params = self._reply_params(
+            reply_to_message_id, quote=quote, quote_parse_mode=quote_parse_mode, quote_position=quote_position
+        )
         if reply_params:
             payload["reply_parameters"] = reply_params
 
@@ -321,6 +354,9 @@ class TelegramBotSender:
         parse_mode: Optional[str] = "HTML",
         reply_to_message_id: Optional[Union[int, str]] = None,
         reply_markup: Optional[Dict[str, Any]] = None,
+        quote: Optional[str] = None,
+        quote_parse_mode: Optional[str] = "HTML",
+        quote_position: Optional[int] = None,
     ) -> int:
         """Send a message with HTML formatting.  text should already be an HTML string."""
         payload: Dict[str, Any] = {
@@ -331,7 +367,9 @@ class TelegramBotSender:
             payload["parse_mode"] = parse_mode
         if reply_markup is not None:
             payload["reply_markup"] = reply_markup
-        reply_params = self._reply_params(reply_to_message_id)
+        reply_params = self._reply_params(
+            reply_to_message_id, quote=quote, quote_parse_mode=quote_parse_mode, quote_position=quote_position
+        )
         if reply_params:
             payload["reply_parameters"] = reply_params
 
@@ -356,6 +394,9 @@ class TelegramBotSender:
         poll: Dict[str, Any],
         reply_to_message_id: Optional[Union[int, str]] = None,
         reply_markup: Optional[Dict[str, Any]] = None,
+        quote: Optional[str] = None,
+        quote_parse_mode: Optional[str] = "HTML",
+        quote_position: Optional[int] = None,
     ) -> int:
         """Recreate a poll via sendPoll."""
         poll_type = poll.get("type", "regular")
@@ -388,7 +429,9 @@ class TelegramBotSender:
 
         if reply_markup is not None:
             payload["reply_markup"] = reply_markup
-        reply_params = self._reply_params(reply_to_message_id)
+        reply_params = self._reply_params(
+            reply_to_message_id, quote=quote, quote_parse_mode=quote_parse_mode, quote_position=quote_position
+        )
         if reply_params:
             payload["reply_parameters"] = reply_params
 
@@ -401,6 +444,9 @@ class TelegramBotSender:
         location: Dict[str, Any],
         reply_to_message_id: Optional[Union[int, str]] = None,
         reply_markup: Optional[Dict[str, Any]] = None,
+        quote: Optional[str] = None,
+        quote_parse_mode: Optional[str] = "HTML",
+        quote_position: Optional[int] = None,
     ) -> int:
         """Recreate a location pin via sendLocation."""
         payload: Dict[str, Any] = {
@@ -413,7 +459,9 @@ class TelegramBotSender:
 
         if reply_markup is not None:
             payload["reply_markup"] = reply_markup
-        reply_params = self._reply_params(reply_to_message_id)
+        reply_params = self._reply_params(
+            reply_to_message_id, quote=quote, quote_parse_mode=quote_parse_mode, quote_position=quote_position
+        )
         if reply_params:
             payload["reply_parameters"] = reply_params
 
@@ -426,6 +474,9 @@ class TelegramBotSender:
         venue: Dict[str, Any],
         reply_to_message_id: Optional[Union[int, str]] = None,
         reply_markup: Optional[Dict[str, Any]] = None,
+        quote: Optional[str] = None,
+        quote_parse_mode: Optional[str] = "HTML",
+        quote_position: Optional[int] = None,
     ) -> int:
         """Recreate a venue via sendVenue."""
         payload: Dict[str, Any] = {
@@ -444,7 +495,9 @@ class TelegramBotSender:
 
         if reply_markup is not None:
             payload["reply_markup"] = reply_markup
-        reply_params = self._reply_params(reply_to_message_id)
+        reply_params = self._reply_params(
+            reply_to_message_id, quote=quote, quote_parse_mode=quote_parse_mode, quote_position=quote_position
+        )
         if reply_params:
             payload["reply_parameters"] = reply_params
 
@@ -457,6 +510,9 @@ class TelegramBotSender:
         contact: Dict[str, Any],
         reply_to_message_id: Optional[Union[int, str]] = None,
         reply_markup: Optional[Dict[str, Any]] = None,
+        quote: Optional[str] = None,
+        quote_parse_mode: Optional[str] = "HTML",
+        quote_position: Optional[int] = None,
     ) -> int:
         """Recreate a shared contact via sendContact."""
         payload: Dict[str, Any] = {
@@ -471,7 +527,9 @@ class TelegramBotSender:
 
         if reply_markup is not None:
             payload["reply_markup"] = reply_markup
-        reply_params = self._reply_params(reply_to_message_id)
+        reply_params = self._reply_params(
+            reply_to_message_id, quote=quote, quote_parse_mode=quote_parse_mode, quote_position=quote_position
+        )
         if reply_params:
             payload["reply_parameters"] = reply_params
 
@@ -542,12 +600,26 @@ class TelegramBotSender:
                 "reply_mappings": [(source_id, sent_id), ...],
             }
         """
+        quote = (
+            processed_payload.get("processed_reply_to_quote_html")
+            or processed_payload.get("processed_reply_to_quote")
+            or payload.get("reply_to_quote_html")
+            or payload.get("reply_to_quote_text")
+        )
+        quote_position = payload.get("reply_to_quote_position")
+        reply_kwargs: Dict[str, Any] = {"reply_to_message_id": reply_to_message_id}
+        if quote:
+            reply_kwargs["quote"] = quote
+            reply_kwargs["quote_parse_mode"] = "HTML"
+        if quote_position is not None:
+            reply_kwargs["quote_position"] = quote_position
+
         if payload.get("use_native_forward"):
             return await self._native_forward_to_destination(
                 dest_chat_id=dest_chat_id,
                 msg_type=msg_type,
                 payload=payload,
-                reply_to_message_id=reply_to_message_id,
+                **reply_kwargs,
             )
 
         if msg_type == "album":
@@ -562,7 +634,7 @@ class TelegramBotSender:
                 chat_id=dest_chat_id,
                 from_chat_id=relay_chat_id,
                 message_ids=relay_message_ids,
-                reply_to_message_id=reply_to_message_id,
+                **reply_kwargs,
             )
 
             for item, sent_id in zip(sorted_items, sent_ids):
@@ -607,7 +679,7 @@ class TelegramBotSender:
                     message_id=relay_message_ids[0],
                     caption=None,  # text messages have no caption field
                     parse_mode=None,  # entities are copied natively, not via parse_mode
-                    reply_to_message_id=reply_to_message_id,
+                    **reply_kwargs,
                     **extra_kwargs,
                 )
             elif text_changed:
@@ -627,7 +699,7 @@ class TelegramBotSender:
                     chat_id=dest_chat_id,
                     text=text,
                     parse_mode="HTML" if use_html else None,
-                    reply_to_message_id=reply_to_message_id,
+                    **reply_kwargs,
                     **extra_kwargs,
                 )
             else:
@@ -638,35 +710,35 @@ class TelegramBotSender:
                     chat_id=dest_chat_id,
                     text=text,
                     parse_mode="HTML" if payload.get("text_html") else None,
-                    reply_to_message_id=reply_to_message_id,
+                    **reply_kwargs,
                     **extra_kwargs,
                 )
         elif msg_type == "poll":
             sent_id = await self.send_poll(
                 chat_id=dest_chat_id,
                 poll=payload["poll"],
-                reply_to_message_id=reply_to_message_id,
+                **reply_kwargs,
                 **extra_kwargs,
             )
         elif msg_type == "location":
             sent_id = await self.send_location(
                 chat_id=dest_chat_id,
                 location=payload["location"],
-                reply_to_message_id=reply_to_message_id,
+                **reply_kwargs,
                 **extra_kwargs,
             )
         elif msg_type == "venue":
             sent_id = await self.send_venue(
                 chat_id=dest_chat_id,
                 venue=payload["venue"],
-                reply_to_message_id=reply_to_message_id,
+                **reply_kwargs,
                 **extra_kwargs,
             )
         elif msg_type == "contact":
             sent_id = await self.send_contact(
                 chat_id=dest_chat_id,
                 contact=payload["contact"],
-                reply_to_message_id=reply_to_message_id,
+                **reply_kwargs,
                 **extra_kwargs,
             )
         else:
@@ -691,7 +763,7 @@ class TelegramBotSender:
                 message_id=relay_message_ids[0],
                 caption=caption,
                 parse_mode=parse_mode,
-                reply_to_message_id=reply_to_message_id,
+                **reply_kwargs,
                 **extra_kwargs,
             )
 
@@ -706,6 +778,9 @@ class TelegramBotSender:
         msg_type: str,
         payload: Dict[str, Any],
         reply_to_message_id: Optional[Union[int, str]] = None,
+        quote: Optional[str] = None,
+        quote_parse_mode: Optional[str] = None,
+        quote_position: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Deliver via forwardMessage(s) from the original channel."""
         origin = payload.get("native_forward_origin") or {}
@@ -715,6 +790,13 @@ class TelegramBotSender:
         )
         if from_chat_id is None or not origin_ids:
             raise RuntimeError("Native forward missing origin chat_id / message_ids")
+
+        fwd_kwargs: Dict[str, Any] = {"reply_to_message_id": reply_to_message_id}
+        if quote:
+            fwd_kwargs["quote"] = quote
+            fwd_kwargs["quote_parse_mode"] = quote_parse_mode or "HTML"
+        if quote_position is not None:
+            fwd_kwargs["quote_position"] = quote_position
 
         if msg_type == "album":
             items = payload.get("items") or []
@@ -731,7 +813,7 @@ class TelegramBotSender:
                 chat_id=dest_chat_id,
                 from_chat_id=from_chat_id,
                 message_ids=fwd_ids,
-                reply_to_message_id=reply_to_message_id,
+                **fwd_kwargs,
             )
             reply_mappings = [
                 (int(item["message_id"]), sent_id)
@@ -747,7 +829,7 @@ class TelegramBotSender:
             chat_id=dest_chat_id,
             from_chat_id=from_chat_id,
             message_id=int(origin_ids[0]),
-            reply_to_message_id=reply_to_message_id,
+            **fwd_kwargs,
         )
         return {
             "sent_message_id": sent_id,

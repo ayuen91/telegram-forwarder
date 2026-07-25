@@ -141,11 +141,11 @@ def normalize_message(message: Message) -> Optional[Dict[str, Any]]:
     # entities so the value is always a str or None.
     text_html: Optional[str] = None
     if message.text:
-        text_html = str(message.text.html) if message.text.entities else str(message.text)
+        text_html = str(message.text.html) if getattr(message.text, "entities", None) else str(message.text)
 
     caption_html: Optional[str] = None
-    if message.caption:
-        caption_html = str(message.caption.html) if message.caption.entities else str(message.caption)
+    if getattr(message, "caption", None):
+        caption_html = str(message.caption.html) if getattr(message.caption, "entities", None) else str(message.caption)
 
     # Detect Restrict Saving Content (protected content) flag.
     # When True, copy_message / copy_media_group will raise
@@ -157,13 +157,49 @@ def normalize_message(message: Message) -> Optional[Dict[str, Any]]:
         or getattr(message.chat, "has_protected_content", False)
     )
 
+    reply_to_quote_text: Optional[str] = None
+    reply_to_quote_html: Optional[str] = None
+    reply_to_quote_position: Optional[int] = None
+
+    quote_obj = getattr(message, "quote", None)
+    if quote_obj:
+        q_text = getattr(quote_obj, "text", None)
+        if q_text is not None:
+            reply_to_quote_text = str(q_text)
+            if getattr(quote_obj, "entities", None) and hasattr(q_text, "html"):
+                reply_to_quote_html = str(q_text.html)
+            elif getattr(quote_obj, "html", None):
+                reply_to_quote_html = str(quote_obj.html)
+            else:
+                reply_to_quote_html = reply_to_quote_text
+        else:
+            reply_to_quote_text = str(quote_obj)
+            reply_to_quote_html = reply_to_quote_text
+        reply_to_quote_position = (
+            getattr(quote_obj, "position", None)
+            if getattr(quote_obj, "position", None) is not None
+            else getattr(quote_obj, "offset", None)
+        )
+    elif getattr(message, "quote_text", None):
+        reply_to_quote_text = str(message.quote_text)
+        reply_to_quote_html = str(getattr(message, "quote_html", reply_to_quote_text))
+        reply_to_quote_position = (
+            getattr(message, "quote_position", None)
+            if getattr(message, "quote_position", None) is not None
+            else getattr(message, "quote_offset", None)
+        )
+    elif getattr(message, "reply_to", None) and getattr(message.reply_to, "quote_text", None):
+        reply_to_quote_text = str(message.reply_to.quote_text)
+        reply_to_quote_html = reply_to_quote_text
+        reply_to_quote_position = getattr(message.reply_to, "quote_offset", None)
+
     payload = {
         "message_id": message.id,
         "chat_id": message.chat.id,
         "type": msg_type,
         # plain text kept for DB storage / replacement matching
-        "text": str(message.text) if message.text else None,
-        "caption": str(message.caption) if message.caption else None,
+        "text": str(message.text) if getattr(message, "text", None) else None,
+        "caption": str(message.caption) if getattr(message, "caption", None) else None,
         # HTML-encoded text that carries all Telegram formatting entities
         "text_html": text_html,
         "caption_html": caption_html,
@@ -171,6 +207,9 @@ def normalize_message(message: Message) -> Optional[Dict[str, Any]]:
         "has_media": msg_type in _RELAY_MEDIA_TYPES or msg_type == "album",
         "has_protected_content": has_protected_content,
         "reply_to_message_id": int(message.reply_to_message_id) if message.reply_to_message_id else None,
+        "reply_to_quote_text": reply_to_quote_text,
+        "reply_to_quote_html": reply_to_quote_html,
+        "reply_to_quote_position": reply_to_quote_position,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 

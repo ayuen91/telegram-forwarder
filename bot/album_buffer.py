@@ -153,6 +153,9 @@ class AlbumBuffer:
             # Parse items and sort by message_id to preserve order
             items = []
             reply_to_id = None
+            reply_to_quote_text = None
+            reply_to_quote_html = None
+            reply_to_quote_position = None
             for msg_id, payload_json in raw_items.items():
                 payload = json.loads(payload_json)
                 if payload.get("media_group_id") is not None:
@@ -162,6 +165,10 @@ class AlbumBuffer:
                         reply_to_id = int(payload["reply_to_message_id"])
                     except (ValueError, TypeError):
                         reply_to_id = payload["reply_to_message_id"]
+                if reply_to_quote_text is None and payload.get("reply_to_quote_text"):
+                    reply_to_quote_text = payload.get("reply_to_quote_text")
+                    reply_to_quote_html = payload.get("reply_to_quote_html")
+                    reply_to_quote_position = payload.get("reply_to_quote_position")
                 items.append(payload)
 
             items.sort(key=lambda x: x.get("message_id", 0))
@@ -170,6 +177,10 @@ class AlbumBuffer:
                 for item in items:
                     if not item.get("reply_to_message_id"):
                         item["reply_to_message_id"] = reply_to_id
+                    if not item.get("reply_to_quote_text") and reply_to_quote_text:
+                        item["reply_to_quote_text"] = reply_to_quote_text
+                        item["reply_to_quote_html"] = reply_to_quote_html
+                        item["reply_to_quote_position"] = reply_to_quote_position
 
             album_payload = {
                 "type": "album",
@@ -179,6 +190,9 @@ class AlbumBuffer:
                 "items": items,
                 "timestamp": items[0].get("timestamp"),
                 "reply_to_message_id": reply_to_id,
+                "reply_to_quote_text": reply_to_quote_text,
+                "reply_to_quote_html": reply_to_quote_html,
+                "reply_to_quote_position": reply_to_quote_position,
             }
 
             # Write a 'sent' marker BEFORE deleting keys so that any item

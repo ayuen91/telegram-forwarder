@@ -194,3 +194,24 @@ class TestSerialization:
         assert payload["message_id"] == 500
         assert payload["chat_id"] == -1001
         assert payload["pinned_message_id"] == 450
+
+    def test_normalize_message_with_quote(self):
+        quote = SimpleNamespace(
+            text="Selected quoted text",
+            html="<b>Selected quoted text</b>",
+            position=12,
+            entities=[object()],
+        )
+        msg = _msg(
+            id=501,
+            chat=SimpleNamespace(id=-1001),
+            text=SimpleNamespace(html="Reply text"),
+            reply_to_message_id=450,
+            quote=quote,
+        )
+        payload = normalize_message(msg)
+        assert payload["type"] == "text"
+        assert payload["reply_to_message_id"] == 450
+        assert payload["reply_to_quote_text"] == "Selected quoted text"
+        assert payload["reply_to_quote_html"] == "<b>Selected quoted text</b>"
+        assert payload["reply_to_quote_position"] == 12

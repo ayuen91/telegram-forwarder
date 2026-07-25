@@ -107,6 +107,14 @@ def build_processed_payload(payload: Dict[str, Any], config) -> Dict[str, Any]:
             result["processed_caption_html"] = processed_caption
         result["caption_changed"] = changed
 
+    quote_src = payload.get("reply_to_quote_html") or payload.get("reply_to_quote_text")
+    if quote_src:
+        processed_quote, changed = apply_replacements(quote_src, rules)
+        result["processed_reply_to_quote"] = processed_quote
+        if payload.get("reply_to_quote_html"):
+            result["processed_reply_to_quote_html"] = processed_quote
+        result["reply_to_quote_changed"] = changed
+
     result["destinations"] = destinations
     return result
 
