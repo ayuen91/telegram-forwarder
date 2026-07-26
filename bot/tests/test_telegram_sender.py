@@ -11,15 +11,22 @@ class TestTelegramBotSenderHelpers:
         assert TelegramBotSender._reply_params(None) is None
 
     def test_reply_params_message_id(self):
-        assert TelegramBotSender._reply_params(42) == {"message_id": 42}
+        assert TelegramBotSender._reply_params(42) == {
+            "message_id": 42,
+            "allow_sending_without_reply": True,
+        }
 
     def test_reply_params_string_id(self):
-        assert TelegramBotSender._reply_params("99") == {"message_id": 99}
+        assert TelegramBotSender._reply_params("99") == {
+            "message_id": 99,
+            "allow_sending_without_reply": True,
+        }
 
     def test_reply_params_with_quote(self):
         res = TelegramBotSender._reply_params(42, quote="hello", quote_parse_mode="HTML", quote_position=5)
         assert res == {
             "message_id": 42,
+            "allow_sending_without_reply": True,
             "quote": "hello",
             "quote_parse_mode": "HTML",
             "quote_position": 5,

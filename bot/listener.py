@@ -941,6 +941,9 @@ async def process_payload(
 
         if not processed_payload or not processed_payload.get("destinations"):
             reason = "Processing failed — no destinations"
+            # Always remove from the pending queue before moving to failed,
+            # so the item is never left as a ghost entry.
+            await queue_manager.remove_from_queue(payload)
             await queue_manager.enqueue_failed(payload, reason)
             await send_alert(
                 alert_token, alert_chat_id,
@@ -957,11 +960,14 @@ async def process_payload(
             alert_token=alert_token, alert_chat_id=alert_chat_id,
         )
 
-        if status == "success":
-            await queue_manager.remove_from_queue(payload)
-        elif status == "defer":
+        # Always remove from the primary pending queue first, then move to the
+        # appropriate secondary queue (deferred / failed) if needed.  This
+        # ensures the item never stays as a ghost in queue:messages.
+        await queue_manager.remove_from_queue(payload)
+
+        if status == "defer":
             await queue_manager.enqueue_deferred(payload, "Reply parent not ready yet")
-        else:
+        elif status != "success":
             reason = "Telegram forwarding failed"
             result = await queue_manager.enqueue_failed(payload, reason)
             await send_alert(
@@ -1010,6 +1016,8 @@ async def retry_payload(
         )
 
         if not processed_payload or not processed_payload.get("destinations"):
+            # Remove from the pending queue before escalating to failed.
+            await queue_manager.remove_from_queue(payload)
             await queue_manager.enqueue_failed(payload, "Retry processing failed")
             return "failed"
 
@@ -1019,8 +1027,11 @@ async def retry_payload(
             alert_token=alert_token, alert_chat_id=alert_chat_id,
         )
 
+        # Always remove from the primary pending queue first so the item is
+        # never left as a ghost entry regardless of outcome.
+        await queue_manager.remove_from_queue(payload)
+
         if status == "success":
-            await queue_manager.remove_from_queue(payload)
             logger.info(f"Retry succeeded for {message_id}")
         elif status == "defer":
             await queue_manager.enqueue_deferred(payload, "Reply parent not ready yet (retry)")
@@ -1130,6 +1141,9 @@ async def message_worker(
                 exc_info=True,
             )
             try:
+                # Remove from the primary queue first so the item does not linger
+                # as a ghost "pending" entry before being moved to the failed queue.
+                await queue_manager.remove_from_queue(payload)
                 await queue_manager.enqueue_failed(payload, str(e))
             except Exception as qe:
                 logger.error(f"Worker-{worker_id}: failed to enqueue error: {qe}")

@@ -80,10 +80,16 @@ class TelegramBotSender:
         quote: Optional[str] = None,
         quote_parse_mode: Optional[str] = "HTML",
         quote_position: Optional[int] = None,
+        allow_sending_without_reply: bool = True,
     ) -> Optional[Dict[str, Any]]:
         if reply_to_message_id is None:
             return None
-        params: Dict[str, Any] = {"message_id": int(reply_to_message_id)}
+        params: Dict[str, Any] = {
+            "message_id": int(reply_to_message_id),
+            # If the replied-to message has been deleted or is not found,
+            # still deliver the message rather than failing entirely.
+            "allow_sending_without_reply": allow_sending_without_reply,
+        }
         if quote:
             params["quote"] = quote
             if quote_parse_mode:
@@ -91,6 +97,25 @@ class TelegramBotSender:
             if quote_position is not None:
                 params["quote_position"] = int(quote_position)
         return params
+
+    @staticmethod
+    def _is_quote_error(exc: Exception) -> bool:
+        """Return True when the error is caused by a bad quote string.
+
+        Telegram returns these error descriptions when the quote text does not
+        match the replied-to message (e.g. because entity re-encoding produced
+        a slightly different string in the destination):
+          - QUOTE_TEXT_INVALID
+          - Bad Request: message quote text not found
+          - Bad Request: quote text is not found in the message
+        """
+        msg = str(exc).lower()
+        return (
+            "quote_text_invalid" in msg
+            or "quote text not found" in msg
+            or "quote text is not found" in msg
+            or "invalid quote" in msg
+        )
 
     # _bot_api_entities removed: formatting is now transported as an HTML
     # string (text_html / caption_html) and decoded by Telegram via
@@ -668,19 +693,31 @@ class TelegramBotSender:
         if msg_type == "text":
             text_changed = processed_payload.get("text_changed", False)
 
+            # When replacements altered the text the destination copy differs
+            # from the source — the quote substring won't match the destination
+            # message, so Telegram will reject it.  Strip the quote in that case.
+            safe_reply_kwargs = dict(reply_kwargs)
+            if text_changed:
+                safe_reply_kwargs.pop("quote", None)
+                safe_reply_kwargs.pop("quote_parse_mode", None)
+                safe_reply_kwargs.pop("quote_position", None)
+
             if not text_changed and relay_message_ids and relay_chat_id:
                 # Message has rich entities (blockquotes, spoilers, dates, etc.)
                 # and was already relayed via Hydrogram copy_message (MTProto).
                 # Use Bot API copyMessage so ALL entities survive intact —
                 # the HTML parser in Hydrogram cannot encode these newer types.
-                sent_id = await self.copy_message(
-                    chat_id=dest_chat_id,
-                    from_chat_id=relay_chat_id,
-                    message_id=relay_message_ids[0],
-                    caption=None,  # text messages have no caption field
-                    parse_mode=None,  # entities are copied natively, not via parse_mode
-                    **reply_kwargs,
-                    **extra_kwargs,
+                sent_id = await self._attempt_with_quote_fallback(
+                    self.copy_message,
+                    dict(
+                        chat_id=dest_chat_id,
+                        from_chat_id=relay_chat_id,
+                        message_id=relay_message_ids[0],
+                        caption=None,  # text messages have no caption field
+                        parse_mode=None,  # entities are copied natively, not via parse_mode
+                        **safe_reply_kwargs,
+                        **extra_kwargs,
+                    ),
                 )
             elif text_changed:
                 # Replacement altered the text — send processed HTML text if available.
@@ -695,23 +732,29 @@ class TelegramBotSender:
                     processed_payload.get("processed_text_html")
                     or payload.get("text_html")
                 )
-                sent_id = await self.send_message(
-                    chat_id=dest_chat_id,
-                    text=text,
-                    parse_mode="HTML" if use_html else None,
-                    **reply_kwargs,
-                    **extra_kwargs,
+                sent_id = await self._attempt_with_quote_fallback(
+                    self.send_message,
+                    dict(
+                        chat_id=dest_chat_id,
+                        text=text,
+                        parse_mode="HTML" if use_html else None,
+                        **safe_reply_kwargs,
+                        **extra_kwargs,
+                    ),
                 )
             else:
                 # No entities, no replacement — simple plain-text send.
                 # Falls back to text_html (bold/italic/links) if available.
                 text = payload.get("text_html") or payload.get("text") or ""
-                sent_id = await self.send_message(
-                    chat_id=dest_chat_id,
-                    text=text,
-                    parse_mode="HTML" if payload.get("text_html") else None,
-                    **reply_kwargs,
-                    **extra_kwargs,
+                sent_id = await self._attempt_with_quote_fallback(
+                    self.send_message,
+                    dict(
+                        chat_id=dest_chat_id,
+                        text=text,
+                        parse_mode="HTML" if payload.get("text_html") else None,
+                        **safe_reply_kwargs,
+                        **extra_kwargs,
+                    ),
                 )
         elif msg_type == "poll":
             sent_id = await self.send_poll(
@@ -747,30 +790,69 @@ class TelegramBotSender:
 
             caption = None
             parse_mode = None
-            if processed_payload.get("caption_changed"):
+            caption_changed = bool(processed_payload.get("caption_changed"))
+            if caption_changed:
                 # Replacement changed the caption — send processed HTML caption if available
                 caption = (
                     processed_caption_html := processed_payload.get("processed_caption_html")
                 ) or processed_payload.get("processed_caption") or payload.get("caption_html") or payload.get("caption")
                 parse_mode = "HTML" if (processed_payload.get("processed_caption_html") or payload.get("caption_html")) else None
+            
+            # When caption_changed is True the destination caption differs from
+            # the source — drop the quote to avoid QUOTE_TEXT_INVALID errors.
+            safe_reply_kwargs = dict(reply_kwargs)
+            if caption_changed:
+                safe_reply_kwargs.pop("quote", None)
+                safe_reply_kwargs.pop("quote_parse_mode", None)
+                safe_reply_kwargs.pop("quote_position", None)
+
             # When caption_changed is False, caption=None & parse_mode=None are passed to copy_message.
             # This allows Telegram Bot API copyMessage to preserve the original relay message's
             # caption AND all native entities (premium emojis, custom emojis, animated emojis, etc.)
             # directly without running the HTML parser or hitting CANNOT_USE_CUSTOM_EMOJI errors.
-            sent_id = await self.copy_message(
-                chat_id=dest_chat_id,
-                from_chat_id=relay_chat_id,
-                message_id=relay_message_ids[0],
-                caption=caption,
-                parse_mode=parse_mode,
-                **reply_kwargs,
-                **extra_kwargs,
+            sent_id = await self._attempt_with_quote_fallback(
+                self.copy_message,
+                dict(
+                    chat_id=dest_chat_id,
+                    from_chat_id=relay_chat_id,
+                    message_id=relay_message_ids[0],
+                    caption=caption,
+                    parse_mode=parse_mode,
+                    **safe_reply_kwargs,
+                    **extra_kwargs,
+                ),
             )
 
         return {
             "sent_message_id": sent_id,
             "reply_mappings": [(msg_id, sent_id)],
         }
+
+    async def _attempt_with_quote_fallback(self, func, kwargs: Dict[str, Any]):
+        """Call *func(**kwargs)*, retrying without the quote on quote-mismatch errors.
+
+        Telegram rejects a quoted reply when the quote text is not an exact
+        substring of the destination copy of the replied-to message.  This can
+        happen even when no replacement rule fired — entity re-encoding (HTML
+        escape differences, zero-width joiners, etc.) can produce a slightly
+        different string in the destination.
+
+        If the first attempt fails with any quote-related error we transparently
+        retry without the quote so the message still arrives as a normal reply.
+        """
+        try:
+            return await func(**kwargs)
+        except Exception as e:
+            if self._is_quote_error(e) and "quote" in kwargs:
+                logger.warning(
+                    f"Quote mismatch on reply — retrying without quote: {e}"
+                )
+                no_quote_kwargs = {
+                    k: v for k, v in kwargs.items()
+                    if k not in ("quote", "quote_parse_mode", "quote_position")
+                }
+                return await func(**no_quote_kwargs)
+            raise
 
     async def _native_forward_to_destination(
         self,
