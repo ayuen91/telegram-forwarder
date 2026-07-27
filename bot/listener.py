@@ -3,7 +3,7 @@ Message listener with backpressure control.
 
 Two-stage design:
   Stage 1 — on_message handler: validates, normalizes, pushes to asyncio.Queue (fast)
-  Stage 2 — Worker tasks: pull from queue, dedup, route to album buffer or webhook (controlled)
+  Stage 2 — Worker tasks: pull from queue, apply local replacements, deliver via Bot API
 
 The asyncio.Queue (maxsize=100) acts as backpressure — if a channel dumps
 50 messages at once, the queue absorbs the burst. Workers (2 by default)
@@ -42,7 +42,7 @@ except (ImportError, ModuleNotFoundError, RuntimeError):
 from hydrogram.types import Message
 
 from media_relay import RelayConfig, relay_to_bot, cleanup_relay
-from replacements import build_processed_payload, needs_n8n
+from replacements import build_processed_payload
 from alerts import send_alert
 from telegram_sender import TelegramBotSender, TelegramFloodWait
 from forward_attribution import (
@@ -240,7 +240,6 @@ def _get_message_type(message: Message) -> Optional[str]:
     ):
         return "pin"
     elif message.text:
-        return "text"
         return "text"
     elif message.photo:
         return "photo"
@@ -881,20 +880,11 @@ async def _deliver_with_native_fallback(
     return result
 
 
-async def _resolve_processed_payload(
-    webhook_sender,
+def _resolve_processed_payload(
     config,
     payload: Dict[str, Any],
-    endpoint: str,
 ) -> Optional[Dict[str, Any]]:
-    """Get processed payload via n8n (if text to edit) with local fallback."""
-    if needs_n8n(payload):
-        processed = await webhook_sender.send(payload, endpoint=endpoint)
-        if processed and processed.get("destinations"):
-            return processed
-        logger.info(
-            f"n8n unavailable or rejected msg {payload.get('message_id')} — using local processing"
-        )
+    """Apply word replacements locally and attach destinations."""
     return build_processed_payload(payload, config)
 
 
@@ -912,7 +902,6 @@ async def _prepare_payload_for_delivery(
 async def process_payload(
     sender: TelegramBotSender,
     queue_manager,
-    webhook_sender,
     payload: Dict[str, Any],
     db_path: str,
     config,
@@ -922,8 +911,7 @@ async def process_payload(
     alert_token: str = "",
     alert_chat_id: int = 0,
 ) -> ForwardStatus:
-    """Run word replacement + Bot API forward for one payload."""
-    endpoint = "album" if payload.get("type") == "album" else "message"
+    """Apply local word replacements + Bot API forward for one payload."""
     chat_id = payload.get("chat_id", 0)
     inflight_ids = _payload_inflight_ids(payload)
     status: ForwardStatus = "failed"
@@ -935,9 +923,7 @@ async def process_payload(
 
     try:
         payload = await _prepare_payload_for_delivery(sender, payload, config)
-        processed_payload = await _resolve_processed_payload(
-            webhook_sender, config, payload, endpoint
-        )
+        processed_payload = _resolve_processed_payload(config, payload)
 
         if not processed_payload or not processed_payload.get("destinations"):
             reason = "Processing failed — no destinations"
@@ -989,7 +975,6 @@ async def process_payload(
 async def retry_payload(
     sender: TelegramBotSender,
     queue_manager,
-    webhook_sender,
     payload: Dict[str, Any],
     db_path: str,
     config,
@@ -1000,7 +985,6 @@ async def retry_payload(
     alert_chat_id: int = 0,
 ) -> ForwardStatus:
     """Retry processing + forward without re-enqueueing to the pending queue."""
-    endpoint = "album" if payload.get("type") == "album" else "message"
     chat_id = payload.get("chat_id", 0)
     inflight_ids = _payload_inflight_ids(payload)
     status: ForwardStatus = "failed"
@@ -1011,9 +995,7 @@ async def retry_payload(
 
     try:
         payload = await _prepare_payload_for_delivery(sender, payload, config)
-        processed_payload = await _resolve_processed_payload(
-            webhook_sender, config, payload, endpoint
-        )
+        processed_payload = _resolve_processed_payload(config, payload)
 
         if not processed_payload or not processed_payload.get("destinations"):
             # Remove from the pending queue before escalating to failed.
@@ -1058,7 +1040,6 @@ async def message_worker(
     dedup,
     album_buffer,
     queue_manager,
-    webhook_sender,
     sender: TelegramBotSender,
     db_path: str,
     config,
@@ -1070,8 +1051,8 @@ async def message_worker(
     delay_max: float = 1.5,
 ):
     """
-    Worker task: pulls messages from asyncio.Queue, processes sequentially.
-    Uses n8n webhook for word replacement, then delivers via Bot API.
+    Worker task: pulls messages from asyncio.Queue, applies local replacements,
+    and delivers via Bot API.
     """
     logger.info(f"Worker-{worker_id} started")
 
@@ -1080,20 +1061,20 @@ async def message_worker(
         message_id = payload.get("message_id", "unknown")
 
         try:
-            delay = random.uniform(delay_min, delay_max)
-            await asyncio.sleep(delay)
-
             chat_id = payload.get("chat_id", 0)
             is_new = await dedup.is_new(chat_id, message_id)
             if not is_new:
                 logger.debug(f"Worker-{worker_id}: duplicate {message_id}, skipping")
                 continue
 
+            delay = random.uniform(delay_min, delay_max)
+            await asyncio.sleep(delay)
+
             if payload.get("media_group_id"):
                 flush_result = await album_buffer.add(payload)
                 if flush_result:
                     await process_payload(
-                        sender, queue_manager, webhook_sender, flush_result,
+                        sender, queue_manager, flush_result,
                         db_path, config, dedup=dedup,
                         hydrogram_app=hydrogram_app, relay=relay,
                         alert_token=alert_token, alert_chat_id=alert_chat_id,
@@ -1104,7 +1085,7 @@ async def message_worker(
                 )
             else:
                 status = await process_payload(
-                    sender, queue_manager, webhook_sender, payload,
+                    sender, queue_manager, payload,
                     db_path, config, dedup=dedup,
                     hydrogram_app=hydrogram_app, relay=relay,
                     alert_token=alert_token, alert_chat_id=alert_chat_id,

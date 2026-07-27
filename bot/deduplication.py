@@ -22,7 +22,7 @@ class Deduplication:
 
     # How long to remember a message_id (24 hours)
     TTL_SECONDS = 86400
-    INFLIGHT_TTL = 600  # 10 minutes — covers worker delay + webhook round-trip
+    INFLIGHT_TTL = 600  # 10 minutes — covers worker delay + relay + Bot API send
 
     def __init__(self, redis_client: aioredis.Redis):
         self.redis = redis_client

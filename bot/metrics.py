@@ -203,7 +203,6 @@ _COMPONENT_LABELS = {
     "sender_bot": "Sender",
     "redis": "Redis",
     "sqlite": "SQLite",
-    "n8n_webhook": "n8n",
     "disk_space": "Disk",
 }
 
@@ -215,7 +214,6 @@ def _pick_components(results: List[HealthCheckResult]) -> List[ComponentStatus]:
         "sender_bot",
         "redis",
         "sqlite",
-        "n8n_webhook",
         "disk_space",
     )
     by_name = {r.name: r for r in results}

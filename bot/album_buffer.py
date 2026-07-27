@@ -3,7 +3,7 @@ Album buffer — collects media group items in Redis before forwarding.
 
 When Telegram sends an album, each item arrives as a separate update
 sharing the same media_group_id. This buffer collects them over a
-2-second window, then bundles and fires a single webhook to n8n.
+2-second window, then bundles and fires directly into the processing pipeline.
 
 Redis data structures:
   - album:{group_id}  — HASH: message_id -> payload JSON

@@ -14,8 +14,6 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-      n8n:
-        condition: service_healthy
     restart: unless-stopped
     logging:
       driver: "json-file"
@@ -45,42 +43,8 @@ services:
     networks:
       - internal
 
-  # n8n (word replacement only — Python bot sends to destinations via Bot API)
-  n8n:
-    image: n8nio/n8n:latest
-    env_file: .env
-    ports:
-      - "127.0.0.1:5678:5678"           # Only localhost — use Nginx reverse proxy for remote access
-    environment:
-      - N8N_BASIC_AUTH_ACTIVE=true
-      - N8N_BASIC_AUTH_USER=${N8N_BASIC_AUTH_USER}
-      - N8N_BASIC_AUTH_PASSWORD=${N8N_BASIC_AUTH_PASSWORD}
-      - N8N_BLOCK_ENV_ACCESS_IN_NODE=false
-      - NODE_FUNCTION_ALLOW_BUILTIN=crypto
-      - WEBHOOK_SECRET=${WEBHOOK_SECRET}
-    volumes:
-      - n8n_data:/home/node/.n8n
-    depends_on:
-      redis:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD-SHELL", "wget -q --spider http://localhost:5678/healthz || exit 1"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
-    restart: unless-stopped
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "5"
-    networks:
-      - internal
-
 volumes:
   redis_data:
-  n8n_data:
 
 networks:
   internal:

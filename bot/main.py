@@ -1,10 +1,10 @@
 """
 Main entry point for the Telegram Forwarder bot.
 
-Pipeline: Hydrogram listen → n8n word replace → Bot API send (via relay for media)
+Pipeline: Hydrogram listen → Local replacements → Bot API send (via relay for media)
 
 Launched tasks:
-  - message_worker × N   — queue → webhook → forward
+  - message_worker × N   — queue → process → forward
   - album_flush_worker   — flush expired album buffers
   - retry_worker         — retry failed/deferred messages
   - health_checker       — periodic health checks + alerts
@@ -59,7 +59,6 @@ from listener import (
 from album_buffer import AlbumBuffer
 from queue_manager import QueueManager
 from deduplication import Deduplication
-from webhook import WebhookSender
 from health import HealthMonitor
 from media_relay import RelayConfig, ensure_relay_chat, resolve_relay_config
 from telegram_sender import TelegramBotSender, TelegramFloodWait
@@ -77,7 +76,6 @@ class WorkerContext:
     """Shared dependencies passed to all workers."""
 
     sender: TelegramBotSender
-    webhook: WebhookSender
     queue_mgr: QueueManager
     dedup: Deduplication
     album_buf: AlbumBuffer
@@ -241,7 +239,6 @@ def make_worker_factory(worker_id: int, queue: asyncio.Queue, ctx: WorkerContext
             dedup=ctx.dedup,
             album_buffer=ctx.album_buf,
             queue_manager=ctx.queue_mgr,
-            webhook_sender=ctx.webhook,
             sender=ctx.sender,
             db_path=ctx.db_path,
             config=ctx.config,
@@ -261,7 +258,7 @@ def make_album_flush_factory(ctx: WorkerContext):
             try:
                 for album_payload in await ctx.album_buf.check_and_flush_expired():
                     await process_payload(
-                        ctx.sender, ctx.queue_mgr, ctx.webhook, album_payload,
+                        ctx.sender, ctx.queue_mgr, album_payload,
                         ctx.db_path, ctx.config, dedup=ctx.dedup,
                         hydrogram_app=ctx.hydrogram_app, relay=ctx.relay,
                         alert_token=ctx.alert_token, alert_chat_id=ctx.alert_chat_id,
@@ -279,7 +276,7 @@ def make_retry_factory(ctx: WorkerContext):
                 payload = await ctx.queue_mgr.dequeue_deferred()
                 if payload:
                     await retry_payload(
-                        ctx.sender, ctx.queue_mgr, ctx.webhook, payload,
+                        ctx.sender, ctx.queue_mgr, payload,
                         ctx.db_path, ctx.config, dedup=ctx.dedup,
                         hydrogram_app=ctx.hydrogram_app, relay=ctx.relay,
                         alert_token=ctx.alert_token, alert_chat_id=ctx.alert_chat_id,
@@ -290,7 +287,7 @@ def make_retry_factory(ctx: WorkerContext):
                 payload = await ctx.queue_mgr.dequeue_failed()
                 if payload:
                     await retry_payload(
-                        ctx.sender, ctx.queue_mgr, ctx.webhook, payload,
+                        ctx.sender, ctx.queue_mgr, payload,
                         ctx.db_path, ctx.config, dedup=ctx.dedup,
                         hydrogram_app=ctx.hydrogram_app, relay=ctx.relay,
                         alert_token=ctx.alert_token, alert_chat_id=ctx.alert_chat_id,
@@ -659,12 +656,6 @@ async def main():
     dedup = Deduplication(redis_client)
     queue_mgr = QueueManager(redis_client, max_retries=settings.max_retries)
     album_buf = AlbumBuffer(redis_client, buffer_seconds=settings.album_buffer_seconds)
-    webhook = WebhookSender(
-        message_url=settings.n8n_webhook_message,
-        album_url=settings.n8n_webhook_album,
-        secret=settings.webhook_secret,
-        config=config,
-    )
     sender = TelegramBotSender(bot_token=settings.bot_token)
 
     app = Client(
@@ -677,7 +668,6 @@ async def main():
 
     health_monitor = HealthMonitor(
         redis_client=redis_client,
-        webhook_sender=webhook,
         config=config,
         hydrogram_app=app,
         bot_sender=sender,
@@ -792,7 +782,6 @@ async def main():
 
     ctx = WorkerContext(
         sender=sender,
-        webhook=webhook,
         queue_mgr=queue_mgr,
         dedup=dedup,
         album_buf=album_buf,
@@ -811,7 +800,7 @@ async def main():
     for album_payload in stale_albums:
         try:
             await process_payload(
-                ctx.sender, ctx.queue_mgr, ctx.webhook, album_payload,
+                ctx.sender, ctx.queue_mgr, album_payload,
                 ctx.db_path, ctx.config, dedup=ctx.dedup,
                 hydrogram_app=ctx.hydrogram_app, relay=ctx.relay,
                 alert_token=ctx.alert_token, alert_chat_id=ctx.alert_chat_id,
@@ -947,7 +936,6 @@ async def main():
         pass
     finally:
         logger.info("Shutting down...")
-        await webhook.close()
         await sender.close()
         await app.stop()
         await redis_client.close()

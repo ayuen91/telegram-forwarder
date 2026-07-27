@@ -35,7 +35,7 @@ class HealthMonitor:
     Centralized health checker with alerting.
 
     Usage:
-        monitor = HealthMonitor(redis_client, webhook_sender, config, pyrogram_app)
+        monitor = HealthMonitor(redis_client, config, pyrogram_app)
 
         # In supervised_task loop:
         await monitor.run_cycle()
@@ -49,7 +49,6 @@ class HealthMonitor:
     def __init__(
         self,
         redis_client: aioredis.Redis,
-        webhook_sender,  # WebhookSender instance
         config,  # Config instance
         hydrogram_app=None,  # Hydrogram Client instance (set after app starts)
         bot_sender=None,  # TelegramBotSender instance
@@ -58,7 +57,6 @@ class HealthMonitor:
         db_path: str = "/app/data/forwarder.db",
     ):
         self.redis = redis_client
-        self.webhook_sender = webhook_sender
         self.config = config
         self.hydrogram_app = hydrogram_app
         self.bot_sender = bot_sender
@@ -91,10 +89,7 @@ class HealthMonitor:
         # 4. Redis connectivity
         results.append(await self._check_redis())
 
-        # 5. n8n webhook reachable
-        results.append(await self._check_n8n())
-
-        # 6. Queue depth (early surge warning)
+        # 5. Queue depth (early surge warning)
         results.append(await self._check_queue_surge())
 
         # 7. Queue depth (critical overflow)
@@ -308,21 +303,6 @@ class HealthMonitor:
         except Exception as e:
             return HealthCheckResult(
                 name="redis", passed=False, level="critical", message=str(e)
-            )
-
-    async def _check_n8n(self) -> HealthCheckResult:
-        """Check if n8n webhook endpoint is reachable."""
-        try:
-            reachable = await self.webhook_sender.is_reachable()
-            return HealthCheckResult(
-                name="n8n_webhook",
-                passed=reachable,
-                level="high",
-                message="" if reachable else "n8n webhook unreachable",
-            )
-        except Exception as e:
-            return HealthCheckResult(
-                name="n8n_webhook", passed=False, level="high", message=str(e)
             )
 
     async def _check_queue_depth(self) -> HealthCheckResult:

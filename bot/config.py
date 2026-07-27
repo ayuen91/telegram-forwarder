@@ -86,11 +86,6 @@ class Settings:
     bot_token: str = ""
     relay_channel_id: int = 0  # Private channel for media relay (recommended)
 
-    # n8n Webhooks (from .env)
-    n8n_webhook_message: str = ""
-    n8n_webhook_album: str = ""
-    webhook_secret: str = ""
-
     # Redis (from .env)
     redis_url: str = ""
 
@@ -179,10 +174,6 @@ class Config:
         source_env = os.getenv("SOURCE_CHAT_ID")
         if source_env:
             s.source_chat_id = int(source_env)
-
-        s.n8n_webhook_message = _require_env("N8N_WEBHOOK_URL_MESSAGE")
-        s.n8n_webhook_album = _require_env("N8N_WEBHOOK_URL_ALBUM")
-        s.webhook_secret = _require_env("WEBHOOK_SECRET")
 
         s.redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
         s.db_path = os.getenv("DB_PATH", "/app/data/forwarder.db")
@@ -351,8 +342,6 @@ class Config:
             errors.append("Source chat ID not configured (set SOURCE_CHAT_ID or channels.yml)")
         if not s.destinations:
             errors.append("No destinations configured in channels.yml")
-        if not s.webhook_secret:
-            errors.append("WEBHOOK_SECRET is not set")
         if not s.bot_token:
             errors.append("BOT_TOKEN is not set")
         if not s.alert_bot_token:

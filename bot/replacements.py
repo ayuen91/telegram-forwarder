@@ -1,7 +1,8 @@
-"""Word replacement engine — mirrors n8n logic, runs in Python."""
+"""Word replacement engine — applies replacements locally, no external service required."""
 
 import re
 from typing import Any, Dict, List, Optional, Tuple
+
 
 
 def apply_replacements(
@@ -119,10 +120,3 @@ def build_processed_payload(payload: Dict[str, Any], config) -> Dict[str, Any]:
     return result
 
 
-def needs_n8n(payload: Dict[str, Any]) -> bool:
-    """Only route through n8n when there is text/caption to edit."""
-    if payload.get("use_native_forward"):
-        return False
-    if payload.get("type") == "album":
-        return any(item.get("caption") for item in payload.get("items", []))
-    return bool(payload.get("text") or payload.get("caption"))
