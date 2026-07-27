@@ -625,17 +625,21 @@ class TelegramBotSender:
                 "reply_mappings": [(source_id, sent_id), ...],
             }
         """
+        # Use plain-text for the quote so Bot API does a simple substring
+        # match against the destination message text, then auto-renders it
+        # with the formatting that already exists at that position in the
+        # destination copy.  Sending HTML with quote_parse_mode="HTML" caused
+        # entity-format mismatches (Hydrogram HTML != Bot API stored entities)
+        # which silently dropped the quote after the fallback retry.
         quote = (
-            processed_payload.get("processed_reply_to_quote_html")
-            or processed_payload.get("processed_reply_to_quote")
-            or payload.get("reply_to_quote_html")
+            processed_payload.get("processed_reply_to_quote")
             or payload.get("reply_to_quote_text")
         )
         quote_position = payload.get("reply_to_quote_position")
         reply_kwargs: Dict[str, Any] = {"reply_to_message_id": reply_to_message_id}
         if quote:
             reply_kwargs["quote"] = quote
-            reply_kwargs["quote_parse_mode"] = "HTML"
+            # No quote_parse_mode — plain text, no entity matching required
         if quote_position is not None:
             reply_kwargs["quote_position"] = quote_position
 

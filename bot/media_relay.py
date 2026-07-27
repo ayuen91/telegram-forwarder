@@ -177,7 +177,13 @@ async def _relay_via_download(
     temp_dir = tempfile.mkdtemp(prefix="tg_relay_")
 
     try:
-        messages = await app.get_messages(source_chat_id, message_ids)
+        # Pass replies=0 to prevent Hydrogram from automatically fetching the
+        # reply-to message of each album item (default replies=1).  When an
+        # album item is a reply, Hydrogram would try to hydrate that parent
+        # message via channels.GetMessages, which raises MESSAGE_IDS_EMPTY when
+        # the parent is from a protected channel or was deleted.  We only need
+        # the media messages themselves for the download+reupload relay.
+        messages = await app.get_messages(source_chat_id, message_ids, replies=0)
         if not isinstance(messages, list):
             messages = [messages]
         # Filter out empty/service messages and sort by ID
