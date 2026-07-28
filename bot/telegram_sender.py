@@ -17,6 +17,31 @@ import aiohttp
 logger = logging.getLogger(__name__)
 
 
+def _normalize_html_for_bot_api(html: str) -> str:
+    """Normalize Pyrogram-generated HTML to tags accepted by the Bot API HTML parser.
+
+    Pyrogram's HTML.unparse() produces tags that differ from what the Telegram
+    Bot API HTML mode expects for two entity types:
+
+      * Spoiler:      Pyrogram → <spoiler>…</spoiler>
+                      Bot API  → <tg-spoiler>…</tg-spoiler>
+
+      * Custom emoji: Pyrogram → <emoji id="123">…</emoji>
+                      Bot API  → <tg-emoji emoji-id="123">…</tg-emoji>
+
+    Without this normalisation those entities are silently stripped (or cause a
+    "Failed to parse entities" error) whenever we call sendMessage with
+    parse_mode="HTML" — e.g. after a word-replacement rule fires.
+    """
+    # <spoiler> → <tg-spoiler>
+    html = re.sub(r'<spoiler>', '<tg-spoiler>', html)
+    html = re.sub(r'</spoiler>', '</tg-spoiler>', html)
+    # <emoji id="…"> → <tg-emoji emoji-id="…">
+    html = re.sub(r'<emoji\s+id="([^"]+)">', r'<tg-emoji emoji-id="\1">', html)
+    html = re.sub(r'</emoji>', '</tg-emoji>', html)
+    return html
+
+
 class TelegramFloodWait(Exception):
     """Bot API returned 429 — caller should sleep and retry."""
 
@@ -667,15 +692,28 @@ class TelegramBotSender:
             )
 
             for item, sent_id in zip(sorted_items, sent_ids):
-                original = item.get("caption") or ""
-                processed = item.get("processed_caption") or original
-                if processed != original:
+                # Compare against the plain-text original so the check works
+                # regardless of whether the source had HTML formatting.
+                original_plain = item.get("caption") or ""
+                processed_html = item.get("processed_caption_html")
+                processed_plain = item.get("processed_caption") or original_plain
+                # Fire the edit only when a replacement rule actually changed the text.
+                if processed_plain != original_plain:
                     try:
-                        # Replacement fired — send plain text
-                        await self.edit_message_caption(
-                            dest_chat_id, sent_id, processed,
-                            parse_mode=None,
-                        )
+                        if processed_html:
+                            # Replacement fired on an HTML-formatted caption — preserve
+                            # rich formatting by sending the HTML version with parse_mode.
+                            await self.edit_message_caption(
+                                dest_chat_id, sent_id,
+                                _normalize_html_for_bot_api(processed_html),
+                                parse_mode="HTML",
+                            )
+                        else:
+                            # Plain-text caption — send without parse_mode.
+                            await self.edit_message_caption(
+                                dest_chat_id, sent_id, processed_plain,
+                                parse_mode=None,
+                            )
                     except Exception as cap_err:
                         logger.warning(
                             f"Failed to edit caption for album item {sent_id} in {dest_chat_id}: {cap_err}"
@@ -725,7 +763,7 @@ class TelegramBotSender:
                 )
             elif text_changed:
                 # Replacement altered the text — send processed HTML text if available.
-                text = (
+                raw_text = (
                     processed_payload.get("processed_text_html")
                     or processed_payload.get("processed_text")
                     or payload.get("text_html")
@@ -736,6 +774,7 @@ class TelegramBotSender:
                     processed_payload.get("processed_text_html")
                     or payload.get("text_html")
                 )
+                text = _normalize_html_for_bot_api(raw_text) if use_html else raw_text
                 sent_id = await self._attempt_with_quote_fallback(
                     self.send_message,
                     dict(
@@ -749,13 +788,15 @@ class TelegramBotSender:
             else:
                 # No entities, no replacement — simple plain-text send.
                 # Falls back to text_html (bold/italic/links) if available.
-                text = payload.get("text_html") or payload.get("text") or ""
+                has_html = bool(payload.get("text_html"))
+                raw_text = payload.get("text_html") or payload.get("text") or ""
+                text = _normalize_html_for_bot_api(raw_text) if has_html else raw_text
                 sent_id = await self._attempt_with_quote_fallback(
                     self.send_message,
                     dict(
                         chat_id=dest_chat_id,
                         text=text,
-                        parse_mode="HTML" if payload.get("text_html") else None,
+                        parse_mode="HTML" if has_html else None,
                         **safe_reply_kwargs,
                         **extra_kwargs,
                     ),
@@ -797,10 +838,17 @@ class TelegramBotSender:
             caption_changed = bool(processed_payload.get("caption_changed"))
             if caption_changed:
                 # Replacement changed the caption — send processed HTML caption if available
-                caption = (
-                    processed_caption_html := processed_payload.get("processed_caption_html")
-                ) or processed_payload.get("processed_caption") or payload.get("caption_html") or payload.get("caption")
-                parse_mode = "HTML" if (processed_payload.get("processed_caption_html") or payload.get("caption_html")) else None
+                raw_caption = (
+                    processed_payload.get("processed_caption_html")
+                    or processed_payload.get("processed_caption")
+                    or payload.get("caption_html")
+                    or payload.get("caption")
+                )
+                use_caption_html = bool(
+                    processed_payload.get("processed_caption_html") or payload.get("caption_html")
+                )
+                caption = _normalize_html_for_bot_api(raw_caption) if use_caption_html else raw_caption
+                parse_mode = "HTML" if use_caption_html else None
             
             # When caption_changed is True the destination caption differs from
             # the source — drop the quote to avoid QUOTE_TEXT_INVALID errors.

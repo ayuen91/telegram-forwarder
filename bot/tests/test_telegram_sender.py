@@ -3,7 +3,75 @@
 from unittest.mock import AsyncMock, patch
 import pytest
 
-from telegram_sender import TelegramBotSender
+from telegram_sender import TelegramBotSender, _normalize_html_for_bot_api
+
+
+class TestNormalizeHtmlForBotApi:
+    """_normalize_html_for_bot_api converts Pyrogram HTML to Bot API HTML."""
+
+    def test_passthrough_plain_text(self):
+        assert _normalize_html_for_bot_api("hello world") == "hello world"
+
+    def test_passthrough_valid_bold(self):
+        assert _normalize_html_for_bot_api("<b>bold</b>") == "<b>bold</b>"
+
+    def test_passthrough_valid_italic(self):
+        assert _normalize_html_for_bot_api("<i>italic</i>") == "<i>italic</i>"
+
+    def test_passthrough_valid_underline(self):
+        assert _normalize_html_for_bot_api("<u>under</u>") == "<u>under</u>"
+
+    def test_passthrough_valid_strikethrough(self):
+        assert _normalize_html_for_bot_api("<s>strike</s>") == "<s>strike</s>"
+
+    def test_passthrough_valid_code(self):
+        assert _normalize_html_for_bot_api("<code>x</code>") == "<code>x</code>"
+
+    def test_passthrough_valid_blockquote(self):
+        assert _normalize_html_for_bot_api("<blockquote>q</blockquote>") == "<blockquote>q</blockquote>"
+
+    def test_passthrough_valid_link(self):
+        assert _normalize_html_for_bot_api('<a href="https://t.me">t</a>') == '<a href="https://t.me">t</a>'
+
+    # --- Spoiler ---
+
+    def test_spoiler_converted(self):
+        result = _normalize_html_for_bot_api("<spoiler>secret</spoiler>")
+        assert result == "<tg-spoiler>secret</tg-spoiler>"
+
+    def test_spoiler_nested_inside_bold(self):
+        result = _normalize_html_for_bot_api("<b><spoiler>s</spoiler></b>")
+        assert result == "<b><tg-spoiler>s</tg-spoiler></b>"
+
+    def test_already_tg_spoiler_unchanged(self):
+        result = _normalize_html_for_bot_api("<tg-spoiler>s</tg-spoiler>")
+        assert result == "<tg-spoiler>s</tg-spoiler>"
+
+    # --- Custom emoji ---
+
+    def test_emoji_id_converted(self):
+        result = _normalize_html_for_bot_api('<emoji id="5368324170671202286">👍</emoji>')
+        assert result == '<tg-emoji emoji-id="5368324170671202286">👍</tg-emoji>'
+
+    def test_emoji_id_with_whitespace_converted(self):
+        result = _normalize_html_for_bot_api('<emoji  id="123">X</emoji>')
+        assert result == '<tg-emoji emoji-id="123">X</tg-emoji>'
+
+    def test_already_tg_emoji_unchanged(self):
+        src = '<tg-emoji emoji-id="123">👍</tg-emoji>'
+        assert _normalize_html_for_bot_api(src) == src
+
+    # --- Mixed content ---
+
+    def test_mixed_entities_all_converted(self):
+        src = '<b>Bold</b> <spoiler>hidden</spoiler> <emoji id="99">🎉</emoji>'
+        expected = '<b>Bold</b> <tg-spoiler>hidden</tg-spoiler> <tg-emoji emoji-id="99">🎉</tg-emoji>'
+        assert _normalize_html_for_bot_api(src) == expected
+
+    def test_multiple_spoilers(self):
+        src = "<spoiler>a</spoiler> and <spoiler>b</spoiler>"
+        expected = "<tg-spoiler>a</tg-spoiler> and <tg-spoiler>b</tg-spoiler>"
+        assert _normalize_html_for_bot_api(src) == expected
 
 
 class TestTelegramBotSenderHelpers:
@@ -337,3 +405,214 @@ class TestForwardToDestination:
             reply_markup=reply_markup,
         )
         assert result == {"sent_message_id": 123, "reply_mappings": [(36, 123)]}
+
+
+class TestAlbumCaptionHtmlFix:
+    """Album caption edits must preserve HTML formatting when the caption had entities."""
+
+    @pytest.fixture
+    def sender(self):
+        return TelegramBotSender(bot_token="test:token")
+
+    @pytest.mark.asyncio
+    async def test_album_caption_plain_replacement_no_parse_mode(self, sender):
+        """Plain-text caption replacement: edit_message_caption called without parse_mode."""
+        sender.copy_messages = AsyncMock(return_value=[10])
+        sender.edit_message_caption = AsyncMock()
+
+        await sender.forward_to_destination(
+            dest_chat_id=-1001,
+            msg_type="album",
+            payload={
+                "message_id": 1,
+                "items": [
+                    {
+                        "message_id": 1,
+                        "caption": "old text",
+                        "processed_caption": "new text",
+                        # No processed_caption_html — plain-text caption
+                    }
+                ],
+            },
+            processed_payload={
+                "items": [
+                    {
+                        "message_id": 1,
+                        "caption": "old text",
+                        "processed_caption": "new text",
+                    }
+                ]
+            },
+            relay_chat_id=999,
+            relay_message_ids=[77],
+        )
+
+        sender.edit_message_caption.assert_awaited_once_with(
+            -1001, 10, "new text", parse_mode=None
+        )
+
+    @pytest.mark.asyncio
+    async def test_album_caption_html_replacement_uses_html_parse_mode(self, sender):
+        """HTML caption replacement: edit_message_caption called WITH parse_mode='HTML'."""
+        sender.copy_messages = AsyncMock(return_value=[20])
+        sender.edit_message_caption = AsyncMock()
+
+        await sender.forward_to_destination(
+            dest_chat_id=-1001,
+            msg_type="album",
+            payload={
+                "message_id": 2,
+                "items": [
+                    {
+                        "message_id": 2,
+                        "caption": "old text",
+                        "caption_html": "<b>old text</b>",
+                    }
+                ],
+            },
+            processed_payload={
+                "items": [
+                    {
+                        "message_id": 2,
+                        "caption": "old text",
+                        "caption_html": "<b>old text</b>",
+                        "processed_caption": "new text",
+                        "processed_caption_html": "<b>new text</b>",
+                    }
+                ]
+            },
+            relay_chat_id=999,
+            relay_message_ids=[78],
+        )
+
+        sender.edit_message_caption.assert_awaited_once_with(
+            -1001, 20, "<b>new text</b>", parse_mode="HTML"
+        )
+
+    @pytest.mark.asyncio
+    async def test_album_caption_no_change_no_edit(self, sender):
+        """No replacement: edit_message_caption must NOT be called."""
+        sender.copy_messages = AsyncMock(return_value=[30])
+        sender.edit_message_caption = AsyncMock()
+
+        await sender.forward_to_destination(
+            dest_chat_id=-1001,
+            msg_type="album",
+            payload={
+                "message_id": 3,
+                "items": [{"message_id": 3, "caption": "same", "caption_html": "<b>same</b>"}],
+            },
+            processed_payload={
+                "items": [
+                    {
+                        "message_id": 3,
+                        "caption": "same",
+                        "caption_html": "<b>same</b>",
+                        "processed_caption": "same",          # unchanged
+                        "processed_caption_html": "<b>same</b>",
+                    }
+                ]
+            },
+            relay_chat_id=999,
+            relay_message_ids=[79],
+        )
+
+        sender.edit_message_caption.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_album_caption_html_spoiler_normalised(self, sender):
+        """Spoiler tag in processed_caption_html is normalised before the edit."""
+        sender.copy_messages = AsyncMock(return_value=[40])
+        sender.edit_message_caption = AsyncMock()
+
+        await sender.forward_to_destination(
+            dest_chat_id=-1001,
+            msg_type="album",
+            payload={
+                "message_id": 4,
+                "items": [
+                    {
+                        "message_id": 4,
+                        "caption": "old",
+                        "caption_html": "<spoiler>old</spoiler>",
+                    }
+                ],
+            },
+            processed_payload={
+                "items": [
+                    {
+                        "message_id": 4,
+                        "caption": "old",
+                        "caption_html": "<spoiler>old</spoiler>",
+                        "processed_caption": "new",
+                        "processed_caption_html": "<spoiler>new</spoiler>",
+                    }
+                ]
+            },
+            relay_chat_id=999,
+            relay_message_ids=[80],
+        )
+
+        # <spoiler> must have been converted to <tg-spoiler> before the API call
+        sender.edit_message_caption.assert_awaited_once_with(
+            -1001, 40, "<tg-spoiler>new</tg-spoiler>", parse_mode="HTML"
+        )
+
+
+class TestTextHtmlNormalisationInForward:
+    """text_html containing Pyrogram-style tags is normalised before sendMessage."""
+
+    @pytest.fixture
+    def sender(self):
+        return TelegramBotSender(bot_token="test:token")
+
+    @pytest.mark.asyncio
+    async def test_text_html_with_spoiler_is_normalised(self, sender):
+        """When text_html contains <spoiler> it is sent as <tg-spoiler> to the Bot API."""
+        sender.send_message = AsyncMock(return_value=55)
+
+        await sender.forward_to_destination(
+            dest_chat_id=-1001,
+            msg_type="text",
+            payload={
+                "message_id": 10,
+                "text": "secret",
+                "text_html": "<spoiler>secret</spoiler>",
+            },
+            processed_payload={"text_changed": False},
+        )
+
+        sender.send_message.assert_awaited_once_with(
+            chat_id=-1001,
+            text="<tg-spoiler>secret</tg-spoiler>",
+            parse_mode="HTML",
+            reply_to_message_id=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_replaced_text_html_with_emoji_is_normalised(self, sender):
+        """Processed text_html with Pyrogram <emoji> tag is normalised before send."""
+        sender.send_message = AsyncMock(return_value=56)
+
+        await sender.forward_to_destination(
+            dest_chat_id=-1001,
+            msg_type="text",
+            payload={
+                "message_id": 11,
+                "text": "hi 👍",
+                "text_html": 'hi <emoji id="99">👍</emoji>',
+            },
+            processed_payload={
+                "text_changed": True,
+                "processed_text": "hey 👍",
+                "processed_text_html": 'hey <emoji id="99">👍</emoji>',
+            },
+        )
+
+        sender.send_message.assert_awaited_once_with(
+            chat_id=-1001,
+            text='hey <tg-emoji emoji-id="99">👍</tg-emoji>',
+            parse_mode="HTML",
+            reply_to_message_id=None,
+        )
+
