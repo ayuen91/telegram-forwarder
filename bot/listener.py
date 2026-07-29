@@ -809,7 +809,13 @@ async def forward_message_pipeline(
 
 
 def _is_native_forward_fallback_error(exc: Exception) -> bool:
-    """True if the error suggests falling back to copy/send is worthwhile."""
+    """True if the error suggests falling back to copy/send is worthwhile.
+
+    Covers all known Telegram error responses that indicate the sender bot
+    cannot forward from the origin channel (not a member, not admin, private
+    channel, kicked, etc.).  Any error in this list triggers the safe
+    copy/send fallback instead of bubbling up to the failed-queue handler.
+    """
     msg = str(exc).lower()
     keywords = (
         "protected",
@@ -824,6 +830,17 @@ def _is_native_forward_fallback_error(exc: Exception) -> bool:
         "forbidden",
         "forwardmessage failed",
         "forwardmessages failed",
+        # Bot is not a member / participant of the origin channel
+        "channel_private",
+        "user_not_participant",
+        "not a member",
+        "bot was kicked",
+        "kicked from",
+        # Origin peer is inaccessible or the ID is stale/invalid
+        "peer_id_invalid",
+        # Generic admin-rights errors from some Telegram servers
+        "need administrator rights",
+        "administrator rights",
     )
     return any(k in msg for k in keywords)
 

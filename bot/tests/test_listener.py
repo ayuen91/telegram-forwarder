@@ -32,6 +32,7 @@ _install_hydrogram_stub()
 
 from listener import (
     _get_message_type,
+    _is_native_forward_fallback_error,
     _serialize_contact,
     _serialize_location,
     _serialize_poll,
@@ -215,3 +216,64 @@ class TestSerialization:
         assert payload["reply_to_quote_text"] == "Selected quoted text"
         assert payload["reply_to_quote_html"] == "<b>Selected quoted text</b>"
         assert payload["reply_to_quote_position"] == 12
+
+
+class TestNativeForwardFallbackError:
+    """_is_native_forward_fallback_error should match all access-denial errors."""
+
+    # ── errors present before this fix ──────────────────────────────────
+    def test_protected(self):
+        assert _is_native_forward_fallback_error(Exception("Content is protected"))
+
+    def test_cannot_be_forwarded(self):
+        assert _is_native_forward_fallback_error(Exception("cannot be forwarded"))
+
+    def test_message_not_found(self):
+        assert _is_native_forward_fallback_error(Exception("message not found"))
+
+    def test_chat_not_found(self):
+        assert _is_native_forward_fallback_error(Exception("chat not found"))
+
+    def test_not_enough_rights(self):
+        assert _is_native_forward_fallback_error(Exception("not enough rights to post"))
+
+    def test_bot_is_not_a_member(self):
+        assert _is_native_forward_fallback_error(Exception("Bot is not a member of the channel"))
+
+    def test_forbidden(self):
+        assert _is_native_forward_fallback_error(Exception("Forbidden: bot is not a member"))
+
+    def test_forwardmessage_failed(self):
+        assert _is_native_forward_fallback_error(Exception("Bot API forwardMessage failed: ..."))
+
+    # ── new keywords added by this fix ───────────────────────────────────
+    def test_channel_private(self):
+        assert _is_native_forward_fallback_error(Exception("CHANNEL_PRIVATE"))
+
+    def test_user_not_participant(self):
+        assert _is_native_forward_fallback_error(Exception("USER_NOT_PARTICIPANT"))
+
+    def test_not_a_member(self):
+        assert _is_native_forward_fallback_error(Exception("Bot is not a member of channel"))
+
+    def test_bot_was_kicked(self):
+        assert _is_native_forward_fallback_error(Exception("bot was kicked from the channel"))
+
+    def test_kicked_from(self):
+        assert _is_native_forward_fallback_error(Exception("Kicked from supergroup"))
+
+    def test_peer_id_invalid(self):
+        assert _is_native_forward_fallback_error(Exception("PEER_ID_INVALID"))
+
+    def test_need_administrator_rights(self):
+        assert _is_native_forward_fallback_error(Exception("Need administrator rights in the channel"))
+
+    def test_administrator_rights(self):
+        assert _is_native_forward_fallback_error(Exception("Bad Request: administrator rights required"))
+
+    # ── unrelated errors must NOT match ─────────────────────────────────
+    def test_unrelated_error_returns_false(self):
+        assert not _is_native_forward_fallback_error(Exception("network timeout"))
+
+    def test_flood_wait_returns_false(self):
+        assert not _is_native_forward_fallback_error(Exception("Too Many Requests: retry after 30"))
