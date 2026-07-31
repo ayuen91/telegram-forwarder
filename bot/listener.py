@@ -12,6 +12,7 @@ to Telegram and prevent FloodWait errors.
 """
 
 import asyncio
+import itertools
 import json
 import logging
 import random
@@ -39,6 +40,17 @@ try:
     from hydrogram.raw.types import UpdateChannelTooLong
 except (ImportError, ModuleNotFoundError, RuntimeError):
     UpdateChannelTooLong = None  # Graceful fallback
+
+try:
+    from hydrogram.raw.types import UpdateDeleteChannelMessages
+except (ImportError, ModuleNotFoundError, RuntimeError, AttributeError):
+    UpdateDeleteChannelMessages = None  # Graceful fallback
+
+try:
+    from hydrogram.raw.types import UpdateDeleteMessages
+except (ImportError, ModuleNotFoundError, RuntimeError, AttributeError):
+    UpdateDeleteMessages = None  # Graceful fallback
+
 from hydrogram.types import Message
 
 from media_relay import RelayConfig, relay_to_bot, cleanup_relay
@@ -52,6 +64,11 @@ from forward_attribution import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Monotonic sequence counter for PriorityQueue FIFO ordering.
+# itertools.count() is GIL-safe: next() is an atomic C-level operation so
+# concurrent asyncio tasks get unique, strictly increasing sequence numbers.
+_MSG_SEQ = itertools.count()
 
 ForwardStatus = Literal["success", "failed", "defer"]
 
@@ -145,7 +162,8 @@ def normalize_message(message: Message) -> Optional[Dict[str, Any]]:
 
     caption_html: Optional[str] = None
     if getattr(message, "caption", None):
-        caption_html = str(message.caption.html) if getattr(message.caption, "entities", None) else str(message.caption)
+        _ch = str(message.caption.html) if getattr(message.caption, "entities", None) else str(message.caption)
+        caption_html = _ch if _ch and _ch != "None" else None
 
     # Detect Restrict Saving Content (protected content) flag.
     # When True, copy_message / copy_media_group will raise
@@ -193,13 +211,19 @@ def normalize_message(message: Message) -> Optional[Dict[str, Any]]:
         reply_to_quote_html = reply_to_quote_text
         reply_to_quote_position = getattr(message.reply_to, "quote_offset", None)
 
+    # caption: convert to str but guard against Hydrogram Str objects that
+    # may stringify to the literal word "None" when the caption is absent.
+    _raw_caption = getattr(message, "caption", None)
+    _caption_str = str(_raw_caption) if _raw_caption is not None else None
+    _caption_safe = _caption_str if (_caption_str and _caption_str != "None") else None
+
     payload = {
         "message_id": message.id,
         "chat_id": message.chat.id,
         "type": msg_type,
         # plain text kept for DB storage / replacement matching
         "text": str(message.text) if getattr(message, "text", None) else None,
-        "caption": str(message.caption) if getattr(message, "caption", None) else None,
+        "caption": _caption_safe,
         # HTML-encoded text that carries all Telegram formatting entities
         "text_html": text_html,
         "caption_html": caption_html,
@@ -212,6 +236,7 @@ def normalize_message(message: Message) -> Optional[Dict[str, Any]]:
         "reply_to_quote_position": reply_to_quote_position,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+
 
     reply_markup = _serialize_reply_markup(getattr(message, "reply_markup", None))
     if reply_markup:
@@ -235,10 +260,18 @@ def normalize_message(message: Message) -> Optional[Dict[str, Any]]:
 
 def _get_message_type(message: Message) -> Optional[str]:
     """Map Hydrogram message to our type string."""
-    if getattr(message, "pinned_message", None) or (
-        getattr(message, "service", False) and "pin" in str(getattr(message, "action", "")).lower()
-    ):
-        return "pin"
+    # Check service/action messages first — before any media checks.
+    # IMPORTANT: check for "unpin" BEFORE "pin" because the string "unpin"
+    # contains "pin", so a naive substring match would misidentify an unpin
+    # action as a pin and cause the bot to re-pin a message when the source
+    # channel actually removed a pin.
+    action_str = str(getattr(message, "action", "")).lower()
+    if getattr(message, "service", False) or getattr(message, "pinned_message", None):
+        if "unpin" in action_str:
+            # Unpin action — we don't forward unpins, skip silently.
+            return None
+        if getattr(message, "pinned_message", None) or "pin" in action_str:
+            return "pin"
     elif message.text:
         return "text"
     elif message.photo:
@@ -1066,6 +1099,7 @@ async def message_worker(
     alert_chat_id: int = 0,
     delay_min: float = 0.5,
     delay_max: float = 1.5,
+    send_lock: Optional[asyncio.Lock] = None,
 ):
     """
     Worker task: pulls messages from asyncio.Queue, applies local replacements,
@@ -1074,7 +1108,17 @@ async def message_worker(
     logger.info(f"Worker-{worker_id} started")
 
     while True:
-        payload = await queue.get()
+        item = await queue.get()
+
+        # Support PriorityQueue items — 3-tuples of (priority_key, seq, payload) —
+        # and plain payload dicts for backward compatibility with any call-site
+        # that still passes a bare dict (e.g. unit tests).
+        if isinstance(item, tuple) and len(item) == 3:
+            _prio, _seq, payload = item
+        else:
+            _prio, _seq, payload = (0, 0, item)
+        _queue_item = (_prio, _seq, payload)  # preserved for FloodWait re-queue
+
         message_id = payload.get("message_id", "unknown")
 
         try:
@@ -1084,46 +1128,75 @@ async def message_worker(
                 logger.debug(f"Worker-{worker_id}: duplicate {message_id}, skipping")
                 continue
 
-            delay = random.uniform(delay_min, delay_max)
-            await asyncio.sleep(delay)
-
             if payload.get("media_group_id"):
                 flush_result = await album_buffer.add(payload)
                 if flush_result:
-                    await process_payload(
-                        sender, queue_manager, flush_result,
-                        db_path, config, dedup=dedup,
-                        hydrogram_app=hydrogram_app, relay=relay,
-                        alert_token=alert_token, alert_chat_id=alert_chat_id,
-                    )
+                    # Acquire send_lock so album delivery is serialised with
+                    # regular messages and source-channel order is maintained.
+                    if send_lock is not None:
+                        async with send_lock:
+                            await process_payload(
+                                sender, queue_manager, flush_result,
+                                db_path, config, dedup=dedup,
+                                hydrogram_app=hydrogram_app, relay=relay,
+                                alert_token=alert_token, alert_chat_id=alert_chat_id,
+                            )
+                    else:
+                        await process_payload(
+                            sender, queue_manager, flush_result,
+                            db_path, config, dedup=dedup,
+                            hydrogram_app=hydrogram_app, relay=relay,
+                            alert_token=alert_token, alert_chat_id=alert_chat_id,
+                        )
+                    # Post-send cooldown outside the lock so other workers can
+                    # acquire it immediately while this worker rests.
+                    await asyncio.sleep(random.uniform(delay_min, delay_max))
                 logger.debug(
                     f"Worker-{worker_id}: buffered album item {message_id} "
                     f"(group={payload['media_group_id']})"
                 )
             else:
-                status = await process_payload(
-                    sender, queue_manager, payload,
-                    db_path, config, dedup=dedup,
-                    hydrogram_app=hydrogram_app, relay=relay,
-                    alert_token=alert_token, alert_chat_id=alert_chat_id,
-                )
+                # Serialise Bot API sends via the send_lock.
+                # The PriorityQueue ensures workers pull messages in ascending
+                # message_id order; the lock ensures sends happen in that same
+                # order even when multiple workers race to acquire it.
+                if send_lock is not None:
+                    async with send_lock:
+                        status = await process_payload(
+                            sender, queue_manager, payload,
+                            db_path, config, dedup=dedup,
+                            hydrogram_app=hydrogram_app, relay=relay,
+                            alert_token=alert_token, alert_chat_id=alert_chat_id,
+                        )
+                else:
+                    status = await process_payload(
+                        sender, queue_manager, payload,
+                        db_path, config, dedup=dedup,
+                        hydrogram_app=hydrogram_app, relay=relay,
+                        alert_token=alert_token, alert_chat_id=alert_chat_id,
+                    )
                 if status == "success":
                     logger.info(
                         f"Worker-{worker_id}: processed message {message_id} "
                         f"type={payload.get('type')}"
                     )
+                # Post-send cooldown applied after lock release so the next
+                # worker can acquire it immediately.  Still provides the natural
+                # rate-limiting needed to avoid Telegram FloodWait errors.
+                await asyncio.sleep(random.uniform(delay_min, delay_max))
 
         except TelegramFloodWait as e:
-            # Bot API 429 — sleep the requested duration then re-queue
+            # Bot API 429 — sleep the requested duration then re-queue.
+            # Re-queue as the original priority tuple to preserve source order.
             wait = e.retry_after + 1
             logger.warning(
                 f"Worker-{worker_id}: Bot API FloodWait {wait}s — "
                 f"re-queuing message {message_id}"
             )
             await asyncio.sleep(wait)
-            await queue.put(payload)
+            await queue.put(_queue_item)
         except FloodWait as e:
-            # Hydrogram (MTProto) flood wait — also sleep + re-queue
+            # Hydrogram (MTProto) flood wait — also sleep + re-queue.
             # Previously this fell through to the generic Exception handler
             # which moved the message to the failed queue instead of retrying.
             wait = e.value + 1
@@ -1132,7 +1205,7 @@ async def message_worker(
                 f"re-queuing message {message_id}"
             )
             await asyncio.sleep(wait)
-            await queue.put(payload)
+            await queue.put(_queue_item)
         except Exception as e:
             logger.error(
                 f"Worker-{worker_id}: error processing message {message_id}: {e}",
@@ -1178,6 +1251,7 @@ def register_listener(
     message_queue: asyncio.Queue,
     redis_client=None,
     bot_start_time: Optional[int] = None,
+    deletion_queue: Optional[asyncio.Queue] = None,
 ):
     """
     bot_start_time — Unix timestamp (seconds) recorded when the bot started.
@@ -1264,17 +1338,20 @@ def register_listener(
 
         try:
             # Non-blocking put — never suspends the dispatcher.
-            # If the queue is full, spill to Redis so no messages are lost
-            # and Hydrogram can immediately deliver the next update.
-            message_queue.put_nowait(payload)
+            # PriorityQueue items are 3-tuples: (message_id, seq, payload).
+            # Lower message_id = higher priority; seq breaks ties so earlier
+            # arrivals of the same message_id are always processed first.
+            _msg_id = int(payload.get("message_id") or 0)
+            _seq = next(_MSG_SEQ)
+            message_queue.put_nowait((_msg_id, _seq, payload))
             logger.info(
                 f"Enqueued message {message.id} type={payload['type']} "
                 f"(queue={message_queue.qsize()}/{message_queue.maxsize}) "
                 f"media_group={payload.get('media_group_id')}"
             )
         except asyncio.QueueFull:
-            # Queue at capacity — spill to Redis overflow list.
-            # overflow_drainer() will refill the queue as workers drain it.
+            # Queue at capacity — spill raw payload JSON to Redis overflow list.
+            # overflow_drainer() will reconstruct the priority tuple on drain.
             if redis_client is not None:
                 try:
                     import json as _json
@@ -1304,14 +1381,71 @@ def register_listener(
     async def on_message(client: Client, message: Message):
         await _handle(client, message)
 
-    # ── Raw update handler — PTS-aware catch-up ─────────────────────────────────
-    # Handles UpdateChannelTooLong (channel-specific PTS desync, most precise)
-    # and the generic UpdatesTooLong sentinel (session-wide fallback).
-    # Uses listener:last_msg_id:{chat_id} as a watermark so only the true gap
-    # is fetched — no static cooldown that could permanently stall on busy channels.
+    # ── Raw update handler — deletions + PTS-aware catch-up ─────────────────────
+    # Handles:
+    #   UpdateDeleteChannelMessages — message deleted in the source channel
+    #   UpdateDeleteMessages        — message deleted in a group/private chat
+    #   UpdateChannelTooLong        — channel PTS desync → targeted catch-up
+    #   UpdatesTooLong              — session-wide PTS desync → full catch-up
     @app.on_raw_update()
     async def _on_raw_update(client: Client, update, users, chats):
         logger.debug(f"[RAW UPDATE] type={type(update).__name__}")
+
+        # ── Deletion propagation ─────────────────────────────────────────────────
+        # UpdateDeleteChannelMessages fires when a message is deleted in a channel.
+        # It includes the channel_id and a list of deleted message IDs so we can
+        # precisely identify which source messages were removed.
+        if (
+            UpdateDeleteChannelMessages is not None
+            and isinstance(update, UpdateDeleteChannelMessages)
+        ):
+            raw_channel_id = getattr(update, "channel_id", None)
+            if raw_channel_id is not None:
+                channel_chat_id = int(f"-100{raw_channel_id}")
+                if channel_chat_id == source_chat_id and deletion_queue is not None:
+                    deleted_ids = list(getattr(update, "messages", []) or [])
+                    if deleted_ids:
+                        logger.info(
+                            f"Source channel deleted {len(deleted_ids)} "
+                            f"message(s): {deleted_ids}"
+                        )
+                        try:
+                            deletion_queue.put_nowait({
+                                "type": "channel_deletion",
+                                "source_chat_id": source_chat_id,
+                                "message_ids": deleted_ids,
+                            })
+                        except asyncio.QueueFull:
+                            logger.warning(
+                                f"Deletion queue full — dropping delete event "
+                                f"for IDs {deleted_ids}"
+                            )
+            return
+
+        # UpdateDeleteMessages fires for group/private-chat deletions and does NOT
+        # carry a chat_id. The deletion worker resolves ownership via the DB.
+        if (
+            UpdateDeleteMessages is not None
+            and isinstance(update, UpdateDeleteMessages)
+        ):
+            if deletion_queue is not None:
+                deleted_ids = list(getattr(update, "messages", []) or [])
+                if deleted_ids:
+                    logger.debug(
+                        f"Group/private deletion event: {len(deleted_ids)} message ID(s)"
+                    )
+                    try:
+                        deletion_queue.put_nowait({
+                            "type": "group_deletion",
+                            "source_chat_id": source_chat_id,
+                            "message_ids": deleted_ids,
+                        })
+                    except asyncio.QueueFull:
+                        logger.warning(
+                            f"Deletion queue full — dropping delete event "
+                            f"for IDs {deleted_ids}"
+                        )
+            return
 
         # UpdateChannelTooLong — channel-specific PTS desync (most precise signal)
         if UpdateChannelTooLong is not None and isinstance(update, UpdateChannelTooLong):
@@ -1393,12 +1527,14 @@ async def _do_channel_catchup(
     newest_id = last_msg_id
     for msg_id, payload in messages_to_process:
         try:
-            message_queue.put_nowait(payload)
+            _seq = next(_MSG_SEQ)
+            message_queue.put_nowait((msg_id, _seq, payload))
             fetched += 1
             if msg_id > newest_id:
                 newest_id = msg_id
         except asyncio.QueueFull:
-            # Spill to Redis overflow instead of abandoning the catch-up.
+            # Spill raw payload to Redis overflow; drainer reconstructs the
+            # priority tuple using the message_id when it refills the queue.
             if redis_client is not None:
                 try:
                     import json as _json
@@ -1504,7 +1640,13 @@ async def overflow_drainer(
 
             payload = _json.loads(payload_json)
             try:
-                message_queue.put_nowait(payload)
+                # Reconstruct a PriorityQueue item from the stored payload.
+                # A fresh seq is assigned so overflow messages sort after any
+                # already-queued item sharing the same message_id (overflow
+                # is inherently lower-priority than live-pushed messages).
+                _omsg_id = int(payload.get("message_id") or 0)
+                _oseq = next(_MSG_SEQ)
+                message_queue.put_nowait((_omsg_id, _oseq, payload))
                 remaining = await redis_client.llen(LISTENER_OVERFLOW_KEY)
                 logger.info(
                     f"Overflow drainer: requeued message {payload.get('message_id')} "
@@ -1528,6 +1670,7 @@ async def overflow_drainer(
             await asyncio.sleep(1.0)
 
 
+
 # make_fallback_poller_factory removed.
 # The get_chat_history polling loop was a high-ban-risk approach (Method 4).
 # Recovery from missed updates is now handled exclusively by two safe mechanisms:
@@ -1535,3 +1678,185 @@ async def overflow_drainer(
 #      (event-driven, only fires when Telegram tells us we missed something)
 #   2. PTS-audited silence watchdog in main.py
 #      (compares updates.GetState() PTS vs listener:last_pts before recycling)
+
+
+# ── Deletion propagation ──────────────────────────────────────────────────────────
+# When the source-channel admin deletes a message, Telegram fires
+# UpdateDeleteChannelMessages (or UpdateDeleteMessages for groups) raw updates.
+# The on_raw_update handler inside register_listener() catches those and enqueues
+# them into a separate deletion_queue.  deletion_worker() consumes that queue,
+# looks up the forwarded copies in SQLite, and removes them from all destinations.
+
+
+async def _process_deletion_event(
+    source_chat_id: int,
+    message_ids: list,
+    db_path: str,
+    sender: TelegramBotSender,
+    config,
+) -> None:
+    """
+    Look up forwarded copies of each deleted source message and remove them
+    from every destination channel via the Bot API.
+
+    For each source_msg_id:
+      1. Queries message_destinations (status='sent') for all forwarded copies.
+      2. Calls sender.delete_message(dest_chat_id, sent_message_id) for each.
+      3. Marks the destination row status='deleted' in SQLite (regardless of
+         whether the API call succeeded — the source is gone either way).
+      4. Marks the parent messages row status='deleted' + deleted_at in SQLite.
+
+    Errors (e.g. bot lacks delete permission in a destination) are logged as
+    warnings — delivery continues for the remaining destinations and events.
+    """
+    destinations = [
+        {"chat_id": d.chat_id, "name": d.name}
+        for d in config.get_active_destinations()
+    ]
+    if not destinations:
+        return
+
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+
+        for source_msg_id in message_ids:
+            # Find every successfully forwarded copy of this source message.
+            cursor = await db.execute(
+                """
+                SELECT md.destination_chat_id,
+                       md.sent_message_id,
+                       md.message_id AS db_message_id
+                FROM   message_destinations md
+                JOIN   messages m ON md.message_id = m.id
+                WHERE  m.source_chat_id        = ?
+                  AND  m.telegram_message_id   = ?
+                  AND  md.status               = 'sent'
+                """,
+                (source_chat_id, source_msg_id),
+            )
+            rows = await cursor.fetchall()
+
+            if not rows:
+                logger.debug(
+                    f"Deletion: source message {source_msg_id} has no forwarded "
+                    "copies to delete (not in DB or already cleaned up)"
+                )
+            else:
+                for row in rows:
+                    dest_chat_id  = row["destination_chat_id"]
+                    sent_msg_id   = row["sent_message_id"]
+                    db_message_id = row["db_message_id"]
+
+                    dest_name = next(
+                        (d["name"] for d in destinations if d["chat_id"] == dest_chat_id),
+                        str(dest_chat_id),
+                    )
+
+                    try:
+                        await sender.delete_message(dest_chat_id, sent_msg_id)
+                        logger.info(
+                            f"Deletion: removed message {sent_msg_id} from "
+                            f"{dest_name} ({dest_chat_id}) "
+                            f"[source msg_id={source_msg_id} in {source_chat_id}]"
+                        )
+                    except Exception as del_err:
+                        # Typically: bot not admin, or lacks can_delete_messages.
+                        # Log as warning — other destinations still get processed.
+                        logger.warning(
+                            f"Deletion: could not delete message {sent_msg_id} "
+                            f"from {dest_name} ({dest_chat_id}): {del_err}"
+                        )
+
+                    # Mark as deleted in DB regardless of API outcome.
+                    # The source message is gone; the local record must reflect that.
+                    await db.execute(
+                        """
+                        UPDATE message_destinations
+                        SET    status  = 'deleted',
+                               sent_at = datetime('now')
+                        WHERE  message_id          = ?
+                          AND  destination_chat_id = ?
+                        """,
+                        (db_message_id, dest_chat_id),
+                    )
+
+            # Mark the parent source-message row as deleted.
+            await db.execute(
+                """
+                UPDATE messages
+                SET    status     = 'deleted',
+                       deleted_at = datetime('now')
+                WHERE  source_chat_id      = ?
+                  AND  telegram_message_id = ?
+                """,
+                (source_chat_id, source_msg_id),
+            )
+
+        await db.commit()
+
+
+async def deletion_worker(
+    deletion_queue: asyncio.Queue,
+    db_path: str,
+    sender: TelegramBotSender,
+    config,
+) -> None:
+    """
+    Background worker that propagates source-channel deletions to destinations.
+
+    Consumes events from deletion_queue (populated by the on_raw_update handler
+    inside register_listener when it sees UpdateDeleteChannelMessages or
+    UpdateDeleteMessages).
+
+    Each event is a dict:
+        {
+            "type":           "channel_deletion" | "group_deletion",
+            "source_chat_id": int,
+            "message_ids":    [int, ...],
+        }
+
+    For each source message_id the worker:
+      1. Queries message_destinations for all forwarded copies with status='sent'.
+      2. Calls Bot API deleteMessage on each destination copy.
+      3. Marks the destination row status='deleted' in SQLite.
+      4. Marks the parent messages row status='deleted' + deleted_at in SQLite.
+
+    NOTE: The sender bot must be an administrator with can_delete_messages=True
+    in each destination channel.  Without that permission, API calls will fail
+    and the deletion will be logged as a warning but will not crash the worker.
+    """
+    logger.info("Deletion worker started")
+
+    while True:
+        try:
+            event = await deletion_queue.get()
+
+            source_chat_id = event.get("source_chat_id")
+            message_ids    = event.get("message_ids") or []
+
+            if source_chat_id and message_ids:
+                try:
+                    await _process_deletion_event(
+                        source_chat_id=int(source_chat_id),
+                        message_ids=[int(mid) for mid in message_ids],
+                        db_path=db_path,
+                        sender=sender,
+                        config=config,
+                    )
+                except Exception as ev_err:
+                    logger.error(
+                        f"Deletion worker: error processing event {event}: {ev_err}",
+                        exc_info=True,
+                    )
+
+            deletion_queue.task_done()
+
+        except asyncio.CancelledError:
+            logger.info("Deletion worker cancelled — shutting down")
+            return
+        except Exception as loop_err:
+            logger.error(
+                f"Deletion worker: unexpected loop error: {loop_err}",
+                exc_info=True,
+            )
+            await asyncio.sleep(1.0)

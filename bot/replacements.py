@@ -80,6 +80,7 @@ def build_processed_payload(payload: Dict[str, Any], config) -> Dict[str, Any]:
                 item_copy["processed_caption"] = processed
                 if item_copy.get("caption_html"):
                     item_copy["processed_caption_html"] = processed
+                item_copy["caption_changed"] = changed  # authoritative per-item flag
                 if changed:
                     any_caption_changed = True
             items.append(item_copy)

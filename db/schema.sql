@@ -19,12 +19,13 @@ CREATE TABLE IF NOT EXISTS messages (
     media_group_id      TEXT,               -- Non-null for album items
     album_item_count    INTEGER,            -- Number of items in album (for album type)
     status              TEXT NOT NULL DEFAULT 'received',
-    -- Status flow: received -> queued -> processing -> sent | failed | dead_letter
+    -- Status flow: received -> queued -> processing -> sent | failed | dead_letter | deleted
     error_message       TEXT,
     retry_count         INTEGER DEFAULT 0,
     received_at         TEXT DEFAULT (datetime('now')),
     processed_at        TEXT,
     sent_at             TEXT,
+    deleted_at          TEXT,               -- Set when source message is deleted
     UNIQUE(telegram_message_id, source_chat_id)
 );
 

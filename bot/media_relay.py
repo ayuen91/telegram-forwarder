@@ -143,14 +143,66 @@ async def _direct_copy(
     message_ids: List[int],
     is_album: bool,
 ) -> List[int]:
-    """Standard copy_message / copy_media_group (fast path)."""
-    if is_album or len(message_ids) > 1:
-        copied = await app.copy_media_group(
-            chat_id=target,
-            from_chat_id=source_chat_id,
-            message_id=message_ids[0],
+    """Standard copy_message / copy_media_group (fast path).
+
+    For albums we fetch each item by its known message_id and re-send them as
+    a media group using file_ids.  This bypasses Telegram's messages.getMediaGroup
+    RPC (used by copy_media_group) which is capped at ±5 items around the anchor
+    and silently truncates albums larger than ~6 items when anchored at item[0].
+    """
+    if is_album and len(message_ids) > 1:
+        from hydrogram.types import (
+            InputMediaPhoto,
+            InputMediaVideo,
+            InputMediaDocument,
+            InputMediaAudio,
         )
-        return [msg.id for msg in copied]
+
+        # Fetch every item by its explicit ID (replies=0 avoids fetching reply
+        # parent messages which can raise MESSAGE_IDS_EMPTY in protected channels).
+        messages = await app.get_messages(source_chat_id, message_ids, replies=0)
+        if not isinstance(messages, list):
+            messages = [messages]
+        messages = sorted(
+            [m for m in messages if m and not m.empty],
+            key=lambda m: m.id,
+        )
+
+        if not messages:
+            raise RuntimeError(
+                f"No fetchable messages for album IDs {message_ids} "
+                f"in chat {source_chat_id}"
+            )
+
+        # Build InputMedia list using file_ids (no disk download required).
+        media_group = []
+        for msg in messages:
+            caption = str(msg.caption) if msg.caption else ""
+            if caption == "None":
+                caption = ""
+            if msg.photo:
+                media_group.append(InputMediaPhoto(msg.photo.file_id, caption=caption))
+            elif msg.video:
+                media_group.append(InputMediaVideo(msg.video.file_id, caption=caption))
+            elif msg.audio:
+                media_group.append(InputMediaAudio(msg.audio.file_id, caption=caption))
+            elif msg.document:
+                media_group.append(InputMediaDocument(msg.document.file_id, caption=caption))
+            else:
+                # Unsupported type — skip with a warning rather than crashing.
+                logger.warning(
+                    f"Unsupported album item type for msg {msg.id} "
+                    "— skipping item in relay"
+                )
+
+        if not media_group:
+            raise RuntimeError(
+                "No supported media items found for album relay (all items unsupported type)"
+            )
+
+        sent = await app.send_media_group(target, media_group)
+        return [m.id for m in sent]
+
     else:
         copied = await app.copy_message(
             chat_id=target,
@@ -251,7 +303,9 @@ async def _download_reupload_single(
             "(protected content channel)"
         )
 
-    caption = str(msg.caption) if msg.caption else None
+    # Guard: Hydrogram may stringify a missing caption as the literal "None".
+    _rc = msg.caption
+    caption = (str(_rc) if _rc is not None and str(_rc) != "None" else None)
 
     if msg.photo:
         sent = await app.send_photo(target, file_path, caption=caption)
@@ -302,7 +356,9 @@ async def _download_reupload_album(
             )
             continue
 
-        caption = str(msg.caption) if msg.caption else ""
+        # Guard: Hydrogram may stringify a missing caption as the literal "None".
+        _rc = msg.caption
+        caption = (str(_rc) if _rc is not None and str(_rc) != "None" else "") or ""
 
         if msg.photo:
             media_group.append(InputMediaPhoto(file_path, caption=caption))

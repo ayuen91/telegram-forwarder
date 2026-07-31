@@ -17,7 +17,7 @@ import os
 import signal
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 # Monkey patch Hydrogram to support 64-bit channel IDs (like -1002...)
@@ -52,6 +52,7 @@ from listener import (
     process_payload,
     retry_payload,
     overflow_drainer,
+    deletion_worker,
     _do_channel_catchup,
     LISTENER_LAST_RECEIVED_KEY,
     LISTENER_LAST_PTS_KEY,
@@ -87,6 +88,10 @@ class WorkerContext:
     delay_max: float
     alert_token: str
     alert_chat_id: int
+    # Serialises Bot API sends across all message workers so that messages
+    # are delivered to destinations in the same order they were received from
+    # the source channel (works in concert with the PriorityQueue).
+    send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 async def supervised_task(name: str, coro_factory, restart_delay: float = 5.0):
@@ -164,7 +169,7 @@ async def supervised_task(name: str, coro_factory, restart_delay: float = 5.0):
 
 
 async def init_database(db_path: str):
-    """Apply schema.sql on first run."""
+    """Apply schema.sql on first run and run incremental column migrations."""
     schema_path = Path("/app/db/schema.sql")
     if not schema_path.exists():
         logger.warning(f"schema.sql not found at {schema_path}")
@@ -173,6 +178,23 @@ async def init_database(db_path: str):
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     async with aiosqlite.connect(db_path) as db:
         await db.executescript(schema_path.read_text())
+
+        # Incremental migrations — ALTER TABLE ADD COLUMN is idempotent here:
+        # aiosqlite raises OperationalError("duplicate column name: …") when the
+        # column already exists; we catch and skip so the schema stays compatible
+        # between fresh deployments and in-place upgrades.
+        _migrations = [
+            "ALTER TABLE messages ADD COLUMN deleted_at TEXT",
+        ]
+        for _stmt in _migrations:
+            try:
+                await db.execute(_stmt)
+            except aiosqlite.OperationalError as _oe:
+                if "duplicate column name" in str(_oe).lower():
+                    pass  # Column already present — migration already applied
+                else:
+                    raise
+
         await db.commit()
         logger.info(f"Database initialized at {db_path}")
 
@@ -248,6 +270,7 @@ def make_worker_factory(worker_id: int, queue: asyncio.Queue, ctx: WorkerContext
             alert_chat_id=ctx.alert_chat_id,
             delay_min=ctx.delay_min,
             delay_max=ctx.delay_max,
+            send_lock=ctx.send_lock,
         )
     return worker
 
@@ -257,12 +280,15 @@ def make_album_flush_factory(ctx: WorkerContext):
         while not shutdown_event.is_set():
             try:
                 for album_payload in await ctx.album_buf.check_and_flush_expired():
-                    await process_payload(
-                        ctx.sender, ctx.queue_mgr, album_payload,
-                        ctx.db_path, ctx.config, dedup=ctx.dedup,
-                        hydrogram_app=ctx.hydrogram_app, relay=ctx.relay,
-                        alert_token=ctx.alert_token, alert_chat_id=ctx.alert_chat_id,
-                    )
+                    # Use the send_lock so timed-out album flushes are delivered
+                    # in source order alongside normal messages.
+                    async with ctx.send_lock:
+                        await process_payload(
+                            ctx.sender, ctx.queue_mgr, album_payload,
+                            ctx.db_path, ctx.config, dedup=ctx.dedup,
+                            hydrogram_app=ctx.hydrogram_app, relay=ctx.relay,
+                            alert_token=ctx.alert_token, alert_chat_id=ctx.alert_chat_id,
+                        )
             except Exception as e:
                 logger.error(f"Album flush error: {e}", exc_info=True)
             await asyncio.sleep(0.5)
@@ -676,8 +702,18 @@ async def main():
         db_path=settings.db_path,
     )
 
-    message_queue = asyncio.Queue(maxsize=settings.queue_max_size)
-    logger.info(f"Message queue initialised (maxsize={settings.queue_max_size})")
+    # PriorityQueue ensures messages are processed in ascending message_id order
+    # (oldest-first) even when multiple workers are active. Items are 3-tuples:
+    # (message_id: int, seq: int, payload: dict). Lower message_id = higher priority.
+    message_queue: asyncio.Queue = asyncio.PriorityQueue(maxsize=settings.queue_max_size)
+    logger.info(
+        f"Message queue initialised (PriorityQueue, maxsize={settings.queue_max_size})"
+    )
+
+    # Separate lightweight queue for deletion propagation events.
+    # Populated by the on_raw_update handler when UpdateDeleteChannelMessages or
+    # UpdateDeleteMessages fires; consumed by deletion_worker().
+    deletion_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
 
     # Record startup time BEFORE connecting so the listener can drop
     # any backlog updates Telegram pushes upon reconnect.
@@ -755,6 +791,7 @@ async def main():
         message_queue,
         redis_client=redis_client,
         bot_start_time=bot_start_time,
+        deletion_queue=deletion_queue,
     )
 
     # Initial channel catch-up to process any messages sent during startup
@@ -828,14 +865,30 @@ async def main():
         name="health",
     ))
 
-    # Overflow drainer: refills the asyncio.Queue from Redis when the queue
-    # was full and messages had to be spilled. Runs independently of workers.
+    # Overflow drainer: refills the asyncio.PriorityQueue from Redis when the
+    # queue was full and messages had to be spilled. Runs independently of workers.
     async def _overflow_drainer_factory():
         await overflow_drainer(message_queue, redis_client, shutdown_event)
 
     tasks.append(asyncio.create_task(
         supervised_task("overflow-drainer", _overflow_drainer_factory),
         name="overflow-drainer",
+    ))
+
+    # Deletion-propagation worker: listens for UpdateDeleteChannelMessages events
+    # forwarded by register_listener and removes the forwarded copies from each
+    # destination channel via Bot API deleteMessage.
+    async def _deletion_worker_factory():
+        await deletion_worker(
+            deletion_queue=deletion_queue,
+            db_path=ctx.db_path,
+            sender=ctx.sender,
+            config=ctx.config,
+        )
+
+    tasks.append(asyncio.create_task(
+        supervised_task("deletion-worker", _deletion_worker_factory),
+        name="deletion-worker",
     ))
 
     tasks.append(asyncio.create_task(
@@ -910,7 +963,8 @@ async def main():
         ))
 
     logger.info(
-        f"Workers running: {settings.worker_count} processors, album-flush, retry, health, overflow-drainer"
+        f"Workers running: {settings.worker_count} processors, album-flush, retry, "
+        "health, overflow-drainer, deletion-worker"
         + (", alert-listener" if settings.alert_bot_token and settings.alert_chat_id else "")
         + (", daily-report" if settings.daily_report_enabled else "")
         + (f", silence-watchdog (PTS-audited, {settings.listener_silence_timeout}s threshold)" if settings.listener_silence_timeout > 0 else "")

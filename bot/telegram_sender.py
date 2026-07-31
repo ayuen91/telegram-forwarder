@@ -288,6 +288,93 @@ class TelegramBotSender:
         }
         return await self._call("pinChatMessage", payload)
 
+    async def delete_message(
+        self,
+        chat_id: Union[int, str],
+        message_id: Union[int, str],
+    ) -> bool:
+        """
+        Delete a message from a chat via Bot API deleteMessage.
+
+        Returns True on success.  Silently treats "message not found" /
+        "message can't be deleted" as success since the message may already
+        have been removed by another means or the bot may have re-started.
+
+        Requires the bot to be an administrator with can_delete_messages = True
+        in the target chat/channel.
+        """
+        try:
+            result = await self._call(
+                "deleteMessage",
+                {"chat_id": chat_id, "message_id": int(message_id)},
+            )
+            return bool(result)
+        except RuntimeError as e:
+            err_msg = str(e).lower()
+            if (
+                "message to delete not found" in err_msg
+                or "message_id_invalid" in err_msg
+                or "message can't be deleted" in err_msg
+                or "message is not modified" in err_msg
+            ):
+                # Already deleted or inaccessible — treat as success to avoid
+                # unnecessary retries.
+                logger.debug(
+                    f"delete_message: {chat_id}/{message_id} already gone or "
+                    f"inaccessible: {e}"
+                )
+                return True
+            raise
+
+    async def delete_messages_batch(
+        self,
+        chat_id: Union[int, str],
+        message_ids: List[Union[int, str]],
+    ) -> bool:
+        """
+        Delete up to 100 messages at once via Bot API deleteMessages (Bot API 7.0+).
+
+        Falls back to sequential deleteMessage calls when deleteMessages is
+        unavailable (older Bot API endpoints or older Telegram server versions).
+        Returns True when all deletes succeeded (or were already gone).
+        """
+        if not message_ids:
+            return True
+
+        valid_ids = [int(mid) for mid in message_ids if mid and int(mid) > 0]
+        if not valid_ids:
+            return True
+
+        # deleteMessages accepts up to 100 IDs per call (Bot API 7.0+).
+        try:
+            await self._call(
+                "deleteMessages",
+                {"chat_id": chat_id, "message_ids": valid_ids[:100]},
+            )
+            return True
+        except RuntimeError as e:
+            err_msg = str(e).lower()
+            if "message to delete not found" in err_msg or "message_id_invalid" in err_msg:
+                return True  # All already deleted
+            if "method not found" in err_msg or "not supported" in err_msg:
+                logger.debug(
+                    "deleteMessages not available — falling back to sequential deleteMessage"
+                )
+            else:
+                raise
+
+        # Sequential fallback for servers that don't support deleteMessages
+        all_ok = True
+        for mid in valid_ids:
+            try:
+                await self.delete_message(chat_id, mid)
+            except Exception as e:
+                logger.warning(
+                    f"delete_messages_batch: failed to delete {mid} from {chat_id}: {e}"
+                )
+                all_ok = False
+        return all_ok
+
     async def copy_message(
         self,
         chat_id: Union[int, str],
@@ -692,13 +779,29 @@ class TelegramBotSender:
             )
 
             for item, sent_id in zip(sorted_items, sent_ids):
-                # Compare against the plain-text original so the check works
-                # regardless of whether the source had HTML formatting.
-                original_plain = item.get("caption") or ""
+                # Only edit the caption when a replacement rule actually changed it.
+                #
+                # Use the authoritative per-item flag set by replacements.py first.
+                # If it's absent (e.g. old payloads / test data without the flag),
+                # fall back to a like-for-like text comparison:
+                #   - HTML caption present → compare processed_caption_html vs caption_html
+                #   - plain caption only   → compare processed_caption vs caption
+                # This avoids the old bug where processed_caption (HTML-sourced) was
+                # compared against item["caption"] (plain text), causing a false
+                # positive on every album item with formatted captions.
+                caption_changed = bool(item.get("caption_changed"))
                 processed_html = item.get("processed_caption_html")
-                processed_plain = item.get("processed_caption") or original_plain
-                # Fire the edit only when a replacement rule actually changed the text.
-                if processed_plain != original_plain:
+                processed_plain = item.get("processed_caption")
+
+                if not caption_changed:
+                    if processed_html is not None:
+                        # Both sides are HTML — compare HTML to HTML
+                        caption_changed = processed_html != (item.get("caption_html") or "")
+                    elif processed_plain is not None:
+                        # Plain text only — compare plain to plain
+                        caption_changed = processed_plain != (item.get("caption") or "")
+
+                if caption_changed:
                     try:
                         if processed_html:
                             # Replacement fired on an HTML-formatted caption — preserve
@@ -708,7 +811,7 @@ class TelegramBotSender:
                                 _normalize_html_for_bot_api(processed_html),
                                 parse_mode="HTML",
                             )
-                        else:
+                        elif processed_plain:
                             # Plain-text caption — send without parse_mode.
                             await self.edit_message_caption(
                                 dest_chat_id, sent_id, processed_plain,
@@ -718,6 +821,7 @@ class TelegramBotSender:
                         logger.warning(
                             f"Failed to edit caption for album item {sent_id} in {dest_chat_id}: {cap_err}"
                         )
+
 
             reply_mappings = [
                 (int(item["message_id"]), sent_id)
