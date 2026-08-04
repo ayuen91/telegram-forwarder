@@ -10,6 +10,7 @@ Each cycle (every 5 minutes) does four things:
 """
 
 import logging
+import os
 import shutil
 import time
 from dataclasses import dataclass
@@ -17,6 +18,7 @@ from pathlib import Path
 from typing import List, Optional
 
 import aiohttp
+import aiosqlite
 import redis.asyncio as aioredis
 
 logger = logging.getLogger(__name__)
@@ -44,7 +46,7 @@ class HealthMonitor:
         await monitor.startup_self_test()
     """
 
-    HEARTBEAT_FILE = Path("/app/data/heartbeat")
+    HEARTBEAT_FILE = Path(os.getenv("HEARTBEAT_FILE", "/app/data/heartbeat"))
 
     def __init__(
         self,
@@ -72,6 +74,9 @@ class HealthMonitor:
         # Reactive failure rate tracking
         self._last_failure_rate: Optional[float] = None
         self._last_failure_state: str = "normal"
+
+        # DB cleanup — track last run date to fire once per calendar day
+        self._last_db_cleanup_date: Optional[str] = None
 
     async def run_all_checks(self) -> List[HealthCheckResult]:
         """Run all health checks and return results."""
@@ -136,6 +141,9 @@ class HealthMonitor:
         # Step 4: Evaluate state transitions for alerting (fire once on change)
         await self._process_state_transition_alerts(results)
 
+        # Step 5: Run daily DB cleanup (once per calendar day)
+        await self._maybe_run_db_cleanup()
+
         # Log summary
         failed = [r for r in results if not r.passed]
         passed = sum(1 for r in results if r.passed)
@@ -178,6 +186,44 @@ class HealthMonitor:
             logger.info("Startup self-test: all checks passed ✓")
 
         return True
+
+    async def _maybe_run_db_cleanup(self, retention_days: int = 30) -> None:
+        """
+        Delete messages and reply-map entries older than retention_days.
+        Runs at most once per calendar day to keep tables from growing unbounded.
+        """
+        import datetime
+        today = datetime.date.today().isoformat()
+        if self._last_db_cleanup_date == today:
+            return
+        self._last_db_cleanup_date = today
+
+        try:
+            cutoff = f"-{retention_days} days"
+            async with aiosqlite.connect(self.db_path) as db:
+                # Remove destination rows whose parent is old (FK cascade not guaranteed)
+                await db.execute(
+                    """
+                    DELETE FROM message_destinations
+                    WHERE message_id IN (
+                        SELECT id FROM messages
+                        WHERE received_at < datetime('now', ?)
+                    )
+                    """,
+                    (cutoff,),
+                )
+                await db.execute(
+                    "DELETE FROM messages WHERE received_at < datetime('now', ?)",
+                    (cutoff,),
+                )
+                await db.execute(
+                    "DELETE FROM message_reply_map WHERE created_at < datetime('now', ?)",
+                    (cutoff,),
+                )
+                await db.commit()
+            logger.info(f"DB cleanup: removed records older than {retention_days} days")
+        except Exception as e:
+            logger.error(f"DB cleanup failed: {e}", exc_info=True)
 
     # ── Individual health checks ──────────────────────────────────────
 

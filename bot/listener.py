@@ -73,7 +73,7 @@ _MSG_SEQ = itertools.count()
 ForwardStatus = Literal["success", "failed", "defer"]
 
 # Message types delivered via Bot API send* methods (no userbot relay).
-_BOT_API_DIRECT_TYPES = frozenset({"text", "poll", "contact", "location", "venue"})
+_BOT_API_DIRECT_TYPES = frozenset({"text", "poll", "contact", "location", "venue", "dice"})
 
 # File media types that require userbot relay before copyMessage delivery.
 _RELAY_MEDIA_TYPES = frozenset({
@@ -111,6 +111,22 @@ def _serialize_reply_markup(reply_markup) -> Optional[Dict[str, Any]]:
                 if getattr(btn.login_url, "forward_text", None):
                     login_dict["forward_text"] = str(btn.login_url.forward_text)
                 btn_dict["login_url"] = login_dict
+            # pay button (invoice keyboard)
+            if getattr(btn, "pay", False):
+                btn_dict["pay"] = True
+            # copy-text button (Bot API 7.3+)
+            copy_text = getattr(btn, "copy_text", None)
+            if copy_text and getattr(copy_text, "text", None):
+                btn_dict["copy_text"] = {"text": str(copy_text.text)}
+            # switch_inline_query_chosen_chat (Bot API 6.7+)
+            chosen = getattr(btn, "switch_inline_query_chosen_chat", None)
+            if chosen is not None:
+                chosen_dict: Dict[str, Any] = {"query": str(getattr(chosen, "query", ""))}
+                for flag in ("allow_user_chats", "allow_bot_chats", "allow_group_chats", "allow_channel_chats"):
+                    val = getattr(chosen, flag, None)
+                    if val is not None:
+                        chosen_dict[flag] = bool(val)
+                btn_dict["switch_inline_query_chosen_chat"] = chosen_dict
             serialized_row.append(btn_dict)
         if serialized_row:
             rows.append(serialized_row)
@@ -234,6 +250,8 @@ def normalize_message(message: Message) -> Optional[Dict[str, Any]]:
         "reply_to_quote_text": reply_to_quote_text,
         "reply_to_quote_html": reply_to_quote_html,
         "reply_to_quote_position": reply_to_quote_position,
+        # Forum topic support — pass through so destinations can target a thread
+        "message_thread_id": getattr(message, "message_thread_id", None),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -250,6 +268,8 @@ def normalize_message(message: Message) -> Optional[Dict[str, Any]]:
         payload["location"] = _serialize_location(message.location)
     elif msg_type == "venue" and message.venue:
         payload["venue"] = _serialize_venue(message.venue)
+    elif msg_type == "dice" and getattr(message, "dice", None):
+        payload["dice"] = _serialize_dice(message.dice)
 
     forward_origin = serialize_forward_origin(message)
     if forward_origin:
@@ -298,6 +318,28 @@ def _get_message_type(message: Message) -> Optional[str]:
         return "venue"
     elif message.location:
         return "location"
+    elif getattr(message, "dice", None):
+        return "dice"
+    elif getattr(message, "game", None):
+        # Game messages cannot be forwarded by bots — drop silently.
+        logger.debug(f"Game message {message.id} — not forwardable by bots, skipping")
+        return None
+    elif getattr(message, "story", None):
+        # Story shares cannot be forwarded by bots — drop silently.
+        logger.debug(f"Story message {message.id} — not forwardable by bots, skipping")
+        return None
+    elif getattr(message, "giveaway", None) or getattr(message, "giveaway_winners", None):
+        # Giveaway service messages cannot be forwarded by bots — drop silently.
+        logger.debug(f"Giveaway message {message.id} — not forwardable by bots, skipping")
+        return None
+    elif getattr(message, "paid_media", None):
+        # Paid media cannot be copied by bots — drop silently.
+        logger.debug(f"Paid media message {message.id} — not forwardable by bots, skipping")
+        return None
+    elif getattr(message, "invoice", None):
+        # Payment invoices cannot be recreated by bots without payment provider — drop.
+        logger.debug(f"Invoice message {message.id} — not forwardable by bots, skipping")
+        return None
     else:
         # Service messages, empty messages, etc.
         logger.debug(f"Unsupported message type for message {message.id}, skipping")
@@ -344,7 +386,25 @@ def _serialize_location(location) -> Dict[str, Any]:
     accuracy = getattr(location, "horizontal_accuracy", None)
     if accuracy is not None:
         data["horizontal_accuracy"] = accuracy
+    # Live location fields
+    live_period = getattr(location, "live_period", None)
+    if live_period:
+        data["live_period"] = int(live_period)
+    heading = getattr(location, "heading", None)
+    if heading is not None:
+        data["heading"] = int(heading)
+    proximity_alert_radius = getattr(location, "proximity_alert_radius", None)
+    if proximity_alert_radius is not None:
+        data["proximity_alert_radius"] = int(proximity_alert_radius)
     return data
+
+
+def _serialize_dice(dice) -> Dict[str, Any]:
+    """Serialize a Hydrogram Dice object for Bot API sendDice."""
+    return {
+        "emoji": str(getattr(dice, "emoji", "\U0001f3b2")),  # default 🎲
+        "value": int(getattr(dice, "value", 0)),
+    }
 
 
 def _serialize_venue(venue) -> Dict[str, Any]:
@@ -725,15 +785,23 @@ async def forward_message_pipeline(
                             f"Reply map: {source_reply_id} -> {reply_to_id} in {dest_name}"
                         )
 
-                async def _send():
+                # Bind loop variables explicitly to avoid the Python closure
+                # capture issue: if call_with_flood_wait retries the coroutine
+                # after the loop variable has advanced, we must capture the
+                # current values by default argument, not by reference.
+                async def _send(
+                    _dest=dest_chat_id,
+                    _reply=reply_to_id,
+                    _relay_ids=relay_message_ids,
+                ):
                     return await sender.forward_to_destination(
-                        dest_chat_id=dest_chat_id,
+                        dest_chat_id=_dest,
                         msg_type=msg_type,
                         payload=payload,
                         processed_payload=processed_payload,
                         relay_chat_id=relay.bot_from_chat if relay else None,
-                        relay_message_ids=relay_message_ids,
-                        reply_to_message_id=reply_to_id,
+                        relay_message_ids=_relay_ids,
+                        reply_to_message_id=_reply,
                     )
 
                 try:

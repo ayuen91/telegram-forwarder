@@ -29,6 +29,9 @@ def _normalize_html_for_bot_api(html: str) -> str:
       * Custom emoji: Pyrogram → <emoji id="123">…</emoji>
                       Bot API  → <tg-emoji emoji-id="123">…</tg-emoji>
 
+      * Expandable blockquote: Hydrogram may produce <blockquote expandable >
+                      Bot API  → <blockquote expandable>  (no trailing space)
+
     Without this normalisation those entities are silently stripped (or cause a
     "Failed to parse entities" error) whenever we call sendMessage with
     parse_mode="HTML" — e.g. after a word-replacement rule fires.
@@ -39,6 +42,8 @@ def _normalize_html_for_bot_api(html: str) -> str:
     # <emoji id="…"> → <tg-emoji emoji-id="…">
     html = re.sub(r'<emoji\s+id="([^"]+)">', r'<tg-emoji emoji-id="\1">', html)
     html = re.sub(r'</emoji>', '</tg-emoji>', html)
+    # Normalize expandable blockquote: strip extra whitespace in the opening tag
+    html = re.sub(r'<blockquote\s+expandable\s*>', '<blockquote expandable>', html)
     return html
 
 
@@ -103,7 +108,7 @@ class TelegramBotSender:
     def _reply_params(
         reply_to_message_id: Optional[Union[int, str]],
         quote: Optional[str] = None,
-        quote_parse_mode: Optional[str] = "HTML",
+        quote_parse_mode: Optional[str] = None,
         quote_position: Optional[int] = None,
         allow_sending_without_reply: bool = True,
     ) -> Optional[Dict[str, Any]]:
@@ -117,6 +122,9 @@ class TelegramBotSender:
         }
         if quote:
             params["quote"] = quote
+            # Only set quote_parse_mode when it has an explicit value.
+            # None means plain-text matching (no HTML parsing) which is the
+            # safe default — the Bot API does a raw substring check.
             if quote_parse_mode:
                 params["quote_parse_mode"] = quote_parse_mode
             if quote_position is not None:
@@ -166,7 +174,7 @@ class TelegramBotSender:
         message_id: Union[int, str],
         reply_to_message_id: Optional[Union[int, str]] = None,
         quote: Optional[str] = None,
-        quote_parse_mode: Optional[str] = "HTML",
+        quote_parse_mode: Optional[str] = None,
         quote_position: Optional[int] = None,
     ) -> int:
         """
@@ -194,7 +202,7 @@ class TelegramBotSender:
         message_ids: List[Union[int, str]],
         reply_to_message_id: Optional[Union[int, str]] = None,
         quote: Optional[str] = None,
-        quote_parse_mode: Optional[str] = "HTML",
+        quote_parse_mode: Optional[str] = None,
         quote_position: Optional[int] = None,
     ) -> List[int]:
         """
@@ -385,7 +393,7 @@ class TelegramBotSender:
         reply_to_message_id: Optional[Union[int, str]] = None,
         reply_markup: Optional[Dict[str, Any]] = None,
         quote: Optional[str] = None,
-        quote_parse_mode: Optional[str] = "HTML",
+        quote_parse_mode: Optional[str] = None,
         quote_position: Optional[int] = None,
     ) -> int:
         """Copy a single message. Returns the new message_id in the destination chat."""
@@ -458,7 +466,7 @@ class TelegramBotSender:
         message_ids: List[Union[int, str]],
         reply_to_message_id: Optional[Union[int, str]] = None,
         quote: Optional[str] = None,
-        quote_parse_mode: Optional[str] = "HTML",
+        quote_parse_mode: Optional[str] = None,
         quote_position: Optional[int] = None,
     ) -> List[int]:
         """Copy an album (media group). Returns message_ids in destination chat, in order."""
@@ -492,7 +500,7 @@ class TelegramBotSender:
         reply_to_message_id: Optional[Union[int, str]] = None,
         reply_markup: Optional[Dict[str, Any]] = None,
         quote: Optional[str] = None,
-        quote_parse_mode: Optional[str] = "HTML",
+        quote_parse_mode: Optional[str] = None,
         quote_position: Optional[int] = None,
     ) -> int:
         """Send a message with HTML formatting.  text should already be an HTML string."""
@@ -532,7 +540,7 @@ class TelegramBotSender:
         reply_to_message_id: Optional[Union[int, str]] = None,
         reply_markup: Optional[Dict[str, Any]] = None,
         quote: Optional[str] = None,
-        quote_parse_mode: Optional[str] = "HTML",
+        quote_parse_mode: Optional[str] = None,
         quote_position: Optional[int] = None,
     ) -> int:
         """Recreate a poll via sendPoll."""
@@ -548,7 +556,12 @@ class TelegramBotSender:
         payload: Dict[str, Any] = {
             "chat_id": chat_id,
             "question": poll["question"],
-            "options": poll["options"],
+            # Bot API 10.0+ requires options as InputPollOption objects.
+            # Older payloads may contain plain strings — coerce them here.
+            "options": [
+                opt if isinstance(opt, dict) else {"text": str(opt)}
+                for opt in poll.get("options", [])
+            ],
             "is_anonymous": poll.get("is_anonymous", True),
             "type": poll_type,
         }
@@ -582,7 +595,7 @@ class TelegramBotSender:
         reply_to_message_id: Optional[Union[int, str]] = None,
         reply_markup: Optional[Dict[str, Any]] = None,
         quote: Optional[str] = None,
-        quote_parse_mode: Optional[str] = "HTML",
+        quote_parse_mode: Optional[str] = None,
         quote_position: Optional[int] = None,
     ) -> int:
         """Recreate a location pin via sendLocation."""
@@ -593,6 +606,13 @@ class TelegramBotSender:
         }
         if location.get("horizontal_accuracy") is not None:
             payload["horizontal_accuracy"] = location["horizontal_accuracy"]
+        # Live location fields (Bot API sendLocation)
+        if location.get("live_period"):
+            payload["live_period"] = int(location["live_period"])
+        if location.get("heading") is not None:
+            payload["heading"] = int(location["heading"])
+        if location.get("proximity_alert_radius") is not None:
+            payload["proximity_alert_radius"] = int(location["proximity_alert_radius"])
 
         if reply_markup is not None:
             payload["reply_markup"] = reply_markup
@@ -612,7 +632,7 @@ class TelegramBotSender:
         reply_to_message_id: Optional[Union[int, str]] = None,
         reply_markup: Optional[Dict[str, Any]] = None,
         quote: Optional[str] = None,
-        quote_parse_mode: Optional[str] = "HTML",
+        quote_parse_mode: Optional[str] = None,
         quote_position: Optional[int] = None,
     ) -> int:
         """Recreate a venue via sendVenue."""
@@ -648,7 +668,7 @@ class TelegramBotSender:
         reply_to_message_id: Optional[Union[int, str]] = None,
         reply_markup: Optional[Dict[str, Any]] = None,
         quote: Optional[str] = None,
-        quote_parse_mode: Optional[str] = "HTML",
+        quote_parse_mode: Optional[str] = None,
         quote_position: Optional[int] = None,
     ) -> int:
         """Recreate a shared contact via sendContact."""
@@ -671,6 +691,31 @@ class TelegramBotSender:
             payload["reply_parameters"] = reply_params
 
         result = await self._call("sendContact", payload)
+        return int(result["message_id"])
+
+    async def send_dice(
+        self,
+        chat_id: Union[int, str],
+        emoji: str = "\U0001f3b2",
+        reply_to_message_id: Optional[Union[int, str]] = None,
+        reply_markup: Optional[Dict[str, Any]] = None,
+        quote: Optional[str] = None,
+        quote_parse_mode: Optional[str] = None,
+        quote_position: Optional[int] = None,
+    ) -> int:
+        """Send an animated dice via sendDice."""
+        payload: Dict[str, Any] = {
+            "chat_id": chat_id,
+            "emoji": emoji,
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+        reply_params = self._reply_params(
+            reply_to_message_id, quote=quote, quote_parse_mode=quote_parse_mode, quote_position=quote_position
+        )
+        if reply_params:
+            payload["reply_parameters"] = reply_params
+        result = await self._call("sendDice", payload)
         return int(result["message_id"])
 
     async def edit_message_caption(
@@ -737,21 +782,33 @@ class TelegramBotSender:
                 "reply_mappings": [(source_id, sent_id), ...],
             }
         """
-        # Use plain-text for the quote so Bot API does a simple substring
-        # match against the destination message text, then auto-renders it
-        # with the formatting that already exists at that position in the
-        # destination copy.  Sending HTML with quote_parse_mode="HTML" caused
-        # entity-format mismatches (Hydrogram HTML != Bot API stored entities)
-        # which silently dropped the quote after the fallback retry.
-        quote = (
+        # Prefer the HTML-encoded quote so Telegram can match it precisely
+        # against the rich-text destination copy.  Fall back to plain text
+        # (quote_parse_mode omitted → raw substring match) when no HTML quote
+        # is available.  Both paths go through _attempt_with_quote_fallback so
+        # a mismatch still delivers the message as a normal reply.
+        quote_html = (
+            processed_payload.get("processed_reply_to_quote_html")
+            or payload.get("reply_to_quote_html")
+        )
+        quote_plain = (
             processed_payload.get("processed_reply_to_quote")
             or payload.get("reply_to_quote_text")
         )
+        if quote_html:
+            quote = quote_html
+            _quote_parse_mode: Optional[str] = "HTML"
+        elif quote_plain:
+            quote = quote_plain
+            _quote_parse_mode = None  # plain text — raw substring match, no parsing
+        else:
+            quote = None
+            _quote_parse_mode = None
         quote_position = payload.get("reply_to_quote_position")
         reply_kwargs: Dict[str, Any] = {"reply_to_message_id": reply_to_message_id}
         if quote:
             reply_kwargs["quote"] = quote
-            # No quote_parse_mode — plain text, no entity matching required
+            reply_kwargs["quote_parse_mode"] = _quote_parse_mode
         if quote_position is not None:
             reply_kwargs["quote_position"] = quote_position
 
@@ -933,6 +990,14 @@ class TelegramBotSender:
                 **reply_kwargs,
                 **extra_kwargs,
             )
+        elif msg_type == "dice":
+            dice = payload.get("dice") or {}
+            sent_id = await self.send_dice(
+                chat_id=dest_chat_id,
+                emoji=dice.get("emoji", "\U0001f3b2"),
+                **reply_kwargs,
+                **extra_kwargs,
+            )
         else:
             if not relay_chat_id or not relay_message_ids:
                 raise RuntimeError("Media message requires userbot relay before Bot API delivery")
@@ -953,7 +1018,14 @@ class TelegramBotSender:
                 )
                 caption = _normalize_html_for_bot_api(raw_caption) if use_caption_html else raw_caption
                 parse_mode = "HTML" if use_caption_html else None
-            
+            elif not payload.get("caption") and not payload.get("caption_html"):
+                # Source message had no caption at all (e.g. a captionless GIF).
+                # Force caption="" so the Bot API copyMessage call explicitly
+                # clears any spurious "None" string that may have appeared in
+                # the relay message due to Hydrogram stringifying a missing caption.
+                caption = ""
+                parse_mode = None
+
             # When caption_changed is True the destination caption differs from
             # the source — drop the quote to avoid QUOTE_TEXT_INVALID errors.
             safe_reply_kwargs = dict(reply_kwargs)
@@ -1017,7 +1089,7 @@ class TelegramBotSender:
         payload: Dict[str, Any],
         reply_to_message_id: Optional[Union[int, str]] = None,
         quote: Optional[str] = None,
-        quote_parse_mode: Optional[str] = None,
+        quote_parse_mode: Optional[str] = None,  # None = plain-text raw match
         quote_position: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Deliver via forwardMessage(s) from the original channel."""
@@ -1032,7 +1104,10 @@ class TelegramBotSender:
         fwd_kwargs: Dict[str, Any] = {"reply_to_message_id": reply_to_message_id}
         if quote:
             fwd_kwargs["quote"] = quote
-            fwd_kwargs["quote_parse_mode"] = quote_parse_mode or "HTML"
+            # Pass through the parse mode determined by forward_to_destination.
+            # None means plain-text raw match; "HTML" means rich-text quote.
+            if quote_parse_mode:
+                fwd_kwargs["quote_parse_mode"] = quote_parse_mode
         if quote_position is not None:
             fwd_kwargs["quote_position"] = quote_position
 

@@ -20,20 +20,6 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# Monkey patch Hydrogram to support 64-bit channel IDs (like -1002...)
-from hydrogram import utils
-
-def get_peer_type_new(peer_id: int) -> str:
-    peer_id_str = str(peer_id)
-    if not peer_id_str.startswith("-"):
-        return "user"
-    elif peer_id_str.startswith("-100"):
-        return "channel"
-    else:
-        return "chat"
-
-utils.get_peer_type = get_peer_type_new
-
 import aiosqlite
 import redis.asyncio as aioredis
 from hydrogram import Client
@@ -170,7 +156,7 @@ async def supervised_task(name: str, coro_factory, restart_delay: float = 5.0):
 
 async def init_database(db_path: str):
     """Apply schema.sql on first run and run incremental column migrations."""
-    schema_path = Path("/app/db/schema.sql")
+    schema_path = Path(os.getenv("SCHEMA_PATH", "/app/db/schema.sql"))
     if not schema_path.exists():
         logger.warning(f"schema.sql not found at {schema_path}")
         return
