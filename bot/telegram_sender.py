@@ -734,6 +734,23 @@ class TelegramBotSender:
             params["parse_mode"] = parse_mode
         await self._call("editMessageCaption", params)
 
+    async def edit_message_text(
+        self,
+        chat_id: Union[int, str],
+        message_id: Union[int, str],
+        text: str,
+        parse_mode: Optional[str] = "HTML",
+    ) -> None:
+        """Edit the text of a previously sent text message via editMessageText."""
+        params: Dict[str, Any] = {
+            "chat_id": chat_id,
+            "message_id": int(message_id),
+            "text": text,
+        }
+        if parse_mode:
+            params["parse_mode"] = parse_mode
+        await self._call("editMessageText", params)
+
     async def verify_bot_access(self, chat_id: Union[int, str]) -> bool:
         """Return True if the bot can access the given chat."""
         try:

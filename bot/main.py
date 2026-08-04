@@ -39,6 +39,7 @@ from listener import (
     retry_payload,
     overflow_drainer,
     deletion_worker,
+    edit_worker,
     _do_channel_catchup,
     LISTENER_LAST_RECEIVED_KEY,
     LISTENER_LAST_PTS_KEY,
@@ -701,6 +702,11 @@ async def main():
     # UpdateDeleteMessages fires; consumed by deletion_worker().
     deletion_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
 
+    # Separate lightweight queue for edit propagation events.
+    # Populated by the on_edited_message handler when a source message is edited;
+    # consumed by edit_worker() which applies the change to all destination copies.
+    edit_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
+
     # Record startup time BEFORE connecting so the listener can drop
     # any backlog updates Telegram pushes upon reconnect.
     bot_start_time = int(time.time())
@@ -778,6 +784,7 @@ async def main():
         redis_client=redis_client,
         bot_start_time=bot_start_time,
         deletion_queue=deletion_queue,
+        edit_queue=edit_queue,
     )
 
     # Initial channel catch-up to process any messages sent during startup
@@ -877,6 +884,22 @@ async def main():
         name="deletion-worker",
     ))
 
+    # Edit-propagation worker: listens for on_edited_message events forwarded
+    # by register_listener and applies the updated text/caption to each
+    # destination copy via Bot API editMessageText / editMessageCaption.
+    async def _edit_worker_factory():
+        await edit_worker(
+            edit_queue=edit_queue,
+            db_path=ctx.db_path,
+            sender=ctx.sender,
+            config=ctx.config,
+        )
+
+    tasks.append(asyncio.create_task(
+        supervised_task("edit-worker", _edit_worker_factory),
+        name="edit-worker",
+    ))
+
     tasks.append(asyncio.create_task(
         supervised_task(
             "channel-sync",
@@ -950,7 +973,7 @@ async def main():
 
     logger.info(
         f"Workers running: {settings.worker_count} processors, album-flush, retry, "
-        "health, overflow-drainer, deletion-worker"
+        "health, overflow-drainer, deletion-worker, edit-worker"
         + (", alert-listener" if settings.alert_bot_token and settings.alert_chat_id else "")
         + (", daily-report" if settings.daily_report_enabled else "")
         + (f", silence-watchdog (PTS-audited, {settings.listener_silence_timeout}s threshold)" if settings.listener_silence_timeout > 0 else "")

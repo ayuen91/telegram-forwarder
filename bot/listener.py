@@ -1320,6 +1320,7 @@ def register_listener(
     redis_client=None,
     bot_start_time: Optional[int] = None,
     deletion_queue: Optional[asyncio.Queue] = None,
+    edit_queue: Optional[asyncio.Queue] = None,
 ):
     """
     bot_start_time — Unix timestamp (seconds) recorded when the bot started.
@@ -1539,6 +1540,35 @@ def register_listener(
             )
             await _do_channel_catchup(
                 client, source_chat_id, redis_client, message_queue, bot_start_time
+            )
+
+
+    # ── Edited-message handler ──────────────────────────────────────────────────
+    # Hydrogram fires on_edited_message for every edit in channels and groups
+    # the userbot is a member of.  We normalize the edited message, then enqueue
+    # it into edit_queue so the edit_worker can propagate the change to every
+    # destination channel via Bot API editMessageText / editMessageCaption.
+    @app.on_edited_message(filters.chat(source_chat_id))
+    async def on_edited_message(client: Client, message: Message):
+        if edit_queue is None:
+            return  # Edit propagation not configured — skip silently
+        payload = normalize_message(message)
+        if payload is None:
+            return  # Unsupported message type (service msg, etc.)
+        try:
+            edit_queue.put_nowait({
+                "type": "edit",
+                "source_chat_id": source_chat_id,
+                "message_id": message.id,
+                "payload": payload,
+            })
+            logger.info(
+                f"Edit event enqueued for message {message.id} "
+                f"type={payload['type']} in {source_chat_id}"
+            )
+        except asyncio.QueueFull:
+            logger.warning(
+                f"Edit queue full — dropping edit event for message {message.id}"
             )
 
 
@@ -1925,6 +1955,215 @@ async def deletion_worker(
         except Exception as loop_err:
             logger.error(
                 f"Deletion worker: unexpected loop error: {loop_err}",
+                exc_info=True,
+            )
+            await asyncio.sleep(1.0)
+
+
+# ── Edit propagation ──────────────────────────────────────────────────────────────
+# When the source-channel admin edits a message, Telegram fires
+# UpdateEditChannelMessage which Hydrogram surfaces as on_edited_message.
+# The on_edited_message handler inside register_listener() catches those and
+# enqueues them into a separate edit_queue. edit_worker() consumes that queue,
+# looks up the forwarded copies in SQLite, and updates them in all destinations.
+
+
+async def _process_edit_event(
+    source_chat_id: int,
+    message_id: int,
+    payload: Dict[str, Any],
+    db_path: str,
+    sender: TelegramBotSender,
+    config,
+) -> None:
+    """
+    Apply an edited source message to every forwarded copy in destination channels.
+
+    For the edited source message:
+      1. Queries message_reply_map to find the sent_message_id in each destination.
+      2. Applies word replacement rules to the new text/caption.
+      3. Calls editMessageText (text) or editMessageCaption (media) on each copy.
+      4. Updates the messages table with the new processed text/caption.
+
+    Errors (e.g. bot lacks edit permission, or the destination message was deleted)
+    are logged as warnings — delivery continues for remaining destinations.
+    """
+    destinations = [
+        {"chat_id": d.chat_id, "name": d.name}
+        for d in config.get_active_destinations()
+    ]
+    if not destinations:
+        return
+
+    # Apply word replacement rules to the edited content
+    processed = build_processed_payload(payload, config)
+
+    msg_type = payload.get("type")
+    # Resolved text to send (prefer HTML for rich formatting)
+    new_text_html = (
+        processed.get("processed_text_html")
+        or processed.get("processed_text")
+        or payload.get("text_html")
+        or payload.get("text")
+    )
+    use_text_html = bool(
+        processed.get("processed_text_html") or payload.get("text_html")
+    )
+    new_caption_html = (
+        processed.get("processed_caption_html")
+        or processed.get("processed_caption")
+        or payload.get("caption_html")
+        or payload.get("caption")
+    )
+    use_caption_html = bool(
+        processed.get("processed_caption_html") or payload.get("caption_html")
+    )
+
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+
+        for dest in destinations:
+            dest_chat_id = int(dest["chat_id"])
+            dest_name = dest["name"]
+
+            # Resolve the destination message ID from the reply map
+            cursor = await db.execute(
+                """
+                SELECT sent_message_id FROM message_reply_map
+                WHERE source_chat_id = ? AND source_message_id = ? AND destination_chat_id = ?
+                """,
+                (source_chat_id, message_id, dest_chat_id),
+            )
+            row = await cursor.fetchone()
+            if not row:
+                logger.debug(
+                    f"Edit propagation: no reply map entry for source msg {message_id} "
+                    f"in destination {dest_name} ({dest_chat_id}) — skipping"
+                )
+                continue
+
+            sent_msg_id = int(row["sent_message_id"])
+
+            try:
+                if msg_type == "text" and new_text_html:
+                    from telegram_sender import _normalize_html_for_bot_api
+                    text = _normalize_html_for_bot_api(new_text_html) if use_text_html else new_text_html
+                    await sender.edit_message_text(
+                        dest_chat_id,
+                        sent_msg_id,
+                        text,
+                        parse_mode="HTML" if use_text_html else None,
+                    )
+                    logger.info(
+                        f"Edit propagated: text msg {sent_msg_id} updated in "
+                        f"{dest_name} ({dest_chat_id}) "
+                        f"[source msg_id={message_id}]"
+                    )
+                elif msg_type in _RELAY_MEDIA_TYPES and new_caption_html is not None:
+                    from telegram_sender import _normalize_html_for_bot_api
+                    caption = _normalize_html_for_bot_api(new_caption_html) if use_caption_html else new_caption_html
+                    await sender.edit_message_caption(
+                        dest_chat_id,
+                        sent_msg_id,
+                        caption,
+                        parse_mode="HTML" if use_caption_html else None,
+                    )
+                    logger.info(
+                        f"Edit propagated: caption msg {sent_msg_id} updated in "
+                        f"{dest_name} ({dest_chat_id}) "
+                        f"[source msg_id={message_id}]"
+                    )
+                else:
+                    logger.warning(
+                        f"Edit propagation: message {message_id} type={msg_type} "
+                        "has no editable text/caption or is unsupported "
+                        f"for destination {dest_name} — skipping"
+                    )
+                    continue
+            except Exception as edit_err:
+                logger.warning(
+                    f"Edit propagation: could not edit message {sent_msg_id} "
+                    f"in {dest_name} ({dest_chat_id}): {edit_err}"
+                )
+
+        # Update the messages table with new text/caption
+        await db.execute(
+            """
+            UPDATE messages
+            SET    processed_text    = ?,
+                   processed_caption = ?,
+                   processed_at      = datetime('now')
+            WHERE  source_chat_id      = ?
+              AND  telegram_message_id = ?
+            """,
+            (
+                processed.get("processed_text") or payload.get("text"),
+                processed.get("processed_caption") or payload.get("caption"),
+                source_chat_id,
+                message_id,
+            ),
+        )
+        await db.commit()
+
+
+async def edit_worker(
+    edit_queue: asyncio.Queue,
+    db_path: str,
+    sender: TelegramBotSender,
+    config,
+) -> None:
+    """
+    Background worker that propagates source-channel edits to all destinations.
+
+    Consumes events from edit_queue (populated by the on_edited_message handler
+    inside register_listener when Hydrogram fires an edit update).
+
+    Each event is a dict:
+        {
+            "type":           "edit",
+            "source_chat_id": int,
+            "message_id":     int,
+            "payload":        dict,   # normalized message payload
+        }
+
+    NOTE: The sender bot must be an administrator with can_edit_messages=True
+    in each destination channel.  Without that permission, API calls will fail
+    and the edit will be logged as a warning but will not crash the worker.
+    """
+    logger.info("Edit worker started")
+
+    while True:
+        try:
+            event = await edit_queue.get()
+
+            source_chat_id = event.get("source_chat_id")
+            message_id     = event.get("message_id")
+            payload        = event.get("payload") or {}
+
+            if source_chat_id and message_id:
+                try:
+                    await _process_edit_event(
+                        source_chat_id=int(source_chat_id),
+                        message_id=int(message_id),
+                        payload=payload,
+                        db_path=db_path,
+                        sender=sender,
+                        config=config,
+                    )
+                except Exception as ev_err:
+                    logger.error(
+                        f"Edit worker: error processing event {event}: {ev_err}",
+                        exc_info=True,
+                    )
+
+            edit_queue.task_done()
+
+        except asyncio.CancelledError:
+            logger.info("Edit worker cancelled — shutting down")
+            return
+        except Exception as loop_err:
+            logger.error(
+                f"Edit worker: unexpected loop error: {loop_err}",
                 exc_info=True,
             )
             await asyncio.sleep(1.0)
