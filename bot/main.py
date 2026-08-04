@@ -19,6 +19,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 import aiosqlite
 import redis.asyncio as aioredis
@@ -333,18 +334,18 @@ def make_channel_sync_factory(
     message_queue: asyncio.Queue,
     bot_start_time: int,
     interval: int = 30,
+    edit_queue: Optional[asyncio.Queue] = None,
 ):
     """
     Lightweight watermark-based channel sync task.
 
-    Runs every `interval` seconds (default 30s) to perform a watermark catchup
-    via `_do_channel_catchup()`. Because `_do_channel_catchup()` stops on the
-    very first message matching `message.id <= last_msg_id`, this uses only 1
-    tiny RPC call when no new messages exist.
+    Runs every `interval` seconds (default 30s) via _do_channel_catchup() which:
+      1. Enqueues messages newer than the watermark (new-message catch-up).
+      2. Scans up to 50 already-seen messages for edits (edit detection) — zero
+         extra API calls; both are detected in the same get_chat_history request.
 
-    This ensures 100% reliable message delivery on large Telegram channels
-    where Telegram MTProto servers do not push real-time UpdateNewChannelMessage
-    events to userbots.
+    This is the reliable fallback for large Telegram channels where Telegram
+    sends UpdateChannelTooLong (compressed) instead of individual push events.
     """
     async def channel_sync():
         while not shutdown_event.is_set():
@@ -353,7 +354,8 @@ def make_channel_sync_factory(
                 break
             try:
                 await _do_channel_catchup(
-                    app, source_chat_id, redis_client, message_queue, bot_start_time
+                    app, source_chat_id, redis_client, message_queue, bot_start_time,
+                    edit_queue=edit_queue,
                 )
             except Exception as e:
                 logger.error(f"Channel sync error: {e}", exc_info=True)
@@ -910,6 +912,7 @@ async def main():
                 message_queue=message_queue,
                 bot_start_time=bot_start_time,
                 interval=30,
+                edit_queue=edit_queue,
             ),
         ),
         name="channel-sync",

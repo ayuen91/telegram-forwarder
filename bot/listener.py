@@ -51,6 +51,11 @@ try:
 except (ImportError, ModuleNotFoundError, RuntimeError, AttributeError):
     UpdateDeleteMessages = None  # Graceful fallback
 
+try:
+    from hydrogram.raw.types import UpdateEditChannelMessage
+except (ImportError, ModuleNotFoundError, RuntimeError, AttributeError):
+    UpdateEditChannelMessage = None  # Graceful fallback
+
 from hydrogram.types import Message
 
 from media_relay import RelayConfig, relay_to_bot, cleanup_relay
@@ -1526,20 +1531,80 @@ def register_listener(
                 return  # Not our source channel
             logger.warning(
                 f"UpdateChannelTooLong for channel {channel_chat_id} — "
-                "running targeted PTS catch-up"
+                "running targeted PTS catch-up + edit scan"
             )
             await _do_channel_catchup(
-                client, channel_chat_id, redis_client, message_queue, bot_start_time
+                client, channel_chat_id, redis_client, message_queue, bot_start_time,
+                edit_queue=edit_queue,
             )
+            return
+
+        # ── UpdateEditChannelMessage — real-time edit push ───────────────────────
+        # Telegram pushes this for every channel message edit (when not compressed).
+        # Extract the embedded message object, normalize it, and enqueue to
+        # edit_queue so edit_worker can propagate the change to destinations.
+        # On large channels this may not arrive reliably (Telegram sends
+        # UpdateChannelTooLong instead) — _do_channel_catchup() handles that
+        # fallback by scanning edit_date on recently fetched messages.
+        if (
+            UpdateEditChannelMessage is not None
+            and isinstance(update, UpdateEditChannelMessage)
+        ):
+            if edit_queue is None:
+                return
+            raw_msg = getattr(update, "message", None)
+            if raw_msg is None:
+                return
+            raw_channel_id = getattr(
+                getattr(raw_msg, "peer_id", None), "channel_id", None
+            )
+            if raw_channel_id is None:
+                return
+            channel_chat_id = int(f"-100{raw_channel_id}")
+            if channel_chat_id != source_chat_id:
+                return
+            # Fetch the full Hydrogram Message object so normalize_message works
+            msg_id = getattr(raw_msg, "id", None)
+            if not msg_id:
+                return
+            try:
+                messages = await client.get_messages(source_chat_id, [int(msg_id)])
+                message = messages[0] if messages else None
+            except Exception as fetch_err:
+                logger.warning(
+                    f"UpdateEditChannelMessage: could not fetch message {msg_id}: {fetch_err}"
+                )
+                return
+            if message is None:
+                return
+            payload = normalize_message(message)
+            if payload is None:
+                return
+            try:
+                edit_queue.put_nowait({
+                    "type": "edit",
+                    "source_chat_id": source_chat_id,
+                    "message_id": msg_id,
+                    "payload": payload,
+                })
+                logger.info(
+                    f"UpdateEditChannelMessage: edit enqueued for message {msg_id} "
+                    f"type={payload['type']}"
+                )
+            except asyncio.QueueFull:
+                logger.warning(
+                    f"Edit queue full — dropping raw edit event for message {msg_id}"
+                )
             return
 
         # Generic UpdatesTooLong — session-wide fallback
         if isinstance(update, UpdatesTooLong):
             logger.warning(
-                "UpdatesTooLong (generic) — running catch-up on source channel"
+                "UpdatesTooLong (generic) — running catch-up + edit scan on source channel"
             )
             await _do_channel_catchup(
-                client, source_chat_id, redis_client, message_queue, bot_start_time
+                client, source_chat_id, redis_client, message_queue, bot_start_time,
+                edit_queue=edit_queue,
             )
 
 
@@ -1578,14 +1643,26 @@ async def _do_channel_catchup(
     redis_client,
     message_queue: asyncio.Queue,
     bot_start_time: Optional[int],
+    edit_queue: Optional[asyncio.Queue] = None,
 ) -> int:
     """
-    Fetch messages newer than the last known ID from channel_chat_id and enqueue them.
+    Fetch messages from channel_chat_id, enqueue new ones, and detect edits.
 
-    Uses listener:last_msg_id:{chat_id} as a watermark so only the genuine gap
-    is fetched. Processes oldest-first to preserve reply-thread ordering.
-    Returns the count of messages re-queued.
+    A single get_chat_history call handles both tasks:
+      - Messages newer than last_msg_id watermark → enqueued as new messages.
+      - Already-seen messages (up to EDIT_SCAN_DEPTH) → edit_date compared to
+        a Redis-stored value; if it advanced, the message is enqueued as an edit.
+
+    This means zero extra API calls for edit detection — one call per cycle
+    regardless of whether there are new messages or only edits to propagate.
+
+    Returns the count of NEW messages re-queued (edits are a side-channel).
     """
+    # How many already-seen messages to scan for edits per cycle.
+    # 50 covers roughly the last few hours on active large channels.
+    EDIT_SCAN_DEPTH = 50
+    EDIT_DATE_PREFIX = "listener:edit_date"
+
     last_msg_id = 0
     if redis_client is not None:
         try:
@@ -1595,11 +1672,70 @@ async def _do_channel_catchup(
         except Exception:
             pass
 
-    messages_to_process: list = []  # list of (msg_id, payload)
+    messages_to_process: list = []  # list of (msg_id, payload) for NEW messages
+    edit_scanned = 0              # count of already-seen messages checked for edits
+    edits_enqueued = 0
     try:
         async for message in client.get_chat_history(channel_chat_id, limit=100):
             if last_msg_id > 0 and message.id <= last_msg_id:
-                break  # Reached the watermark — gap is fully covered
+                # ── Already-seen message — check for edits ───────────────────
+                if edit_queue is None or edit_scanned >= EDIT_SCAN_DEPTH:
+                    break  # No edit detection configured, or scanned enough
+                edit_scanned += 1
+
+                edit_date = getattr(message, "edit_date", None)
+                if not edit_date:
+                    continue
+                try:
+                    edit_ts = int(
+                        edit_date.timestamp()
+                        if hasattr(edit_date, "timestamp")
+                        else int(edit_date)
+                    )
+                except Exception:
+                    continue
+
+                redis_key = f"{EDIT_DATE_PREFIX}:{channel_chat_id}:{message.id}"
+                last_seen_ts = 0
+                if redis_client is not None:
+                    try:
+                        raw_ts = await redis_client.get(redis_key)
+                        if raw_ts is not None:
+                            last_seen_ts = int(raw_ts)
+                    except Exception:
+                        pass
+
+                if edit_ts <= last_seen_ts:
+                    continue  # Already processed this edit
+
+                payload = normalize_message(message)
+                if payload is None:
+                    continue
+
+                try:
+                    edit_queue.put_nowait({
+                        "type": "edit",
+                        "source_chat_id": channel_chat_id,
+                        "message_id": message.id,
+                        "payload": payload,
+                    })
+                    edits_enqueued += 1
+                    logger.info(
+                        f"Catch-up edit scan: detected edit on message {message.id} "
+                        f"(edit_ts={edit_ts} > last_seen={last_seen_ts}) — enqueued"
+                    )
+                    if redis_client is not None:
+                        try:
+                            await redis_client.set(redis_key, str(edit_ts), ex=86400 * 7)
+                        except Exception:
+                            pass
+                except asyncio.QueueFull:
+                    logger.warning(
+                        f"Edit queue full — dropping edit for message {message.id}"
+                    )
+                continue  # Don't enqueue as a new message
+
+            # ── New message (id > watermark) ─────────────────────────────────
             if bot_start_time is not None:
                 msg_ts = (
                     int(message.date.timestamp())
@@ -1617,6 +1753,12 @@ async def _do_channel_catchup(
     except Exception as ex:
         logger.error(f"Channel catch-up history fetch failed: {ex}", exc_info=True)
         return 0
+
+    if edits_enqueued > 0:
+        logger.info(
+            f"Channel catch-up {channel_chat_id}: detected {edits_enqueued} edit(s) "
+            f"in {edit_scanned} scanned message(s)"
+        )
 
     # Oldest-first so reply-thread ordering is preserved
     messages_to_process.reverse()
