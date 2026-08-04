@@ -1016,8 +1016,8 @@ class TelegramBotSender:
                 use_caption_html = bool(
                     processed_payload.get("processed_caption_html") or payload.get("caption_html")
                 )
-                caption = _normalize_html_for_bot_api(raw_caption) if use_caption_html else raw_caption
-                parse_mode = "HTML" if use_caption_html else None
+                caption = _normalize_html_for_bot_api(raw_caption) if use_caption_html and raw_caption else raw_caption
+                parse_mode = "HTML" if use_caption_html and raw_caption else None
             elif not payload.get("caption") and not payload.get("caption_html"):
                 # Source message had no caption at all (e.g. a captionless GIF).
                 # Force caption="" so the Bot API copyMessage call explicitly
