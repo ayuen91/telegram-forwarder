@@ -799,35 +799,35 @@ class TelegramBotSender:
                 "reply_mappings": [(source_id, sent_id), ...],
             }
         """
-        # Prefer the HTML-encoded quote so Telegram can match it precisely
-        # against the rich-text destination copy.  Fall back to plain text
-        # (quote_parse_mode omitted → raw substring match) when no HTML quote
-        # is available.  Both paths go through _attempt_with_quote_fallback so
-        # a mismatch still delivers the message as a normal reply.
-        quote_html = (
-            processed_payload.get("processed_reply_to_quote_html")
-            or payload.get("reply_to_quote_html")
-        )
-        quote_plain = (
+        # Always use plain-text quote for the Bot API reply_parameters.quote field.
+        #
+        # Rationale:
+        #   1. quote_position (UTF-16 offset) from Hydrogram is not reliably in
+        #      the same encoding the Bot API expects — any emoji or non-BMP character
+        #      before the selected text shifts the offset, causing QUOTE_TEXT_INVALID.
+        #      We intentionally omit quote_position and let Telegram find the first
+        #      occurrence of the quote text by plain substring match instead.
+        #
+        #   2. HTML quote_parse_mode="HTML" requires the destination copy's entity
+        #      encoding to be byte-identical to the source — this is not guaranteed
+        #      when the replied-to message was delivered via sendMessage (replacement
+        #      path) vs copyMessage (relay path).  Plain text avoids this entirely.
+        #
+        #   3. _attempt_with_quote_fallback still catches any remaining mismatches
+        #      and delivers the message as a normal reply rather than failing.
+        quote = (
             processed_payload.get("processed_reply_to_quote")
             or payload.get("reply_to_quote_text")
+            # Fall back to stripping HTML tags from the HTML quote if no plain text
+            or (re.sub(r"<[^>]+>", "", processed_payload.get("processed_reply_to_quote_html") or payload.get("reply_to_quote_html") or "") or None)
         )
-        if quote_html:
-            quote = quote_html
-            _quote_parse_mode: Optional[str] = "HTML"
-        elif quote_plain:
-            quote = quote_plain
-            _quote_parse_mode = None  # plain text — raw substring match, no parsing
-        else:
-            quote = None
-            _quote_parse_mode = None
-        quote_position = payload.get("reply_to_quote_position")
         reply_kwargs: Dict[str, Any] = {"reply_to_message_id": reply_to_message_id}
         if quote:
             reply_kwargs["quote"] = quote
-            reply_kwargs["quote_parse_mode"] = _quote_parse_mode
-        if quote_position is not None:
-            reply_kwargs["quote_position"] = quote_position
+            # quote_parse_mode intentionally omitted — plain-text raw substring match.
+            # quote_position intentionally omitted — Bot API locates the first
+            # occurrence automatically; the Hydrogram-provided offset is UTF-16 and
+            # may not match the Bot API's expected encoding unit.
 
         if payload.get("use_native_forward"):
             return await self._native_forward_to_destination(
@@ -1089,8 +1089,10 @@ class TelegramBotSender:
             return await func(**kwargs)
         except Exception as e:
             if self._is_quote_error(e) and "quote" in kwargs:
+                quote_snippet = str(kwargs.get("quote", ""))[:80]
                 logger.warning(
-                    f"Quote mismatch on reply — retrying without quote: {e}"
+                    f"Quote mismatch on reply — retrying without quote "
+                    f"(quote={quote_snippet!r}): {e}"
                 )
                 no_quote_kwargs = {
                     k: v for k, v in kwargs.items()
@@ -1106,8 +1108,6 @@ class TelegramBotSender:
         payload: Dict[str, Any],
         reply_to_message_id: Optional[Union[int, str]] = None,
         quote: Optional[str] = None,
-        quote_parse_mode: Optional[str] = None,  # None = plain-text raw match
-        quote_position: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Deliver via forwardMessage(s) from the original channel."""
         origin = payload.get("native_forward_origin") or {}
@@ -1120,13 +1120,9 @@ class TelegramBotSender:
 
         fwd_kwargs: Dict[str, Any] = {"reply_to_message_id": reply_to_message_id}
         if quote:
+            # Plain-text quote only — quote_parse_mode and quote_position omitted.
+            # See forward_to_destination for the full rationale.
             fwd_kwargs["quote"] = quote
-            # Pass through the parse mode determined by forward_to_destination.
-            # None means plain-text raw match; "HTML" means rich-text quote.
-            if quote_parse_mode:
-                fwd_kwargs["quote_parse_mode"] = quote_parse_mode
-        if quote_position is not None:
-            fwd_kwargs["quote_position"] = quote_position
 
         if msg_type == "album":
             items = payload.get("items") or []
