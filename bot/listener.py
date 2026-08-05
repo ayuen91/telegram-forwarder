@@ -200,6 +200,26 @@ def normalize_message(message: Message) -> Optional[Dict[str, Any]]:
     reply_to_quote_html: Optional[str] = None
     reply_to_quote_position: Optional[int] = None
 
+    # Diagnostic logging: inspect all reply/quote attributes on message & _raw
+    if getattr(message, "reply_to_message_id", None) or getattr(message, "reply_to_story_id", None):
+        msg_reply_attrs = {
+            k: getattr(message, k, None)
+            for k in dir(message)
+            if ("reply" in k.lower() or "quote" in k.lower()) and not k.startswith("_")
+        }
+        _raw = getattr(message, "_raw", None)
+        raw_reply = getattr(_raw, "reply_to", None) if _raw else None
+        raw_reply_dict = {}
+        if raw_reply:
+            for k in ("reply_to_msg_id", "quote", "quote_text", "quote_offset", "quote_entities", "reply_to_top_id"):
+                if hasattr(raw_reply, k):
+                    raw_reply_dict[k] = getattr(raw_reply, k, None)
+        logger.info(
+            f"[QUOTE_DEBUG] msg={message.id} "
+            f"msg_attrs={msg_reply_attrs} "
+            f"raw_reply={raw_reply_dict}"
+        )
+
     quote_obj = getattr(message, "quote", None)
     if quote_obj:
         q_attrs = [a for a in dir(quote_obj) if not a.startswith("_")]
