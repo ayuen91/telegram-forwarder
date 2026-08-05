@@ -101,6 +101,8 @@ def build_processed_payload(payload: Dict[str, Any], config) -> Dict[str, Any]:
         if payload.get("text_html"):
             result["processed_text_html"] = processed_text
         result["text_changed"] = changed
+    else:
+        result["text_changed"] = False
 
     if caption_src:
         processed_caption, changed = apply_replacements(caption_src, rules)
@@ -108,14 +110,26 @@ def build_processed_payload(payload: Dict[str, Any], config) -> Dict[str, Any]:
         if payload.get("caption_html"):
             result["processed_caption_html"] = processed_caption
         result["caption_changed"] = changed
+    else:
+        result["caption_changed"] = False
 
-    quote_src = payload.get("reply_to_quote_html") or payload.get("reply_to_quote_text")
-    if quote_src:
-        processed_quote, changed = apply_replacements(quote_src, rules)
-        result["processed_reply_to_quote"] = processed_quote
-        if payload.get("reply_to_quote_html"):
-            result["processed_reply_to_quote_html"] = processed_quote
+    # Apply replacements to the quoted text independently for HTML and plain variants.
+    # processed_reply_to_quote must always be plain text (no HTML tags) so that the
+    # Bot API can do a plain-text substring match against the destination message copy.
+    quote_html_src = payload.get("reply_to_quote_html")
+    quote_plain_src = payload.get("reply_to_quote_text")
+    if quote_html_src:
+        processed_html_quote, changed = apply_replacements(quote_html_src, rules)
+        result["processed_reply_to_quote_html"] = processed_html_quote
+        # Strip all HTML tags to produce a clean plain-text version for Bot API matching.
+        result["processed_reply_to_quote"] = re.sub(r"<[^>]+>", "", processed_html_quote)
         result["reply_to_quote_changed"] = changed
+    elif quote_plain_src:
+        processed_plain_quote, changed = apply_replacements(quote_plain_src, rules)
+        result["processed_reply_to_quote"] = processed_plain_quote
+        result["reply_to_quote_changed"] = changed
+    else:
+        result["reply_to_quote_changed"] = False
 
     result["destinations"] = destinations
     return result

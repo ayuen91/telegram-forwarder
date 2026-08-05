@@ -913,11 +913,13 @@ class TelegramBotSender:
         if msg_type == "text":
             text_changed = processed_payload.get("text_changed", False)
 
-            # When replacements altered the text the destination copy differs
-            # from the source — the quote substring won't match the destination
-            # message, so Telegram will reject it.  Strip the quote in that case.
+            # Strip the quote only when the replacement rule changed the *quoted text
+            # itself* (the highlighted excerpt in the parent message).  The quote lives
+            # in the replied-to message, which is not touched by replacements that fire
+            # on the current reply body — so text_changed is the wrong signal here.
+            reply_to_quote_changed = processed_payload.get("reply_to_quote_changed", False)
             safe_reply_kwargs = dict(reply_kwargs)
-            if text_changed:
+            if reply_to_quote_changed:
                 safe_reply_kwargs.pop("quote", None)
                 safe_reply_kwargs.pop("quote_parse_mode", None)
                 safe_reply_kwargs.pop("quote_position", None)
@@ -1043,10 +1045,12 @@ class TelegramBotSender:
                 caption = ""
                 parse_mode = None
 
-            # When caption_changed is True the destination caption differs from
-            # the source — drop the quote to avoid QUOTE_TEXT_INVALID errors.
+            # Strip the quote only when the replacement rule changed the *quoted text
+            # itself*.  caption_changed tracks the current message's caption — the quote
+            # belongs to the replied-to parent, which is unaffected by caption replacements.
+            reply_to_quote_changed = processed_payload.get("reply_to_quote_changed", False)
             safe_reply_kwargs = dict(reply_kwargs)
-            if caption_changed:
+            if reply_to_quote_changed:
                 safe_reply_kwargs.pop("quote", None)
                 safe_reply_kwargs.pop("quote_parse_mode", None)
                 safe_reply_kwargs.pop("quote_position", None)

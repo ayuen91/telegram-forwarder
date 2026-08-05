@@ -170,7 +170,7 @@ class TestForwardToDestination:
             chat_id=-1001,
             from_chat_id=123456,
             message_id=77,
-            caption=None,
+            caption="",      # empty string clears any spurious relay caption when source has no caption
             parse_mode=None,
             reply_to_message_id=None,
         )
