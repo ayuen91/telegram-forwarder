@@ -1577,6 +1577,34 @@ def register_listener(
                 return
             if message is None:
                 return
+
+            # Guard: skip if edit_date equals the message's original date.
+            # Telegram fires UpdateEditChannelMessage for album items with captions
+            # immediately after posting (on smaller/non-large channels).  These are
+            # internal caption assignments, not user-initiated edits.
+            _msg_date = getattr(message, "date", None)
+            _msg_edit_date = getattr(message, "edit_date", None)
+            if _msg_date is not None and _msg_edit_date is not None:
+                try:
+                    _d = int(
+                        _msg_date.timestamp()
+                        if hasattr(_msg_date, "timestamp")
+                        else int(_msg_date)
+                    )
+                    _e = int(
+                        _msg_edit_date.timestamp()
+                        if hasattr(_msg_edit_date, "timestamp")
+                        else int(_msg_edit_date)
+                    )
+                    if _e <= _d:
+                        logger.debug(
+                            f"UpdateEditChannelMessage: skipping spurious edit for message {msg_id} "
+                            f"(edit_date={_e} <= date={_d}, likely album caption assignment)"
+                        )
+                        return
+                except Exception:
+                    pass  # If comparison fails, proceed normally
+
             payload = normalize_message(message)
             if payload is None:
                 return
@@ -1617,6 +1645,37 @@ def register_listener(
     async def on_edited_message(client: Client, message: Message):
         if edit_queue is None:
             return  # Edit propagation not configured — skip silently
+
+        # Guard against spurious "edits" that Telegram fires internally when
+        # an album item's caption is assigned at post time.  On smaller channels
+        # (non-large), Telegram delivers UpdateEditChannelMessage for each
+        # captioned album item immediately after posting — the edit_date equals
+        # the message's original date.  These are NOT user-initiated edits and
+        # must not cause the forwarded copy to show the "Edited" label.
+        msg_date = getattr(message, "date", None)
+        msg_edit_date = getattr(message, "edit_date", None)
+        if msg_date is not None and msg_edit_date is not None:
+            try:
+                _date_ts = int(
+                    msg_date.timestamp()
+                    if hasattr(msg_date, "timestamp")
+                    else int(msg_date)
+                )
+                _edit_ts = int(
+                    msg_edit_date.timestamp()
+                    if hasattr(msg_edit_date, "timestamp")
+                    else int(msg_edit_date)
+                )
+                if _edit_ts <= _date_ts:
+                    logger.debug(
+                        f"Skipping spurious edit for message {message.id} "
+                        f"(edit_date={_edit_ts} <= date={_date_ts}, "
+                        "likely album caption assignment, not a real edit)"
+                    )
+                    return
+            except Exception:
+                pass  # If we can't compare, proceed normally
+
         payload = normalize_message(message)
         if payload is None:
             return  # Unsupported message type (service msg, etc.)
@@ -1694,6 +1753,26 @@ async def _do_channel_catchup(
                     )
                 except Exception:
                     continue
+
+                # Skip spurious edits where edit_date == message date.
+                # Telegram sets edit_date = date when it internally assigns
+                # captions to album items at post time (not a real user edit).
+                msg_date = getattr(message, "date", None)
+                if msg_date is not None:
+                    try:
+                        _date_ts = int(
+                            msg_date.timestamp()
+                            if hasattr(msg_date, "timestamp")
+                            else int(msg_date)
+                        )
+                        if edit_ts <= _date_ts:
+                            logger.debug(
+                                f"Catch-up edit scan: skipping spurious edit on message {message.id} "
+                                f"(edit_ts={edit_ts} <= date_ts={_date_ts})"
+                            )
+                            continue
+                    except Exception:
+                        pass  # If we can't compare, proceed normally
 
                 redis_key = f"{EDIT_DATE_PREFIX}:{channel_chat_id}:{message.id}"
                 last_seen_ts = 0
