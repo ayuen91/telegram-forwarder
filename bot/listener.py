@@ -196,16 +196,9 @@ def normalize_message(message: Message) -> Optional[Dict[str, Any]]:
         or getattr(message.chat, "has_protected_content", False)
     )
 
-    # ── Quote extraction ──────────────────────────────────────────────────────
-    # Hydrogram may expose the selected-quote data in different places depending
-    # on version.  We try four locations in order from highest to lowest level:
-    #
-    #   1. message.quote           — synthesized TextQuote object (some versions)
-    #   2. message.quote_text      — flat attribute (some versions)
-    #   3. message.reply_to.quote_text — MessageReplyHeader as Python object
-    #   4. message._raw.reply_to.quote_text — raw MTProto TL object (current
-    #      Hydrogram: reply_to is None on the Python Message but the raw header
-    #      carries the quote fields)
+    reply_to_quote_text: Optional[str] = None
+    reply_to_quote_html: Optional[str] = None
+    reply_to_quote_position: Optional[int] = None
 
     quote_obj = getattr(message, "quote", None)
     if quote_obj:
@@ -256,28 +249,28 @@ def normalize_message(message: Message) -> Optional[Dict[str, Any]]:
         )
 
     else:
-        # Branch 4: access the raw MTProto TL object directly.
-        # In the current Hydrogram build message.reply_to is None even for
-        # quote-replies, but message._raw.reply_to (MessageReplyHeader) carries
-        # the quote fields.
-        _raw = getattr(message, "_raw", None)
-        _raw_reply = getattr(_raw, "reply_to", None) if _raw else None
-        _raw_qt = getattr(_raw_reply, "quote_text", None) if _raw_reply else None
+        # Branch 4: Access reply_to_header or raw MTProto reply_to object.
+        reply_header = (
+            getattr(message, "reply_to_header", None)
+            or getattr(getattr(message, "_raw", None), "reply_to", None)
+        )
+        _raw_qt = getattr(reply_header, "quote_text", None) if reply_header else None
         if _raw_qt:
             reply_to_quote_text = str(_raw_qt)
             reply_to_quote_html = reply_to_quote_text
-            reply_to_quote_position = getattr(_raw_reply, "quote_offset", None)
+            reply_to_quote_position = (
+                getattr(reply_header, "quote_offset", None)
+                if getattr(reply_header, "quote_offset", None) is not None
+                else getattr(reply_header, "quote_position", None)
+            )
             logger.info(
-                f"[QUOTE] msg={message.id} branch=_raw.reply_to.quote_text "
+                f"[QUOTE] msg={message.id} branch=reply_header.quote_text "
                 f"text={reply_to_quote_text!r:.60} pos={reply_to_quote_position}"
             )
         elif getattr(message, "reply_to_message_id", None):
-            # Reply with no quote at all — log raw header attrs for future debugging
-            _raw_attrs = [a for a in dir(_raw_reply) if not a.startswith("_")] if _raw_reply else []
             logger.info(
                 f"[QUOTE] msg={message.id} branch=NONE (plain reply, no quote) "
-                f"reply_to_msg_id={message.reply_to_message_id} "
-                f"_raw.reply_to attrs={_raw_attrs}"
+                f"reply_to_msg_id={message.reply_to_message_id}"
             )
 
     # caption: convert to str but guard against Hydrogram Str objects that
