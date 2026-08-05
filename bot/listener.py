@@ -208,12 +208,14 @@ def normalize_message(message: Message) -> Optional[Dict[str, Any]]:
             if ("reply" in k.lower() or "quote" in k.lower()) and not k.startswith("_")
         }
         _raw = getattr(message, "_raw", None)
-        raw_reply = getattr(_raw, "reply_to", None) if _raw else None
+        _raw_msg = getattr(_raw, "message", _raw) if _raw else None
+        raw_reply = (getattr(_raw_msg, "reply_to", None) or getattr(_raw, "reply_to", None)) if _raw_msg else None
         raw_reply_dict = {}
         if raw_reply:
             for k in ("reply_to_msg_id", "quote", "quote_text", "quote_offset", "quote_entities", "reply_to_top_id"):
-                if hasattr(raw_reply, k):
-                    raw_reply_dict[k] = getattr(raw_reply, k, None)
+                val = getattr(raw_reply, k, None)
+                if val is not None:
+                    raw_reply_dict[k] = val
         logger.info(
             f"[QUOTE_DEBUG] msg={message.id} "
             f"msg_attrs={msg_reply_attrs} "
@@ -270,9 +272,12 @@ def normalize_message(message: Message) -> Optional[Dict[str, Any]]:
 
     else:
         # Branch 4: Access reply_to_header or raw MTProto reply_to object.
+        _raw = getattr(message, "_raw", None)
+        _raw_msg = getattr(_raw, "message", _raw) if _raw else None
         reply_header = (
             getattr(message, "reply_to_header", None)
-            or getattr(getattr(message, "_raw", None), "reply_to", None)
+            or (getattr(_raw_msg, "reply_to", None) if _raw_msg else None)
+            or (getattr(_raw, "reply_to", None) if _raw else None)
         )
         _raw_qt = getattr(reply_header, "quote_text", None) if reply_header else None
         if _raw_qt:
