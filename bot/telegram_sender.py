@@ -821,6 +821,13 @@ class TelegramBotSender:
             # Fall back to stripping HTML tags from the HTML quote if no plain text
             or (re.sub(r"<[^>]+>", "", processed_payload.get("processed_reply_to_quote_html") or payload.get("reply_to_quote_html") or "") or None)
         )
+        if reply_to_message_id:
+            logger.info(
+                f"[QUOTE] delivery msg={payload.get('message_id')} "
+                f"reply_to={reply_to_message_id} "
+                f"quote={quote!r:.80} "
+                f"quote_changed={processed_payload.get('reply_to_quote_changed')}"
+            )
         reply_kwargs: Dict[str, Any] = {"reply_to_message_id": reply_to_message_id}
         if quote:
             reply_kwargs["quote"] = quote

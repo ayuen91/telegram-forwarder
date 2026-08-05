@@ -202,6 +202,9 @@ def normalize_message(message: Message) -> Optional[Dict[str, Any]]:
 
     quote_obj = getattr(message, "quote", None)
     if quote_obj:
+        # Log the actual attribute names Hydrogram exposes on the quote object
+        # so we can detect API surface changes between versions.
+        q_attrs = [a for a in dir(quote_obj) if not a.startswith("_")]
         q_text = getattr(quote_obj, "text", None)
         if q_text is not None:
             reply_to_quote_text = str(q_text)
@@ -219,6 +222,11 @@ def normalize_message(message: Message) -> Optional[Dict[str, Any]]:
             if getattr(quote_obj, "position", None) is not None
             else getattr(quote_obj, "offset", None)
         )
+        logger.info(
+            f"[QUOTE] msg={message.id} branch=message.quote "
+            f"text={reply_to_quote_text!r:.60} pos={reply_to_quote_position} "
+            f"attrs={q_attrs}"
+        )
     elif getattr(message, "quote_text", None):
         reply_to_quote_text = str(message.quote_text)
         reply_to_quote_html = str(getattr(message, "quote_html", reply_to_quote_text))
@@ -227,10 +235,29 @@ def normalize_message(message: Message) -> Optional[Dict[str, Any]]:
             if getattr(message, "quote_position", None) is not None
             else getattr(message, "quote_offset", None)
         )
+        logger.info(
+            f"[QUOTE] msg={message.id} branch=message.quote_text "
+            f"text={reply_to_quote_text!r:.60} pos={reply_to_quote_position}"
+        )
     elif getattr(message, "reply_to", None) and getattr(message.reply_to, "quote_text", None):
         reply_to_quote_text = str(message.reply_to.quote_text)
         reply_to_quote_html = reply_to_quote_text
         reply_to_quote_position = getattr(message.reply_to, "quote_offset", None)
+        logger.info(
+            f"[QUOTE] msg={message.id} branch=reply_to.quote_text "
+            f"text={reply_to_quote_text!r:.60} pos={reply_to_quote_position}"
+        )
+    elif getattr(message, "reply_to_message_id", None):
+        # Reply exists but no quote extracted — log what reply_to exposes
+        reply_to_obj = getattr(message, "reply_to", None)
+        rt_attrs = [a for a in dir(reply_to_obj) if not a.startswith("_")] if reply_to_obj else []
+        rt_qt = getattr(reply_to_obj, "quote_text", "<missing>") if reply_to_obj else "<no reply_to>"
+        logger.info(
+            f"[QUOTE] msg={message.id} branch=NONE (no quote found) "
+            f"reply_to_msg_id={message.reply_to_message_id} "
+            f"reply_to.quote_text={rt_qt!r} "
+            f"reply_to attrs={rt_attrs}"
+        )
 
     # caption: convert to str but guard against Hydrogram Str objects that
     # may stringify to the literal word "None" when the caption is absent.
