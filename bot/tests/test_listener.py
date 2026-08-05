@@ -217,6 +217,29 @@ class TestSerialization:
         assert payload["reply_to_quote_html"] == "<b>Selected quoted text</b>"
         assert payload["reply_to_quote_position"] == 12
 
+    def test_normalize_message_with_raw_tl_quote(self):
+        raw_header = SimpleNamespace(
+            quote_text="Quoted text from raw TL",
+            quote_offset=8,
+        )
+        raw_msg = SimpleNamespace(reply_to=raw_header)
+        msg = _msg(
+            id=502,
+            chat=SimpleNamespace(id=-1001),
+            text=SimpleNamespace(html="Reply text"),
+            reply_to_message_id=450,
+            quote=None,
+            reply_to=None,
+            _raw=raw_msg,
+        )
+        payload = normalize_message(msg)
+        assert payload["type"] == "text"
+        assert payload["reply_to_message_id"] == 450
+        assert payload["reply_to_quote_text"] == "Quoted text from raw TL"
+        assert payload["reply_to_quote_html"] == "Quoted text from raw TL"
+        assert payload["reply_to_quote_position"] == 8
+
+
 
 class TestNativeForwardFallbackError:
     """_is_native_forward_fallback_error should match all access-denial errors."""
