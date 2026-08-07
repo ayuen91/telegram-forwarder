@@ -56,6 +56,11 @@ try:
 except (ImportError, ModuleNotFoundError, RuntimeError, AttributeError):
     UpdateEditChannelMessage = None  # Graceful fallback
 
+try:
+    from hydrogram.raw.types import UpdateNewChannelMessage
+except (ImportError, ModuleNotFoundError, RuntimeError, AttributeError):
+    UpdateNewChannelMessage = None  # Graceful fallback
+
 from hydrogram.types import Message
 
 from media_relay import RelayConfig, relay_to_bot, cleanup_relay
@@ -165,13 +170,13 @@ def _quote_position_from(obj) -> Optional[int]:
     return getattr(obj, "quote_offset", None)
 
 
-def _quote_from_header(reply_header) -> tuple:
-    """Extract (plain, html, position) from a reply_to / reply_to_header object."""
+def _extract_quote_from_tl_reply_header(reply_header) -> Optional[Dict[str, Any]]:
+    """Extract quote fields from a TL MessageReplyHeader or Hydrogram reply object."""
     if not reply_header:
-        return None, None, None
+        return None
 
     nested = getattr(reply_header, "quote", None)
-    if nested:
+    if nested and not isinstance(nested, bool):
         q_text = getattr(nested, "text", None)
         if q_text is not None:
             plain = str(q_text)
@@ -181,16 +186,99 @@ def _quote_from_header(reply_header) -> tuple:
                 html = str(nested.html)
             else:
                 html = _entities_to_html(plain, getattr(nested, "entities", None)) or plain
-            return plain, html, _quote_position_from(nested)
+            return {
+                "reply_to_quote_text": plain,
+                "reply_to_quote_html": html,
+                "reply_to_quote_position": _quote_position_from(nested),
+            }
 
     qt = getattr(reply_header, "quote_text", None)
     if not qt:
-        return None, None, None
+        return None
 
     plain = str(qt)
     entities = getattr(reply_header, "quote_entities", None)
     html = (_entities_to_html(plain, entities) if entities else None) or plain
-    return plain, html, _quote_position_from(reply_header)
+    return {
+        "reply_to_quote_text": plain,
+        "reply_to_quote_html": html,
+        "reply_to_quote_position": _quote_position_from(reply_header),
+    }
+
+
+def _quote_from_header(reply_header) -> tuple:
+    """Extract (plain, html, position) from a reply_to / reply_to_header object."""
+    data = _extract_quote_from_tl_reply_header(reply_header)
+    if not data:
+        return None, None, None
+    return (
+        data["reply_to_quote_text"],
+        data["reply_to_quote_html"],
+        data.get("reply_to_quote_position"),
+    )
+
+
+async def _store_pending_quote(
+    redis_client,
+    pending_quotes: Dict[int, Dict[str, Any]],
+    chat_id: int,
+    message_id: int,
+    quote: Dict[str, Any],
+) -> None:
+    pending_quotes[int(message_id)] = quote
+    if redis_client is None:
+        return
+    try:
+        key = f"{QUOTE_CACHE_PREFIX}:{chat_id}:{int(message_id)}"
+        await redis_client.setex(key, QUOTE_CACHE_TTL, json.dumps(quote, default=str))
+    except Exception as e:
+        logger.debug(f"Quote cache write skipped for msg {message_id}: {e}")
+
+
+async def _consume_pending_quote(
+    redis_client,
+    pending_quotes: Dict[int, Dict[str, Any]],
+    chat_id: int,
+    message_id: int,
+) -> Optional[Dict[str, Any]]:
+    mid = int(message_id)
+    if mid in pending_quotes:
+        return pending_quotes.pop(mid)
+    if redis_client is None:
+        return None
+    try:
+        key = f"{QUOTE_CACHE_PREFIX}:{chat_id}:{mid}"
+        raw = await redis_client.get(key)
+        if not raw:
+            return None
+        await redis_client.delete(key)
+        payload = raw.decode() if isinstance(raw, bytes) else raw
+        return json.loads(payload)
+    except Exception as e:
+        logger.debug(f"Quote cache read skipped for msg {message_id}: {e}")
+        return None
+
+
+def _capture_tl_message_quote(tl_message, source_chat_id: int) -> Optional[Dict[str, Any]]:
+    """Read quote metadata from a raw TL Message before Hydrogram drops it."""
+    if tl_message is None:
+        return None
+    peer = getattr(tl_message, "peer_id", None)
+    raw_channel_id = getattr(peer, "channel_id", None)
+    if raw_channel_id is None:
+        return None
+    channel_chat_id = int(f"-100{raw_channel_id}")
+    if channel_chat_id != source_chat_id:
+        return None
+    msg_id = getattr(tl_message, "id", None)
+    if not msg_id:
+        return None
+    reply_to = getattr(tl_message, "reply_to", None)
+    quote = _extract_quote_from_tl_reply_header(reply_to)
+    if not quote:
+        return None
+    quote["_source_message_id"] = int(msg_id)
+    return quote
 
 
 def _extract_reply_quote(message: Message) -> tuple:
@@ -306,16 +394,15 @@ def normalize_message(message: Message) -> Optional[Dict[str, Any]]:
     reply_to_quote_html: Optional[str] = None
     reply_to_quote_position: Optional[int] = None
 
-    # Diagnostic logging: inspect all reply/quote attributes on message & _raw
+    # Diagnostic logging when a reply is present but quote extraction may fail.
     if getattr(message, "reply_to_message_id", None) or getattr(message, "reply_to_story_id", None):
-        msg_reply_attrs = {
-            k: getattr(message, k, None)
-            for k in dir(message)
-            if ("reply" in k.lower() or "quote" in k.lower()) and not k.startswith("_")
-        }
         _raw = getattr(message, "_raw", None)
         _raw_msg = getattr(_raw, "message", _raw) if _raw else None
-        raw_reply = (getattr(_raw_msg, "reply_to", None) or getattr(_raw, "reply_to", None)) if _raw_msg else None
+        raw_reply = None
+        if _raw_msg is not None:
+            raw_reply = getattr(_raw_msg, "reply_to", None) or getattr(_raw, "reply_to", None)
+        elif _raw is not None:
+            raw_reply = getattr(_raw, "reply_to", None)
         raw_reply_dict = {}
         if raw_reply:
             for k in ("reply_to_msg_id", "quote", "quote_text", "quote_offset", "quote_entities", "reply_to_top_id"):
@@ -324,8 +411,8 @@ def normalize_message(message: Message) -> Optional[Dict[str, Any]]:
                     raw_reply_dict[k] = val
         logger.info(
             f"[QUOTE_DEBUG] msg={message.id} "
-            f"msg_attrs={msg_reply_attrs} "
-            f"raw_reply={raw_reply_dict}"
+            f"has_raw={_raw is not None} "
+            f"raw_reply={raw_reply_dict or 'empty'}"
         )
 
     reply_to_quote_text, reply_to_quote_html, reply_to_quote_position = _extract_reply_quote(message)
@@ -1430,6 +1517,8 @@ LISTENER_LAST_PTS_KEY = "listener:last_pts"
 # _handle() pushes here instead of blocking; overflow_drainer() refills
 # the queue as workers free up slots. Messages are never lost.
 LISTENER_OVERFLOW_KEY = "listener:overflow"
+QUOTE_CACHE_PREFIX = "listener:quote"
+QUOTE_CACHE_TTL = 120
 
 
 def register_listener(
@@ -1472,6 +1561,10 @@ def register_listener(
         f"(handler=on_message, filter=filters.chat)"
     )
 
+    # Hydrogram hydrates reply_to_message but drops quote_text from MessageReplyHeader.
+    # Capture quotes from raw TL UpdateNewChannelMessage before on_message runs.
+    pending_quotes: Dict[int, Dict[str, Any]] = {}
+
     async def _handle(client: Client, message: Message):
         """Shared handler: validate, normalize, enqueue. No heavy work here."""
         # ── Startup backlog filter ────────────────────────────────────────
@@ -1493,6 +1586,20 @@ def register_listener(
         payload = normalize_message(message)
         if payload is None:
             return  # Unsupported message type
+
+        if not payload.get("reply_to_quote_text") and payload.get("reply_to_message_id"):
+            hint = await _consume_pending_quote(
+                redis_client, pending_quotes, int(message.chat.id), int(message.id)
+            )
+            if hint:
+                payload["reply_to_quote_text"] = hint.get("reply_to_quote_text")
+                payload["reply_to_quote_html"] = hint.get("reply_to_quote_html")
+                payload["reply_to_quote_position"] = hint.get("reply_to_quote_position")
+                logger.info(
+                    f"[QUOTE] msg={message.id} branch=raw_tl "
+                    f"text={payload['reply_to_quote_text']!r:.60} "
+                    f"pos={payload.get('reply_to_quote_position')}"
+                )
 
         # Track liveness and sequence — both written on every push-delivered
         # message so the health check and catch-up handler have accurate state.
@@ -1562,22 +1669,28 @@ def register_listener(
                     f"Queue full, no Redis client — dropping message {message.id}"
                 )
 
-    # Hydrogram routes channel posts (UpdateNewChannelMessage) and regular
-    # messages (UpdateNewMessage) through the same on_message handler.
-    # filters.chat() matches by numeric ID for both public and private channels.
-    @app.on_message(filters.chat(source_chat_id))
-    async def on_message(client: Client, message: Message):
-        await _handle(client, message)
-
-    # ── Raw update handler — deletions + PTS-aware catch-up ─────────────────────
-    # Handles:
-    #   UpdateDeleteChannelMessages — message deleted in the source channel
-    #   UpdateDeleteMessages        — message deleted in a group/private chat
-    #   UpdateChannelTooLong        — channel PTS desync → targeted catch-up
-    #   UpdatesTooLong              — session-wide PTS desync → full catch-up
+    # Register raw handler BEFORE on_message so quote cache is populated first.
     @app.on_raw_update()
     async def _on_raw_update(client: Client, update, users, chats):
         logger.debug(f"[RAW UPDATE] type={type(update).__name__}")
+
+        # Capture selected-reply quote from TL before Hydrogram strips it.
+        if (
+            UpdateNewChannelMessage is not None
+            and isinstance(update, UpdateNewChannelMessage)
+        ):
+            tl_msg = getattr(update, "message", None)
+            quote = _capture_tl_message_quote(tl_msg, source_chat_id)
+            if quote:
+                msg_id = int(quote.pop("_source_message_id"))
+                await _store_pending_quote(
+                    redis_client, pending_quotes, source_chat_id, msg_id, quote
+                )
+                logger.info(
+                    f"[QUOTE] raw_tl cached msg={msg_id} "
+                    f"text={quote.get('reply_to_quote_text')!r:.60} "
+                    f"pos={quote.get('reply_to_quote_position')}"
+                )
 
         # ── Deletion propagation ─────────────────────────────────────────────────
         # UpdateDeleteChannelMessages fires when a message is deleted in a channel.
@@ -1749,6 +1862,11 @@ def register_listener(
                 edit_queue=edit_queue,
             )
 
+    # Hydrogram routes channel posts (UpdateNewChannelMessage) and regular
+    # messages (UpdateNewMessage) through the same on_message handler.
+    @app.on_message(filters.chat(source_chat_id))
+    async def on_message(client: Client, message: Message):
+        await _handle(client, message)
 
     # ── Edited-message handler ──────────────────────────────────────────────────
     # Hydrogram fires on_edited_message for every edit in channels and groups

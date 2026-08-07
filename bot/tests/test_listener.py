@@ -40,6 +40,8 @@ from listener import (
     _serialize_venue,
     _source_message_ids,
     _extract_reply_quote,
+    _extract_quote_from_tl_reply_header,
+    _capture_tl_message_quote,
     normalize_message,
 )
 
@@ -278,6 +280,37 @@ class TestSerialization:
         assert plain == "Nested quote"
         assert html == "<i>Nested quote</i>"
         assert pos == 5
+
+    def test_extract_quote_from_tl_reply_header_boolean_quote_flag(self):
+        """TL MessageReplyHeader.quote is a bool flag, not a nested object."""
+        header = SimpleNamespace(
+            quote=True,
+            quote_text="Album caption tests",
+            quote_offset=0,
+            quote_entities=None,
+        )
+        data = _extract_quote_from_tl_reply_header(header)
+        assert data is not None
+        assert data["reply_to_quote_text"] == "Album caption tests"
+        assert data["reply_to_quote_position"] == 0
+
+    def test_capture_tl_message_quote_channel_filter(self):
+        tl_msg = SimpleNamespace(
+            id=595,
+            peer_id=SimpleNamespace(channel_id=4497139985),
+            reply_to=SimpleNamespace(
+                quote=True,
+                quote_text="Selected part",
+                quote_offset=6,
+            ),
+        )
+        quote = _capture_tl_message_quote(tl_msg, -1004497139985)
+        assert quote is not None
+        assert quote["_source_message_id"] == 595
+        assert quote["reply_to_quote_text"] == "Selected part"
+
+        wrong_channel = _capture_tl_message_quote(tl_msg, -1009999999999)
+        assert wrong_channel is None
 
 
 class TestNativeForwardFallbackError:
