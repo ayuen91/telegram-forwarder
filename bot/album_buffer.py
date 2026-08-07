@@ -58,12 +58,15 @@ class AlbumBuffer:
 
         sent_key = f"{self.ALBUM_PREFIX}:{group_id}:sent"
         if await self.redis.exists(sent_key):
-            # This album was already flushed and dispatched.  The arriving item
-            # is a late straggler — drop it to prevent a duplicate send.
-            logger.debug(
-                f"Album {group_id} already sent, dropping late item {message_id}"
+            # Album already dispatched — forward this straggler as a standalone
+            # message so content is not lost (may appear outside the album group).
+            logger.warning(
+                f"Album {group_id} already sent — forwarding late item {message_id} individually"
             )
-            return None
+            late = dict(payload)
+            late.pop("media_group_id", None)
+            late["_late_album_item"] = True
+            return late
 
         album_key = f"{self.ALBUM_PREFIX}:{group_id}"
         timer_key = f"{self.ALBUM_PREFIX}:{group_id}:first_seen"

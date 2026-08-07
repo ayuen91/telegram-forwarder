@@ -136,6 +136,41 @@ async def ensure_relay_chat(
 # ── Internal relay helpers ────────────────────────────────────────────────
 
 
+def _parse_mode_html():
+    try:
+        from hydrogram.enums import ParseMode
+        return ParseMode.HTML
+    except Exception:
+        return "html"
+
+
+def _text_for_relay(msg) -> tuple:
+    """Return (text, parse_mode) preserving Hydrogram HTML entities when present."""
+    if not msg.text:
+        return "", None
+    if getattr(msg.text, "entities", None) and hasattr(msg.text, "html"):
+        html = str(msg.text.html)
+        if html and html != "None":
+            return html, _parse_mode_html()
+    plain = str(msg.text)
+    return (plain if plain != "None" else ""), None
+
+
+def _caption_for_relay(msg) -> tuple:
+    """Return (caption, parse_mode) preserving caption entities when present."""
+    cap = getattr(msg, "caption", None)
+    if cap is None:
+        return "", None
+    if getattr(cap, "entities", None) and hasattr(cap, "html"):
+        html = str(cap.html)
+        if html and html != "None":
+            return html, _parse_mode_html()
+    plain = str(cap)
+    if plain == "None":
+        return "", None
+    return plain, None
+
+
 async def _direct_copy(
     app: Client,
     target: int,
@@ -177,17 +212,18 @@ async def _direct_copy(
         # Build InputMedia list using file_ids (no disk download required).
         media_group = []
         for msg in messages:
-            caption = str(msg.caption) if msg.caption else ""
-            if caption == "None":
-                caption = ""
+            caption, parse_mode = _caption_for_relay(msg)
+            cap_kwargs = {"caption": caption}
+            if parse_mode:
+                cap_kwargs["parse_mode"] = parse_mode
             if msg.photo:
-                media_group.append(InputMediaPhoto(msg.photo.file_id, caption=caption))
+                media_group.append(InputMediaPhoto(msg.photo.file_id, **cap_kwargs))
             elif msg.video:
-                media_group.append(InputMediaVideo(msg.video.file_id, caption=caption))
+                media_group.append(InputMediaVideo(msg.video.file_id, **cap_kwargs))
             elif msg.audio:
-                media_group.append(InputMediaAudio(msg.audio.file_id, caption=caption))
+                media_group.append(InputMediaAudio(msg.audio.file_id, **cap_kwargs))
             elif msg.document:
-                media_group.append(InputMediaDocument(msg.document.file_id, caption=caption))
+                media_group.append(InputMediaDocument(msg.document.file_id, **cap_kwargs))
             else:
                 # Unsupported type — skip with a warning rather than crashing.
                 logger.warning(
@@ -291,7 +327,11 @@ async def _download_reupload_single(
         msg.photo, msg.video, msg.document, msg.audio,
         msg.voice, msg.video_note, msg.animation, msg.sticker,
     ]):
-        sent = await app.send_message(target, str(msg.text))
+        text, parse_mode = _text_for_relay(msg)
+        if parse_mode:
+            sent = await app.send_message(target, text, parse_mode=parse_mode)
+        else:
+            sent = await app.send_message(target, text)
         return [sent.id]
 
     file_path = await app.download_media(
@@ -303,29 +343,32 @@ async def _download_reupload_single(
             "(protected content channel)"
         )
 
-    # Guard: Hydrogram may stringify a missing caption as the literal "None".
-    _rc = msg.caption
-    caption = (str(_rc) if _rc is not None and str(_rc) != "None" else None)
+    caption, parse_mode = _caption_for_relay(msg)
+    cap_kwargs = {}
+    if caption:
+        cap_kwargs["caption"] = caption
+    if parse_mode:
+        cap_kwargs["parse_mode"] = parse_mode
 
     if msg.photo:
-        sent = await app.send_photo(target, file_path, caption=caption)
+        sent = await app.send_photo(target, file_path, **cap_kwargs)
     elif msg.video:
-        sent = await app.send_video(target, file_path, caption=caption)
+        sent = await app.send_video(target, file_path, **cap_kwargs)
     elif msg.document:
-        sent = await app.send_document(target, file_path, caption=caption)
+        sent = await app.send_document(target, file_path, **cap_kwargs)
     elif msg.audio:
-        sent = await app.send_audio(target, file_path, caption=caption)
+        sent = await app.send_audio(target, file_path, **cap_kwargs)
     elif msg.voice:
-        sent = await app.send_voice(target, file_path, caption=caption)
+        sent = await app.send_voice(target, file_path, **cap_kwargs)
     elif msg.video_note:
         sent = await app.send_video_note(target, file_path)
     elif msg.animation:
-        sent = await app.send_animation(target, file_path, caption=caption)
+        sent = await app.send_animation(target, file_path, **cap_kwargs)
     elif msg.sticker:
         sent = await app.send_sticker(target, file_path)
     else:
         # Unknown media type — send as document
-        sent = await app.send_document(target, file_path, caption=caption)
+        sent = await app.send_document(target, file_path, **cap_kwargs)
 
     return [sent.id]
 
@@ -357,18 +400,20 @@ async def _download_reupload_album(
             continue
 
         # Guard: Hydrogram may stringify a missing caption as the literal "None".
-        _rc = msg.caption
-        caption = (str(_rc) if _rc is not None and str(_rc) != "None" else "") or ""
+        caption, parse_mode = _caption_for_relay(msg)
+        cap_kwargs = {"caption": caption}
+        if parse_mode:
+            cap_kwargs["parse_mode"] = parse_mode
 
         if msg.photo:
-            media_group.append(InputMediaPhoto(file_path, caption=caption))
+            media_group.append(InputMediaPhoto(file_path, **cap_kwargs))
         elif msg.video:
-            media_group.append(InputMediaVideo(file_path, caption=caption))
+            media_group.append(InputMediaVideo(file_path, **cap_kwargs))
         elif msg.audio:
-            media_group.append(InputMediaAudio(file_path, caption=caption))
+            media_group.append(InputMediaAudio(file_path, **cap_kwargs))
         else:
             # document, animation, etc.
-            media_group.append(InputMediaDocument(file_path, caption=caption))
+            media_group.append(InputMediaDocument(file_path, **cap_kwargs))
 
     if not media_group:
         raise RuntimeError(

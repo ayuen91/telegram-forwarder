@@ -140,6 +140,112 @@ def _serialize_reply_markup(reply_markup) -> Optional[Dict[str, Any]]:
     return {"inline_keyboard": rows}
 
 
+def _entities_to_html(text: str, entities) -> Optional[str]:
+    """Best-effort HTML from plain text + MTProto/Hydrogram entity list."""
+    if not text or not entities:
+        return None
+    for module_path in ("hydrogram.parser.html", "pyrogram.parser.html"):
+        try:
+            import importlib
+
+            mod = importlib.import_module(module_path)
+            return str(mod.unparse(text, entities))
+        except Exception:
+            continue
+    return None
+
+
+def _quote_position_from(obj) -> Optional[int]:
+    pos = getattr(obj, "position", None)
+    if pos is not None:
+        return pos
+    off = getattr(obj, "offset", None)
+    if off is not None:
+        return off
+    return getattr(obj, "quote_offset", None)
+
+
+def _quote_from_header(reply_header) -> tuple:
+    """Extract (plain, html, position) from a reply_to / reply_to_header object."""
+    if not reply_header:
+        return None, None, None
+
+    nested = getattr(reply_header, "quote", None)
+    if nested:
+        q_text = getattr(nested, "text", None)
+        if q_text is not None:
+            plain = str(q_text)
+            if getattr(nested, "entities", None) and hasattr(q_text, "html"):
+                html = str(q_text.html)
+            elif getattr(nested, "html", None):
+                html = str(nested.html)
+            else:
+                html = _entities_to_html(plain, getattr(nested, "entities", None)) or plain
+            return plain, html, _quote_position_from(nested)
+
+    qt = getattr(reply_header, "quote_text", None)
+    if not qt:
+        return None, None, None
+
+    plain = str(qt)
+    entities = getattr(reply_header, "quote_entities", None)
+    html = (_entities_to_html(plain, entities) if entities else None) or plain
+    return plain, html, _quote_position_from(reply_header)
+
+
+def _extract_reply_quote(message: Message) -> tuple:
+    """Return (reply_to_quote_text, reply_to_quote_html, reply_to_quote_position)."""
+    quote_obj = getattr(message, "quote", None)
+    if quote_obj:
+        q_text = getattr(quote_obj, "text", None)
+        if q_text is not None:
+            plain = str(q_text)
+            if getattr(quote_obj, "entities", None) and hasattr(q_text, "html"):
+                html = str(q_text.html)
+            elif getattr(quote_obj, "html", None):
+                html = str(quote_obj.html)
+            else:
+                html = _entities_to_html(plain, getattr(quote_obj, "entities", None)) or plain
+        else:
+            plain = str(quote_obj)
+            html = plain
+        return plain, html, _quote_position_from(quote_obj)
+
+    if getattr(message, "quote_text", None):
+        plain = str(message.quote_text)
+        html = str(getattr(message, "quote_html", plain))
+        if html == plain and getattr(message, "quote_entities", None):
+            html = _entities_to_html(plain, message.quote_entities) or plain
+        return plain, html, _quote_position_from(message)
+
+    reply_to = getattr(message, "reply_to", None)
+    if reply_to:
+        plain, html, pos = _quote_from_header(reply_to)
+        if plain:
+            return plain, html, pos
+
+    reply_header = getattr(message, "reply_to_header", None)
+    if reply_header:
+        plain, html, pos = _quote_from_header(reply_header)
+        if plain:
+            return plain, html, pos
+
+    _raw = getattr(message, "_raw", None)
+    _raw_msg = getattr(_raw, "message", _raw) if _raw else None
+    if _raw_msg or _raw:
+        raw_reply = (
+            getattr(_raw_msg, "reply_to", None)
+            or getattr(_raw, "reply_to", None)
+            if _raw_msg
+            else getattr(_raw, "reply_to", None)
+        )
+        plain, html, pos = _quote_from_header(raw_reply)
+        if plain:
+            return plain, html, pos
+
+    return None, None, None
+
+
 def normalize_message(message: Message) -> Optional[Dict[str, Any]]:
     """
     Extract a consistent payload from any Hydrogram message type.
@@ -222,81 +328,18 @@ def normalize_message(message: Message) -> Optional[Dict[str, Any]]:
             f"raw_reply={raw_reply_dict}"
         )
 
-    quote_obj = getattr(message, "quote", None)
-    if quote_obj:
-        q_attrs = [a for a in dir(quote_obj) if not a.startswith("_")]
-        q_text = getattr(quote_obj, "text", None)
-        if q_text is not None:
-            reply_to_quote_text = str(q_text)
-            if getattr(quote_obj, "entities", None) and hasattr(q_text, "html"):
-                reply_to_quote_html = str(q_text.html)
-            elif getattr(quote_obj, "html", None):
-                reply_to_quote_html = str(quote_obj.html)
-            else:
-                reply_to_quote_html = reply_to_quote_text
-        else:
-            reply_to_quote_text = str(quote_obj)
-            reply_to_quote_html = reply_to_quote_text
-        reply_to_quote_position = (
-            getattr(quote_obj, "position", None)
-            if getattr(quote_obj, "position", None) is not None
-            else getattr(quote_obj, "offset", None)
-        )
+    reply_to_quote_text, reply_to_quote_html, reply_to_quote_position = _extract_reply_quote(message)
+    if reply_to_quote_text and getattr(message, "reply_to_message_id", None):
         logger.info(
-            f"[QUOTE] msg={message.id} branch=message.quote "
+            f"[QUOTE] msg={message.id} "
             f"text={reply_to_quote_text!r:.60} pos={reply_to_quote_position} "
-            f"attrs={q_attrs}"
+            f"html={bool(reply_to_quote_html and reply_to_quote_html != reply_to_quote_text)}"
         )
-
-    elif getattr(message, "quote_text", None):
-        reply_to_quote_text = str(message.quote_text)
-        reply_to_quote_html = str(getattr(message, "quote_html", reply_to_quote_text))
-        reply_to_quote_position = (
-            getattr(message, "quote_position", None)
-            if getattr(message, "quote_position", None) is not None
-            else getattr(message, "quote_offset", None)
-        )
+    elif getattr(message, "reply_to_message_id", None):
         logger.info(
-            f"[QUOTE] msg={message.id} branch=message.quote_text "
-            f"text={reply_to_quote_text!r:.60} pos={reply_to_quote_position}"
+            f"[QUOTE] msg={message.id} branch=NONE (plain reply, no quote) "
+            f"reply_to_msg_id={message.reply_to_message_id}"
         )
-
-    elif getattr(message, "reply_to", None) and getattr(message.reply_to, "quote_text", None):
-        reply_to_quote_text = str(message.reply_to.quote_text)
-        reply_to_quote_html = reply_to_quote_text
-        reply_to_quote_position = getattr(message.reply_to, "quote_offset", None)
-        logger.info(
-            f"[QUOTE] msg={message.id} branch=reply_to.quote_text "
-            f"text={reply_to_quote_text!r:.60} pos={reply_to_quote_position}"
-        )
-
-    else:
-        # Branch 4: Access reply_to_header or raw MTProto reply_to object.
-        _raw = getattr(message, "_raw", None)
-        _raw_msg = getattr(_raw, "message", _raw) if _raw else None
-        reply_header = (
-            getattr(message, "reply_to_header", None)
-            or (getattr(_raw_msg, "reply_to", None) if _raw_msg else None)
-            or (getattr(_raw, "reply_to", None) if _raw else None)
-        )
-        _raw_qt = getattr(reply_header, "quote_text", None) if reply_header else None
-        if _raw_qt:
-            reply_to_quote_text = str(_raw_qt)
-            reply_to_quote_html = reply_to_quote_text
-            reply_to_quote_position = (
-                getattr(reply_header, "quote_offset", None)
-                if getattr(reply_header, "quote_offset", None) is not None
-                else getattr(reply_header, "quote_position", None)
-            )
-            logger.info(
-                f"[QUOTE] msg={message.id} branch=reply_header.quote_text "
-                f"text={reply_to_quote_text!r:.60} pos={reply_to_quote_position}"
-            )
-        elif getattr(message, "reply_to_message_id", None):
-            logger.info(
-                f"[QUOTE] msg={message.id} branch=NONE (plain reply, no quote) "
-                f"reply_to_msg_id={message.reply_to_message_id}"
-            )
 
     # caption: convert to str but guard against Hydrogram Str objects that
     # may stringify to the literal word "None" when the caption is absent.
@@ -1270,6 +1313,11 @@ async def message_worker(
             if payload.get("media_group_id"):
                 flush_result = await album_buffer.add(payload)
                 if flush_result:
+                    if flush_result.get("_late_album_item"):
+                        flush_result = {
+                            k: v for k, v in flush_result.items()
+                            if k != "_late_album_item"
+                        }
                     # Acquire send_lock so album delivery is serialised with
                     # regular messages and source-channel order is maintained.
                     if send_lock is not None:

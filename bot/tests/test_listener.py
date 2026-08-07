@@ -39,6 +39,7 @@ from listener import (
     _serialize_reply_markup,
     _serialize_venue,
     _source_message_ids,
+    _extract_reply_quote,
     normalize_message,
 )
 
@@ -239,6 +240,44 @@ class TestSerialization:
         assert payload["reply_to_quote_html"] == "Quoted text from raw TL"
         assert payload["reply_to_quote_position"] == 8
 
+    def test_extract_reply_quote_with_entities(self):
+        raw_header = SimpleNamespace(
+            quote_text="Bold quote",
+            quote_offset=3,
+            quote_entities=[SimpleNamespace(type="bold", offset=0, length=4)],
+        )
+        msg = SimpleNamespace(
+            quote=None,
+            quote_text=None,
+            reply_to=raw_header,
+            reply_to_header=None,
+            _raw=None,
+        )
+        plain, html, pos = _extract_reply_quote(msg)
+        assert plain == "Bold quote"
+        assert pos == 3
+        # Without hydrogram parser in test env, html falls back to plain text
+        assert html == "Bold quote"
+
+    def test_extract_reply_quote_nested_on_reply_to(self):
+        nested = SimpleNamespace(
+            text="Nested quote",
+            html="<i>Nested quote</i>",
+            position=5,
+            entities=[object()],
+        )
+        reply_to = SimpleNamespace(quote=nested, quote_text=None)
+        msg = SimpleNamespace(
+            quote=None,
+            quote_text=None,
+            reply_to=reply_to,
+            reply_to_header=None,
+            _raw=None,
+        )
+        plain, html, pos = _extract_reply_quote(msg)
+        assert plain == "Nested quote"
+        assert html == "<i>Nested quote</i>"
+        assert pos == 5
 
 
 class TestNativeForwardFallbackError:

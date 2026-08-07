@@ -176,3 +176,26 @@ class TestAlbumBuffer:
         assert result["items"][1]["reply_to_message_id"] == 29960
         assert result["items"][1]["media_group_id"] == "14279032192983933"
 
+    @pytest.mark.asyncio
+    async def test_late_item_forwarded_individually(self):
+        """Late album stragglers should be forwarded, not dropped."""
+        from album_buffer import AlbumBuffer
+
+        self.mock_redis.exists.return_value = True
+        buffer = AlbumBuffer(self.mock_redis, buffer_seconds=2.0)
+
+        payload = {
+            "message_id": 99,
+            "chat_id": -100123,
+            "media_group_id": "late_group",
+            "type": "photo",
+        }
+
+        result = await buffer.add(payload)
+
+        assert result is not None
+        assert result.get("_late_album_item") is True
+        assert "media_group_id" not in result
+        assert result["message_id"] == 99
+        self.mock_redis.hset.assert_not_called()
+

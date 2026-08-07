@@ -282,7 +282,21 @@ class TestReplacementsSkipNative:
         assert "processed_text" not in result
         assert result["destinations"][0]["chat_id"] == -1001
 
-    def test_needs_n8n_false_when_native(self):
-        from replacements import needs_n8n
+    def test_skips_replacement_when_native_forward_even_if_rule_matches(self):
+        from replacements import build_processed_payload
 
-        assert needs_n8n({"type": "text", "text": "hi", "use_native_forward": True}) is False
+        config = MagicMock()
+        config.get_active_destinations.return_value = [
+            SimpleNamespace(chat_id=-1001, name="D", enabled=True)
+        ]
+        config.settings.replacement_rules = [
+            SimpleNamespace(pattern="hello", replacement="bye", is_regex=False)
+        ]
+        payload = {
+            "type": "text",
+            "text": "hello world",
+            "use_native_forward": True,
+        }
+        result = build_processed_payload(payload, config)
+        assert result.get("text_changed") is not True
+        assert "processed_text" not in result
