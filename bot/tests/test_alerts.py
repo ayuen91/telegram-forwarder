@@ -105,3 +105,37 @@ class TestAlertInlineKeyboard:
         assert "stats" in cmds
         assert "reload" in cmds
         assert "help" in cmds
+
+    @pytest.mark.asyncio
+    async def test_send_alert_cooldown_deduplication(self):
+        with patch("alerts.aiohttp.ClientSession") as mock_session_cls:
+            mock_session = MagicMock()
+            mock_resp = AsyncMock()
+            mock_resp.status = 200
+            mock_post_cm = MagicMock()
+            mock_post_cm.__aenter__ = AsyncMock(return_value=mock_resp)
+            mock_post_cm.__aexit__ = AsyncMock(return_value=None)
+            mock_session.post.return_value = mock_post_cm
+            mock_session_cls.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+            mock_session_cls.return_value.__aexit__ = AsyncMock(return_value=None)
+
+            # First alert sends
+            await send_alert(
+                token="test_token",
+                chat_id=12345,
+                message="Error 1",
+                alert_key="throttled_category_key",
+                cooldown=300,
+            )
+            assert mock_session.post.call_count == 1
+
+            # Second alert with same key within cooldown is suppressed
+            await send_alert(
+                token="test_token",
+                chat_id=12345,
+                message="Error 2",
+                alert_key="throttled_category_key",
+                cooldown=300,
+            )
+            assert mock_session.post.call_count == 1
+

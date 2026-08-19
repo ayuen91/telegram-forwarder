@@ -5,22 +5,22 @@ A production-ready system that listens to a Telegram source channel and forwards
 ## Architecture
 
 ```
-Source Channel → Hydrogram user (listen + media relay) → Redis Queue → n8n (word replace) → Sender Bot API → Destinations
+Source Channel → Hydrogram user (listen + media relay) → Priority Queue → Replacements Engine → Sender Bot API → Destinations
 ```
 
 **Roles:**
-- **Hydrogram user account** — member of source channel (reads messages, relays media to bot via private chat)
+- **Hydrogram user account** — member of source channel (reads messages, relays media to bot via private chat or relay channel)
 - **Sender bot (`BOT_TOKEN`)** — admin of **destination channels only**; receives text via `sendMessage`, media via `copyMessage` from relay chat
-- **n8n** — HMAC-verified webhook that applies word replacements from `replacements.yml` and returns JSON
+- **Local Replacements Engine** — applies word replacements and regular expressions from `replacements.yml` with HTML tag preservation
 
 **Key features:**
 - **Minimal bot privileges**: sender bot does not need source channel access
 - **Zero-download media**: userbot copies media to relay chat; bot copies from relay to destinations
 - **Forward attribution**: when the source posts a message forwarded from a channel where the sender bot is admin, destinations get the same "Forwarded from" tag via `forwardMessage`
-- **Reply threading**: Maps source message IDs to destination IDs so channel replies are preserved
+- **Reply threading & Quotes**: Maps source message IDs to destination IDs so channel replies and quotes are preserved across small and big channels alike (with expandable blockquote fallback for unmapped historical parent posts)
 - **Album support**: Buffers media groups via `media_group_id` with 2-second collection window
-- **Word replacement**: Applied to both text and captions, regex and plain string supported
-- **Backpressure control**: `asyncio.Queue` + 2 workers with randomized delay prevents FloodWait
+- **Word replacement**: Applied to text, captions, and quotes; regex and plain string supported
+- **Backpressure control**: `asyncio.PriorityQueue` + Redis overflow buffer + workers with randomized delay prevents FloodWait
 - **Auto-recovery**: Task supervisor auto-restarts crashed tasks, Docker HEALTHCHECK restarts hung containers
 - **Health monitoring**: 9 health checks, Telegram alerts, heartbeat-based Docker healthcheck
 - **Config hot-reload**: Edit `replacements.yml` or `channels.yml` without restarting
@@ -156,16 +156,6 @@ docker compose restart                  # All services
 bash scripts/deploy.sh
 ```
 
-### n8n Workflow
-
-n8n handles **word replacement only** — it does not send Telegram messages. The Python bot sends via Bot API after n8n returns the processed payload.
-
-1. Open n8n at `http://localhost:5678` via SSH tunnel: `ssh -L 5678:localhost:5678 user@your-ec2-ip`
-2. Import `n8n/workflows/message_processor.json` (use the `+` button → Import from file)
-3. Activate the workflow (toggle in top-right corner)
-
-> **Note:** `WEBHOOK_SECRET` is injected into n8n from `.env` via Docker Compose. `BOT_TOKEN` stays in the bot container only.
-
 ### Backups
 
 Automatic daily backups run at 3:00 AM (configured by `setup_vps.sh`):
@@ -180,7 +170,7 @@ Manual backup: `bash scripts/backup.sh`
 
 | Feature | How It Works |
 |---------|-------------|
-| **Backpressure** | `asyncio.Queue(maxsize=100)` absorbs bursts; 2 workers process with random delay |
+| **Backpressure** | `asyncio.PriorityQueue` absorbs bursts with oldest-first prioritization; Redis overflow list handles surges |
 | **FloodWait** | Caught in task supervisor — auto-sleeps for requested duration |
 | **Task auto-restart** | Supervisor wraps all tasks; crashes trigger alert + exponential backoff restart |
 | **Docker HEALTHCHECK** | Heartbeat file checked every 2min; 3 failures = container auto-restart |
@@ -194,23 +184,23 @@ Manual backup: `bash scripts/backup.sh`
 ```
 telegram-forwarder/
 ├── Dockerfile             # Bot image (build context: repo root)
-├── docker-compose.yml     # 3 services: bot, redis, n8n
-├── bot/                   # Hydrogram user bot
-│   ├── main.py            # Entry point: supervisor + self-test
-│   ├── listener.py        # on_message → Queue → workers → Bot API forward
+├── docker-compose.yml     # Services: bot, redis
+├── bot/                   # Forwarder core
+│   ├── main.py            # Entry point: supervisor + self-test + silence watchdog
+│   ├── listener.py        # MTProto userbot listener + PriorityQueue + workers
 │   ├── media_relay.py     # Userbot copy to relay chat (media only)
-│   ├── telegram_sender.py # Bot API sendMessage / copyMessage / forwardMessage
+│   ├── telegram_sender.py # Bot API delivery (quotes, native forwards, copies)
 │   ├── forward_attribution.py  # Detect origin + admin eligibility for forward tags
-│   ├── album_buffer.py    # Media group collection
+│   ├── album_buffer.py    # Media group buffering with quote propagation
+│   ├── replacements.py    # Word replacement & regex engine with HTML safety
 │   ├── queue_manager.py   # Redis queues + retry
-│   ├── deduplication.py   # Message dedup
-│   ├── webhook.py         # HMAC webhook sender
-│   ├── health.py          # Health checks + alerts
+│   ├── deduplication.py   # Redis message dedup
+│   ├── health.py          # Centralized health checks + reactive alerts
+│   ├── daily_report.py    # 24h visual health digest & QuickChart generator
 │   ├── config.py          # Config with hot-reload
 │   └── logging_config.py  # Structured JSON logging
-├── config/                # Hot-reloadable YAML configs
+├── config/                # Hot-reloadable YAML configs (channels.yml, replacements.yml)
 ├── db/schema.sql          # SQLite schema
-├── n8n/workflows/         # n8n workflow export
 └── scripts/               # VPS setup, deploy, backup
 ```
 
@@ -224,6 +214,6 @@ telegram-forwarder/
 | Listener not receiving | Check logs for `Workers running` — if missing, startup was blocked by a **critical** check (hydrogram/redis/sender bot/sqlite). Dead letter warnings are safe to ignore at startup |
 | Media not forwarding | Set `RELAY_CHANNEL_ID` to a private channel (both userbot + sender bot as admins). Without it, DM relay is used — ensure `/start` was sent to the sender bot |
 | No alerts received | Verify `ALERT_BOT_TOKEN` and `ALERT_CHAT_ID` in `.env` |
-| n8n not processing | Check n8n workflow is **activated** |
 | FloodWait errors | Increase `WORKER_DELAY_MIN`/`WORKER_DELAY_MAX` in `.env` |
 | Account restricted | Check alerts; may need to re-authenticate or use different account |
+

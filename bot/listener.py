@@ -61,6 +61,11 @@ try:
 except (ImportError, ModuleNotFoundError, RuntimeError, AttributeError):
     UpdateNewChannelMessage = None  # Graceful fallback
 
+try:
+    from hydrogram.raw.types import UpdateNewMessage
+except (ImportError, ModuleNotFoundError, RuntimeError, AttributeError):
+    UpdateNewMessage = None  # Graceful fallback
+
 from hydrogram.types import Message
 
 from media_relay import RelayConfig, relay_to_bot, cleanup_relay
@@ -264,12 +269,20 @@ def _capture_tl_message_quote(tl_message, source_chat_id: int) -> Optional[Dict[
     if tl_message is None:
         return None
     peer = getattr(tl_message, "peer_id", None)
-    raw_channel_id = getattr(peer, "channel_id", None)
-    if raw_channel_id is None:
-        return None
-    channel_chat_id = int(f"-100{raw_channel_id}")
-    if channel_chat_id != source_chat_id:
-        return None
+    if peer is not None:
+        raw_channel_id = getattr(peer, "channel_id", None)
+        if raw_channel_id is not None:
+            channel_chat_id = int(f"-100{raw_channel_id}")
+            if channel_chat_id != source_chat_id:
+                return None
+        elif getattr(peer, "chat_id", None) is not None:
+            chat_id = int(f"-{peer.chat_id}")
+            if chat_id != source_chat_id:
+                return None
+        elif getattr(peer, "user_id", None) is not None:
+            user_id = int(peer.user_id)
+            if user_id != source_chat_id:
+                return None
     msg_id = getattr(tl_message, "id", None)
     if not msg_id:
         return None
@@ -279,6 +292,55 @@ def _capture_tl_message_quote(tl_message, source_chat_id: int) -> Optional[Dict[
         return None
     quote["_source_message_id"] = int(msg_id)
     return quote
+
+
+async def _resolve_raw_quote_if_needed(
+    client: Client,
+    source_chat_id: int,
+    message_id: int,
+    payload: Dict[str, Any],
+) -> None:
+    """
+    If payload has a reply_to_message_id but no quote text (e.g. catch-up sync on a large channel),
+    query raw message reply_to header via client.invoke(channels.GetMessages) / get_messages.
+    """
+    if payload.get("reply_to_quote_text") or not payload.get("reply_to_message_id"):
+        return
+    try:
+        import hydrogram.raw.functions.channels as _ch_raw
+        import hydrogram.raw.functions.messages as _msg_raw
+        import hydrogram.raw.types as _raw_types
+
+        peer = await client.resolve_peer(source_chat_id)
+        if isinstance(peer, (_raw_types.InputPeerChannel, _raw_types.InputChannel)):
+            res = await client.invoke(
+                _ch_raw.GetMessages(
+                    channel=peer,
+                    id=[_raw_types.InputMessageID(id=int(message_id))]
+                )
+            )
+        else:
+            res = await client.invoke(
+                _msg_raw.GetMessages(
+                    id=[_raw_types.InputMessageID(id=int(message_id))]
+                )
+            )
+        raw_msgs = getattr(res, "messages", [])
+        if raw_msgs:
+            raw_m = raw_msgs[0]
+            reply_to = getattr(raw_m, "reply_to", None)
+            quote_data = _extract_quote_from_tl_reply_header(reply_to)
+            if quote_data:
+                payload["reply_to_quote_text"] = quote_data.get("reply_to_quote_text")
+                payload["reply_to_quote_html"] = quote_data.get("reply_to_quote_html")
+                payload["reply_to_quote_position"] = quote_data.get("reply_to_quote_position")
+                logger.info(
+                    f"[QUOTE] resolved via GetMessages msg={message_id} "
+                    f"text={payload['reply_to_quote_text']!r:.60} "
+                    f"pos={payload.get('reply_to_quote_position')}"
+                )
+    except Exception as e:
+        logger.debug(f"Failed to resolve raw quote for msg {message_id}: {e}")
 
 
 def _extract_reply_quote(message: Message) -> tuple:
@@ -887,14 +949,17 @@ async def forward_message_pipeline(
                 relay,
                 is_album=(msg_type == "album"),
             )
+        except (FloodWait, TelegramFloodWait):
+            raise
         except MessageIdsEmpty:
             logger.warning(
-                f"MESSAGE_IDS_EMPTY during relay for message "
-                f"{payload.get('message_id')} — message was likely deleted"
+                f"Relay skipped: message {payload.get('message_id')} was deleted or empty"
             )
             return "failed"
         except Exception as ex:
-            logger.error(f"Userbot media relay failed: {ex}", exc_info=True)
+            logger.error(
+                f"Userbot media relay failed for message {payload.get('message_id')}: {ex}"
+            )
             return "failed"
 
     async with aiosqlite.connect(db_path) as db:
@@ -1058,13 +1123,12 @@ async def forward_message_pipeline(
                     f"sent_message_id={sent_msg_id})"
                 )
 
-            except TelegramFloodWait:
+            except (TelegramFloodWait, FloodWait):
                 raise
             except Exception as ex:
                 any_failed = True
                 logger.error(
-                    f"Failed to forward to {dest_name} (chat_id={dest_chat_id}): {ex}",
-                    exc_info=True,
+                    f"Failed to forward message {telegram_id} to {dest_name} (chat_id={dest_chat_id}): {ex}"
                 )
                 await db.execute(
                     """
@@ -1275,15 +1339,31 @@ async def process_payload(
         elif status != "success":
             reason = "Telegram forwarding failed"
             result = await queue_manager.enqueue_failed(payload, reason)
-            await send_alert(
-                alert_token, alert_chat_id,
-                f"🔴 <b>Forward Failed</b>\n\n"
-                f"<blockquote><b>Message ID:</b> <code>{message_id}</code>\n"
-                f"<b>Type:</b> <code>{payload.get('type')}</code>\n"
-                f"<b>Reason:</b> {reason}</blockquote>"
-                + ("\n⚠️ <b>Status:</b> Moved to dead letter queue" if result == "dead_letter" else ""),
-                alert_key=f"fwd-fail-{message_id}",
-            )
+            src_id = payload.get("chat_id", chat_id)
+            if result == "dead_letter":
+                await send_alert(
+                    alert_token, alert_chat_id,
+                    f"💀 <b>Moved to Dead Letter Queue</b>\n\n"
+                    f"<blockquote><b>Message ID:</b> <code>{message_id}</code>\n"
+                    f"<b>Source Chat:</b> <code>{src_id}</code>\n"
+                    f"<b>Type:</b> <code>{payload.get('type')}</code>\n"
+                    f"<b>Reason:</b> {reason} (max retries exceeded)</blockquote>\n"
+                    f"⚠️ <i>Inspect DLQ with: <code>docker compose exec redis redis-cli LRANGE queue:dead_letter 0 -1</code></i>",
+                    alert_key=f"dlq-{message_id}",
+                    cooldown=60,
+                )
+            else:
+                await send_alert(
+                    alert_token, alert_chat_id,
+                    f"🔴 <b>Forwarding Failed</b>\n\n"
+                    f"<blockquote><b>Message ID:</b> <code>{message_id}</code>\n"
+                    f"<b>Source Chat:</b> <code>{src_id}</code>\n"
+                    f"<b>Type:</b> <code>{payload.get('type')}</code>\n"
+                    f"<b>Reason:</b> {reason}</blockquote>\n"
+                    f"🔄 <i>Queued for automatic retry</i>",
+                    alert_key=f"fwd-fail-{src_id}",
+                    cooldown=120,
+                )
 
         return status
     finally:
@@ -1333,19 +1413,34 @@ async def retry_payload(
         await queue_manager.remove_from_queue(payload)
 
         if status == "success":
-            logger.info(f"Retry succeeded for {message_id}")
+            logger.info(f"Retry succeeded for message {message_id}")
         elif status == "defer":
             await queue_manager.enqueue_deferred(payload, "Reply parent not ready yet (retry)")
         else:
-            result = await queue_manager.enqueue_failed(payload, "Retry telegram forwarding failed")
-            await send_alert(
-                alert_token, alert_chat_id,
-                f"🔴 <b>Retry Failed</b>\n\n"
-                f"<blockquote><b>Message ID:</b> <code>{message_id}</code>\n"
-                f"<b>Reason:</b> Retry telegram forwarding failed</blockquote>"
-                + ("\n⚠️ <b>Status:</b> Moved to dead letter queue" if result == "dead_letter" else ""),
-                alert_key=f"retry-fail-{message_id}",
-            )
+            reason = "Retry telegram forwarding failed"
+            result = await queue_manager.enqueue_failed(payload, reason)
+            src_id = payload.get("chat_id", chat_id)
+            if result == "dead_letter":
+                await send_alert(
+                    alert_token, alert_chat_id,
+                    f"💀 <b>Moved to Dead Letter Queue</b>\n\n"
+                    f"<blockquote><b>Message ID:</b> <code>{message_id}</code>\n"
+                    f"<b>Source Chat:</b> <code>{src_id}</code>\n"
+                    f"<b>Reason:</b> {reason} (max retries exceeded)</blockquote>\n"
+                    f"⚠️ <i>Inspect DLQ with: <code>docker compose exec redis redis-cli LRANGE queue:dead_letter 0 -1</code></i>",
+                    alert_key=f"dlq-{message_id}",
+                    cooldown=60,
+                )
+            else:
+                await send_alert(
+                    alert_token, alert_chat_id,
+                    f"🔴 <b>Retry Failed</b>\n\n"
+                    f"<blockquote><b>Message ID:</b> <code>{message_id}</code>\n"
+                    f"<b>Source Chat:</b> <code>{src_id}</code>\n"
+                    f"<b>Reason:</b> {reason}</blockquote>",
+                    alert_key=f"retry-fail-{src_id}",
+                    cooldown=120,
+                )
 
         return status
     finally:
@@ -1465,25 +1560,50 @@ async def message_worker(
             wait = e.retry_after + 1
             logger.warning(
                 f"Worker-{worker_id}: Bot API FloodWait {wait}s — "
-                f"re-queuing message {message_id}"
+                f"pausing worker and re-queuing message {message_id}"
             )
+            if alert_token and alert_chat_id:
+                try:
+                    await send_alert(
+                        alert_token, alert_chat_id,
+                        f"⏳ <b>FloodWait Encountered</b>\n\n"
+                        f"<blockquote><b>Duration:</b> {wait}s ({wait // 60}m {wait % 60}s)\n"
+                        f"<b>Source:</b> Bot API (Telegram)\n"
+                        f"<b>Action:</b> Workers paused, message <code>{message_id}</code> re-queued</blockquote>\n"
+                        f"🕒 <i>Auto-resuming in {wait}s...</i>",
+                        alert_key="floodwait-worker-botapi",
+                        cooldown=min(wait, 300),
+                    )
+                except Exception:
+                    pass
             await asyncio.sleep(wait)
             await queue.put(_queue_item)
         except FloodWait as e:
             # Hydrogram (MTProto) flood wait — also sleep + re-queue.
-            # Previously this fell through to the generic Exception handler
-            # which moved the message to the failed queue instead of retrying.
             wait = e.value + 1
             logger.warning(
                 f"Worker-{worker_id}: MTProto FloodWait {wait}s — "
-                f"re-queuing message {message_id}"
+                f"pausing worker and re-queuing message {message_id}"
             )
+            if alert_token and alert_chat_id:
+                try:
+                    await send_alert(
+                        alert_token, alert_chat_id,
+                        f"⏳ <b>FloodWait Encountered</b>\n\n"
+                        f"<blockquote><b>Duration:</b> {wait}s ({wait // 60}m {wait % 60}s)\n"
+                        f"<b>Source:</b> MTProto Userbot (Hydrogram)\n"
+                        f"<b>Action:</b> Workers paused, message <code>{message_id}</code> re-queued</blockquote>\n"
+                        f"🕒 <i>Auto-resuming in {wait}s...</i>",
+                        alert_key="floodwait-worker-mtproto",
+                        cooldown=min(wait, 300),
+                    )
+                except Exception:
+                    pass
             await asyncio.sleep(wait)
             await queue.put(_queue_item)
         except Exception as e:
             logger.error(
-                f"Worker-{worker_id}: error processing message {message_id}: {e}",
-                exc_info=True,
+                f"Worker-{worker_id}: error processing message {message_id}: {e}"
             )
             try:
                 # Remove from the primary queue first so the item does not linger
@@ -1600,6 +1720,10 @@ def register_listener(
                     f"text={payload['reply_to_quote_text']!r:.60} "
                     f"pos={payload.get('reply_to_quote_position')}"
                 )
+            else:
+                await _resolve_raw_quote_if_needed(
+                    client, int(message.chat.id), int(message.id), payload
+                )
 
         # Track liveness and sequence — both written on every push-delivered
         # message so the health check and catch-up handler have accurate state.
@@ -1675,22 +1799,25 @@ def register_listener(
         logger.debug(f"[RAW UPDATE] type={type(update).__name__}")
 
         # Capture selected-reply quote from TL before Hydrogram strips it.
-        if (
-            UpdateNewChannelMessage is not None
-            and isinstance(update, UpdateNewChannelMessage)
-        ):
-            tl_msg = getattr(update, "message", None)
-            quote = _capture_tl_message_quote(tl_msg, source_chat_id)
-            if quote:
-                msg_id = int(quote.pop("_source_message_id"))
-                await _store_pending_quote(
-                    redis_client, pending_quotes, source_chat_id, msg_id, quote
-                )
-                logger.info(
-                    f"[QUOTE] raw_tl cached msg={msg_id} "
-                    f"text={quote.get('reply_to_quote_text')!r:.60} "
-                    f"pos={quote.get('reply_to_quote_position')}"
-                )
+        # Handles single updates as well as container updates (Updates, UpdatesCombined).
+        nested_updates = getattr(update, "updates", None) or [update]
+        for u in nested_updates:
+            if (
+                (UpdateNewChannelMessage is not None and isinstance(u, UpdateNewChannelMessage))
+                or (UpdateNewMessage is not None and isinstance(u, UpdateNewMessage))
+            ):
+                tl_msg = getattr(u, "message", None)
+                quote = _capture_tl_message_quote(tl_msg, source_chat_id)
+                if quote:
+                    msg_id = int(quote.pop("_source_message_id"))
+                    await _store_pending_quote(
+                        redis_client, pending_quotes, source_chat_id, msg_id, quote
+                    )
+                    logger.info(
+                        f"[QUOTE] raw_tl cached msg={msg_id} "
+                        f"text={quote.get('reply_to_quote_text')!r:.60} "
+                        f"pos={quote.get('reply_to_quote_position')}"
+                    )
 
         # ── Deletion propagation ─────────────────────────────────────────────────
         # UpdateDeleteChannelMessages fires when a message is deleted in a channel.
@@ -2057,6 +2184,18 @@ async def _do_channel_catchup(
                     continue
             payload = normalize_message(message)
             if payload is not None:
+                if not payload.get("reply_to_quote_text") and payload.get("reply_to_message_id"):
+                    hint = await _consume_pending_quote(
+                        redis_client, {}, channel_chat_id, int(message.id)
+                    )
+                    if hint:
+                        payload["reply_to_quote_text"] = hint.get("reply_to_quote_text")
+                        payload["reply_to_quote_html"] = hint.get("reply_to_quote_html")
+                        payload["reply_to_quote_position"] = hint.get("reply_to_quote_position")
+                    else:
+                        await _resolve_raw_quote_if_needed(
+                            client, channel_chat_id, int(message.id), payload
+                        )
                 messages_to_process.append((message.id, payload))
     except FloodWait as fw:
         logger.warning(f"FloodWait {fw.value}s during channel catch-up for {channel_chat_id}")

@@ -1,10 +1,11 @@
-"""Tests for listener message classification and normalization."""
-
+import asyncio
 import sys
 import types
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 
 def _install_hydrogram_stub():
@@ -23,9 +24,59 @@ def _install_hydrogram_stub():
     hydrogram_types = types.ModuleType("hydrogram.types")
     hydrogram_types.Message = MagicMock()
 
+    raw = types.ModuleType("hydrogram.raw")
+    raw_types = types.ModuleType("hydrogram.raw.types")
+
+    class UpdateNewChannelMessage:
+        pass
+    class UpdateNewMessage:
+        pass
+    class UpdateEditChannelMessage:
+        pass
+    class UpdateDeleteChannelMessages:
+        pass
+    class UpdateDeleteMessages:
+        pass
+    class UpdateChannelTooLong:
+        pass
+    class UpdatesTooLong:
+        pass
+    class InputPeerChannel:
+        pass
+    class InputChannel:
+        pass
+    class InputMessageID:
+        def __init__(self, id=0):
+            self.id = id
+
+    raw_types.UpdateNewChannelMessage = UpdateNewChannelMessage
+    raw_types.UpdateNewMessage = UpdateNewMessage
+    raw_types.UpdateEditChannelMessage = UpdateEditChannelMessage
+    raw_types.UpdateDeleteChannelMessages = UpdateDeleteChannelMessages
+    raw_types.UpdateDeleteMessages = UpdateDeleteMessages
+    raw_types.UpdateChannelTooLong = UpdateChannelTooLong
+    raw_types.UpdatesTooLong = UpdatesTooLong
+    raw_types.InputPeerChannel = InputPeerChannel
+    raw_types.InputChannel = InputChannel
+    raw_types.InputMessageID = InputMessageID
+
+    raw_funcs = types.ModuleType("hydrogram.raw.functions")
+    ch_raw = types.ModuleType("hydrogram.raw.functions.channels")
+    ch_raw.GetMessages = MagicMock()
+    msg_raw = types.ModuleType("hydrogram.raw.functions.messages")
+    msg_raw.GetMessages = MagicMock()
+    upd_raw = types.ModuleType("hydrogram.raw.functions.updates")
+    upd_raw.GetState = MagicMock()
+
     sys.modules["hydrogram"] = hydrogram
     sys.modules["hydrogram.errors"] = errors
     sys.modules["hydrogram.types"] = hydrogram_types
+    sys.modules["hydrogram.raw"] = raw
+    sys.modules["hydrogram.raw.types"] = raw_types
+    sys.modules["hydrogram.raw.functions"] = raw_funcs
+    sys.modules["hydrogram.raw.functions.channels"] = ch_raw
+    sys.modules["hydrogram.raw.functions.messages"] = msg_raw
+    sys.modules["hydrogram.raw.functions.updates"] = upd_raw
 
 
 _install_hydrogram_stub()
@@ -372,3 +423,151 @@ class TestNativeForwardFallbackError:
 
     def test_flood_wait_returns_false(self):
         assert not _is_native_forward_fallback_error(Exception("Too Many Requests: retry after 30"))
+
+
+class TestQuoteExtractionAndCatchup:
+    def test_capture_tl_message_quote_direct(self):
+        from listener import _capture_tl_message_quote
+        reply_to = SimpleNamespace(
+            quote=None,
+            quote_text="Important quotation",
+            quote_offset=12,
+            quote_entities=None,
+        )
+        peer = SimpleNamespace(channel_id=123456789)
+        tl_msg = SimpleNamespace(
+            id=101,
+            peer_id=peer,
+            reply_to=reply_to,
+        )
+
+        quote = _capture_tl_message_quote(tl_msg, -100123456789)
+        assert quote is not None
+        assert quote["reply_to_quote_text"] == "Important quotation"
+        assert quote["reply_to_quote_position"] == 12
+        assert quote["_source_message_id"] == 101
+
+    @pytest.mark.asyncio
+    async def test_resolve_raw_quote_if_needed(self):
+        from listener import _resolve_raw_quote_if_needed
+        client = MagicMock()
+        client.resolve_peer = AsyncMock(return_value=SimpleNamespace())
+        reply_to = SimpleNamespace(
+            quote=None,
+            quote_text="Resolved catchup quote",
+            quote_offset=0,
+            quote_entities=None,
+        )
+        raw_msg = SimpleNamespace(reply_to=reply_to)
+        res = SimpleNamespace(messages=[raw_msg])
+        client.invoke = AsyncMock(return_value=res)
+
+        payload = {"message_id": 55, "reply_to_message_id": 40}
+        await _resolve_raw_quote_if_needed(client, -100123456789, 55, payload)
+        assert payload.get("reply_to_quote_text") == "Resolved catchup quote"
+        assert payload.get("reply_to_quote_position") == 0
+
+    @pytest.mark.asyncio
+    async def test_on_raw_update_container_unpacking(self):
+        from listener import register_listener, UpdateNewChannelMessage
+        app = MagicMock()
+        registered_raw = []
+        def mock_on_raw():
+            def decorator(fn):
+                registered_raw.append(fn)
+                return fn
+            return decorator
+        app.on_raw_update = mock_on_raw
+        app.on_message = MagicMock(return_value=lambda fn: fn)
+        app.on_edited_message = MagicMock(return_value=lambda fn: fn)
+
+        queue = asyncio.Queue()
+        redis_mock = AsyncMock()
+        register_listener(app, -100123456789, queue, redis_client=redis_mock)
+        assert len(registered_raw) == 1
+        raw_handler = registered_raw[0]
+
+        reply_to = SimpleNamespace(
+            quote=None,
+            quote_text="Container quote",
+            quote_offset=5,
+            quote_entities=None,
+        )
+        peer = SimpleNamespace(channel_id=123456789)
+        tl_msg = SimpleNamespace(
+            id=77,
+            peer_id=peer,
+            reply_to=reply_to,
+        )
+
+        if UpdateNewChannelMessage is not None:
+            nested_update = UpdateNewChannelMessage()
+            nested_update.message = tl_msg
+        else:
+            nested_update = SimpleNamespace(message=tl_msg)
+
+        container_update = SimpleNamespace(updates=[nested_update])
+
+        await raw_handler(app, container_update, None, None)
+        redis_mock.setex.assert_awaited_once()
+        call_args = redis_mock.setex.call_args[0]
+        assert "listener:quote:-100123456789:77" in call_args[0]
+        assert "Container quote" in call_args[2]
+
+
+class TestFloodWaitPropagation:
+    @pytest.mark.asyncio
+    async def test_forward_message_pipeline_propagates_flood_wait(self, monkeypatch):
+        from listener import forward_message_pipeline
+        from hydrogram.errors import FloodWait
+
+        async def mock_relay(*args, **kwargs):
+            fw = FloodWait(543)
+            fw.value = 543
+            raise fw
+
+        monkeypatch.setattr("listener.relay_to_bot", mock_relay)
+
+        sender = MagicMock()
+        payload = {"message_id": 100, "chat_id": -100, "has_media": True, "type": "photo", "file_id": "xyz"}
+        processed = {"destinations": [{"chat_id": -200, "name": "Dest"}]}
+
+        with pytest.raises(FloodWait):
+            await forward_message_pipeline(
+                sender,
+                payload,
+                processed,
+                ":memory:",
+                hydrogram_app=MagicMock(),
+                relay=MagicMock(),
+            )
+
+    @pytest.mark.asyncio
+    async def test_process_payload_propagates_flood_wait(self, monkeypatch):
+        from listener import process_payload
+        from hydrogram.errors import FloodWait
+
+        async def mock_pipeline(*args, **kwargs):
+            fw = FloodWait(300)
+            fw.value = 300
+            raise fw
+
+        monkeypatch.setattr("listener.forward_message_pipeline", mock_pipeline)
+        monkeypatch.setattr("listener._resolve_processed_payload", lambda cfg, p: {"destinations": [{"chat_id": -200}]})
+
+        sender = MagicMock()
+        qm = MagicMock()
+        qm.enqueue = AsyncMock()
+        qm.remove_from_queue = AsyncMock()
+        qm.enqueue_failed = AsyncMock()
+
+        payload = {"message_id": 100, "chat_id": -100, "type": "text", "text": "hello"}
+        config = MagicMock()
+
+        with pytest.raises(FloodWait):
+            await process_payload(sender, qm, payload, ":memory:", config)
+
+        # Confirm it was NOT pushed to the failed queue
+        qm.enqueue_failed.assert_not_called()
+
+

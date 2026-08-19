@@ -35,16 +35,22 @@ def _any_rule_matches(texts: List[str], rules: List[Dict[str, Any]]) -> bool:
 
 
 def _collect_replaceable_texts(payload: Dict[str, Any]) -> List[str]:
-    """Plain text / caption fields that word replacement may alter."""
+    """Plain text / caption / quote fields that word replacement may alter."""
     texts: List[str] = []
     if payload.get("type") == "album":
         for item in payload.get("items", []):
             cap = item.get("caption_html") or item.get("caption")
             if cap:
                 texts.append(cap)
+            q_item = item.get("reply_to_quote_html") or item.get("reply_to_quote_text")
+            if q_item:
+                texts.append(q_item)
+        q_album = payload.get("reply_to_quote_html") or payload.get("reply_to_quote_text")
+        if q_album:
+            texts.append(q_album)
         return texts
 
-    for key in ("text_html", "text", "caption_html", "caption"):
+    for key in ("text_html", "text", "caption_html", "caption", "reply_to_quote_html", "reply_to_quote_text"):
         val = payload.get(key)
         if val:
             texts.append(val)

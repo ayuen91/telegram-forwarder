@@ -16,7 +16,7 @@ def _monitor(**kwargs) -> HealthMonitor:
     config.settings.failure_rate_delta_threshold = 0.10
     return HealthMonitor(
         redis_client=MagicMock(),
-        webhook_sender=MagicMock(),
+        bot_sender=MagicMock(),
         config=config,
         **kwargs,
     )

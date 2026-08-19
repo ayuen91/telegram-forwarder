@@ -286,9 +286,12 @@ def make_album_flush_factory(ctx: WorkerContext):
 def make_retry_factory(ctx: WorkerContext):
     async def retry():
         while not shutdown_event.is_set():
+            payload = None
+            queue_type = None
             try:
                 payload = await ctx.queue_mgr.dequeue_deferred()
                 if payload:
+                    queue_type = "deferred"
                     await retry_payload(
                         ctx.sender, ctx.queue_mgr, payload,
                         ctx.db_path, ctx.config, dedup=ctx.dedup,
@@ -300,6 +303,7 @@ def make_retry_factory(ctx: WorkerContext):
 
                 payload = await ctx.queue_mgr.dequeue_failed()
                 if payload:
+                    queue_type = "failed"
                     await retry_payload(
                         ctx.sender, ctx.queue_mgr, payload,
                         ctx.db_path, ctx.config, dedup=ctx.dedup,
@@ -309,8 +313,22 @@ def make_retry_factory(ctx: WorkerContext):
                 else:
                     await asyncio.sleep(60)
                     continue
+            except (FloodWait, TelegramFloodWait) as e:
+                wait = getattr(e, "value", getattr(e, "retry_after", 5)) + 1
+                logger.warning(
+                    f"Retry worker: Telegram FloodWait {wait}s — pausing retries and preserving payload"
+                )
+                if payload:
+                    if queue_type == "deferred":
+                        await ctx.queue_mgr.enqueue_deferred(payload, f"FloodWait pause {wait}s")
+                    else:
+                        await ctx.queue_mgr.enqueue_failed(payload, f"FloodWait pause {wait}s")
+                await asyncio.sleep(wait)
+                continue
             except Exception as e:
-                logger.error(f"Retry worker error: {e}", exc_info=True)
+                logger.error(f"Retry worker error: {e}")
+                if payload:
+                    await ctx.queue_mgr.enqueue_failed(payload, f"Unexpected error: {e}")
 
             await asyncio.sleep(2)
     return retry
@@ -358,7 +376,7 @@ def make_channel_sync_factory(
                     edit_queue=edit_queue,
                 )
             except Exception as e:
-                logger.error(f"Channel sync error: {e}", exc_info=True)
+                logger.error(f"Channel sync error: {e}")
     return channel_sync
 
 

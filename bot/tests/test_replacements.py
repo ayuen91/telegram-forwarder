@@ -127,3 +127,20 @@ class TestBuildProcessedPayload:
         rules = [{"pattern": "foo", "replacement": "bar", "is_regex": False}]
         assert _any_rule_matches(["<b>foo</b> baz"], rules) is True
         assert _any_rule_matches(["<b>bar</b> baz"], rules) is False
+
+    def test_quote_replacement_when_main_text_has_no_match(self):
+        config = self._config([{"pattern": "@oldchannel", "replacement": "@newchannel"}])
+        payload = {
+            "type": "text",
+            "text": "Regular message text without targets",
+            "text_html": "Regular message text without targets",
+            "reply_to_quote_text": "Check out @oldchannel for news",
+            "reply_to_quote_html": "Check out <b>@oldchannel</b> for news",
+            "message_id": 1,
+            "chat_id": -100,
+        }
+        result = build_processed_payload(payload, config)
+        assert result["reply_to_quote_changed"] is True
+        assert "@newchannel" in result["processed_reply_to_quote_html"]
+        assert "@newchannel" in result["processed_reply_to_quote"]
+

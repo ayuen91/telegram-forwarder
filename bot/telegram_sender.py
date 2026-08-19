@@ -821,6 +821,17 @@ class TelegramBotSender:
             # Fall back to stripping HTML tags from the HTML quote if no plain text
             or (re.sub(r"<[^>]+>", "", processed_payload.get("processed_reply_to_quote_html") or payload.get("reply_to_quote_html") or "") or None)
         )
+        quote_html = (
+            processed_payload.get("processed_reply_to_quote_html")
+            or payload.get("reply_to_quote_html")
+            or quote
+        )
+
+        # When reply_to_message_id is missing but a quote was specified in the source message
+        # (common in large channels with old/unmapped parent posts), format the quote as an expandable
+        # blockquote so destination channels still display the quoted text context.
+        unmapped_quote_prefix = f"<blockquote expandable>{quote_html}</blockquote>\n\n" if (quote and not reply_to_message_id) else ""
+
         if reply_to_message_id:
             logger.info(
                 f"[QUOTE] delivery msg={payload.get('message_id')} "
@@ -829,7 +840,7 @@ class TelegramBotSender:
                 f"quote_changed={processed_payload.get('reply_to_quote_changed')}"
             )
         reply_kwargs: Dict[str, Any] = {"reply_to_message_id": reply_to_message_id}
-        if quote:
+        if quote and reply_to_message_id:
             reply_kwargs["quote"] = quote
             # quote_parse_mode intentionally omitted — plain-text raw substring match.
             # quote_position intentionally omitted — Bot API locates the first
@@ -859,50 +870,50 @@ class TelegramBotSender:
                 **reply_kwargs,
             )
 
-            for item, sent_id in zip(sorted_items, sent_ids):
-                # Only edit the caption when a replacement rule actually changed it.
-                #
-                # Use the authoritative per-item flag set by replacements.py first.
-                # If it's absent (e.g. old payloads / test data without the flag),
-                # fall back to a like-for-like text comparison:
-                #   - HTML caption present → compare processed_caption_html vs caption_html
-                #   - plain caption only   → compare processed_caption vs caption
-                # This avoids the old bug where processed_caption (HTML-sourced) was
-                # compared against item["caption"] (plain text), causing a false
-                # positive on every album item with formatted captions.
+            for idx, (item, sent_id) in enumerate(zip(sorted_items, sent_ids)):
+                # Only edit the caption when a replacement rule actually changed it
+                # or when an unmapped quote prefix needs to be attached to the first item.
                 caption_changed = bool(item.get("caption_changed"))
                 processed_html = item.get("processed_caption_html")
                 processed_plain = item.get("processed_caption")
 
                 if not caption_changed:
                     if processed_html is not None:
-                        # Both sides are HTML — compare HTML to HTML
                         caption_changed = processed_html != (item.get("caption_html") or "")
                     elif processed_plain is not None:
-                        # Plain text only — compare plain to plain
                         caption_changed = processed_plain != (item.get("caption") or "")
+
+                # Attach unmapped quote prefix to the first item if present
+                item_prefix = unmapped_quote_prefix if idx == 0 else ""
+                if item_prefix:
+                    caption_changed = True
 
                 if caption_changed:
                     try:
-                        if processed_html:
-                            # Replacement fired on an HTML-formatted caption — preserve
-                            # rich formatting by sending the HTML version with parse_mode.
-                            await self.edit_message_caption(
-                                dest_chat_id, sent_id,
-                                _normalize_html_for_bot_api(processed_html),
-                                parse_mode="HTML",
-                            )
-                        elif processed_plain:
-                            # Plain-text caption — send without parse_mode.
-                            await self.edit_message_caption(
-                                dest_chat_id, sent_id, processed_plain,
-                                parse_mode=None,
-                            )
+                        raw_item_cap = (
+                            processed_html
+                            or processed_plain
+                            or item.get("caption_html")
+                            or item.get("caption")
+                            or ""
+                        )
+                        full_item_cap = f"{item_prefix}{raw_item_cap}" if item_prefix else raw_item_cap
+                        if full_item_cap:
+                            if processed_html or item_prefix:
+                                await self.edit_message_caption(
+                                    dest_chat_id, sent_id,
+                                    _normalize_html_for_bot_api(full_item_cap),
+                                    parse_mode="HTML",
+                                )
+                            else:
+                                await self.edit_message_caption(
+                                    dest_chat_id, sent_id, full_item_cap,
+                                    parse_mode=None,
+                                )
                     except Exception as cap_err:
                         logger.warning(
                             f"Failed to edit caption for album item {sent_id} in {dest_chat_id}: {cap_err}"
                         )
-
 
             reply_mappings = [
                 (int(item["message_id"]), sent_id)
@@ -919,23 +930,12 @@ class TelegramBotSender:
 
         if msg_type == "text":
             text_changed = processed_payload.get("text_changed", False)
-
-            # Strip the quote only when the replacement rule changed the *quoted text
-            # itself* (the highlighted excerpt in the parent message).  The quote lives
-            # in the replied-to message, which is not touched by replacements that fire
-            # on the current reply body — so text_changed is the wrong signal here.
-            reply_to_quote_changed = processed_payload.get("reply_to_quote_changed", False)
             safe_reply_kwargs = dict(reply_kwargs)
-            if reply_to_quote_changed:
-                safe_reply_kwargs.pop("quote", None)
-                safe_reply_kwargs.pop("quote_parse_mode", None)
-                safe_reply_kwargs.pop("quote_position", None)
 
-            if not text_changed and relay_message_ids and relay_chat_id:
-                # Message has rich entities (blockquotes, spoilers, dates, etc.)
+            if not text_changed and not unmapped_quote_prefix and relay_message_ids and relay_chat_id:
+                # Message has rich entities (blockquotes, spoilers, dates, etc.), no unmapped quote prefix,
                 # and was already relayed via Hydrogram copy_message (MTProto).
-                # Use Bot API copyMessage so ALL entities survive intact —
-                # the HTML parser in Hydrogram cannot encode these newer types.
+                # Use Bot API copyMessage so ALL entities survive intact.
                 sent_id = await self._attempt_with_quote_fallback(
                     self.copy_message,
                     dict(
@@ -948,8 +948,8 @@ class TelegramBotSender:
                         **extra_kwargs,
                     ),
                 )
-            elif text_changed:
-                # Replacement altered the text — send processed HTML text if available.
+            elif text_changed or unmapped_quote_prefix:
+                # Replacement altered the text OR an unmapped quote prefix must be attached — send HTML text.
                 raw_text = (
                     processed_payload.get("processed_text_html")
                     or processed_payload.get("processed_text")
@@ -960,8 +960,10 @@ class TelegramBotSender:
                 use_html = bool(
                     processed_payload.get("processed_text_html")
                     or payload.get("text_html")
+                    or unmapped_quote_prefix
                 )
-                text = _normalize_html_for_bot_api(raw_text) if use_html else raw_text
+                full_text = f"{unmapped_quote_prefix}{raw_text}" if unmapped_quote_prefix else raw_text
+                text = _normalize_html_for_bot_api(full_text) if use_html else full_text
                 sent_id = await self._attempt_with_quote_fallback(
                     self.send_message,
                     dict(
@@ -973,8 +975,7 @@ class TelegramBotSender:
                     ),
                 )
             else:
-                # No entities, no replacement — simple plain-text send.
-                # Falls back to text_html (bold/italic/links) if available.
+                # No entities, no replacement, no unmapped quote — simple plain-text send.
                 has_html = bool(payload.get("text_html"))
                 raw_text = payload.get("text_html") or payload.get("text") or ""
                 text = _normalize_html_for_bot_api(raw_text) if has_html else raw_text
@@ -1031,19 +1032,18 @@ class TelegramBotSender:
             caption = None
             parse_mode = None
             caption_changed = bool(processed_payload.get("caption_changed"))
-            if caption_changed:
-                # Replacement changed the caption — send processed HTML caption if available
+            if caption_changed or unmapped_quote_prefix:
+                # Replacement changed the caption OR unmapped quote prefix must be attached
                 raw_caption = (
                     processed_payload.get("processed_caption_html")
                     or processed_payload.get("processed_caption")
                     or payload.get("caption_html")
                     or payload.get("caption")
+                    or ""
                 )
-                use_caption_html = bool(
-                    processed_payload.get("processed_caption_html") or payload.get("caption_html")
-                )
-                caption = _normalize_html_for_bot_api(raw_caption) if use_caption_html and raw_caption else raw_caption
-                parse_mode = "HTML" if use_caption_html and raw_caption else None
+                full_caption = f"{unmapped_quote_prefix}{raw_caption}" if unmapped_quote_prefix else raw_caption
+                caption = _normalize_html_for_bot_api(full_caption)
+                parse_mode = "HTML"
             elif not payload.get("caption") and not payload.get("caption_html"):
                 # Source message had no caption at all (e.g. a captionless GIF).
                 # Force caption="" so the Bot API copyMessage call explicitly
@@ -1052,20 +1052,11 @@ class TelegramBotSender:
                 caption = ""
                 parse_mode = None
 
-            # Strip the quote only when the replacement rule changed the *quoted text
-            # itself*.  caption_changed tracks the current message's caption — the quote
-            # belongs to the replied-to parent, which is unaffected by caption replacements.
-            reply_to_quote_changed = processed_payload.get("reply_to_quote_changed", False)
             safe_reply_kwargs = dict(reply_kwargs)
-            if reply_to_quote_changed:
-                safe_reply_kwargs.pop("quote", None)
-                safe_reply_kwargs.pop("quote_parse_mode", None)
-                safe_reply_kwargs.pop("quote_position", None)
 
-            # When caption_changed is False, caption=None & parse_mode=None are passed to copy_message.
-            # This allows Telegram Bot API copyMessage to preserve the original relay message's
-            # caption AND all native entities (premium emojis, custom emojis, animated emojis, etc.)
-            # directly without running the HTML parser or hitting CANNOT_USE_CUSTOM_EMOJI errors.
+            # When caption_changed is False and unmapped_quote_prefix is empty, caption=None & parse_mode=None
+            # are passed to copy_message. This allows Telegram Bot API copyMessage to preserve the original
+            # relay message's caption AND all native entities directly.
             sent_id = await self._attempt_with_quote_fallback(
                 self.copy_message,
                 dict(

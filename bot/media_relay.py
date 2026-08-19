@@ -128,7 +128,7 @@ async def ensure_relay_chat(
             "Send /start to the sender bot manually."
         )
     except Exception as e:
-        logger.error(f"Failed to auto-open relay chat: {e}", exc_info=True)
+        logger.error(f"Failed to auto-open relay chat: {e}")
 
     return False
 
@@ -482,8 +482,7 @@ async def relay_to_bot(
                     pass
                 else:
                     logger.error(
-                        f"Relay retry after peer re-resolve failed: {retry_err}",
-                        exc_info=True,
+                        f"Relay retry after peer re-resolve failed: {retry_err}"
                     )
                     raise
 
@@ -501,8 +500,7 @@ async def relay_to_bot(
         else:
             logger.error(
                 f"Failed to relay message(s) {message_ids} from "
-                f"{source_chat_id}: {e}",
-                exc_info=True,
+                f"{source_chat_id}: {e}"
             )
             raise
 
@@ -520,8 +518,7 @@ async def relay_to_bot(
             raise
         except Exception as dl_err:
             logger.error(
-                f"Protected-content relay (download+reupload) failed: {dl_err}",
-                exc_info=True,
+                f"Protected-content relay (download+reupload) failed: {dl_err}"
             )
             raise
 

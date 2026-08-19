@@ -616,3 +616,90 @@ class TestTextHtmlNormalisationInForward:
             reply_to_message_id=None,
         )
 
+
+class TestQuoteHandlingInForward:
+    """Quote replies with mapped parents use reply_parameters, unmapped parents use blockquote."""
+
+    @pytest.fixture
+    def sender(self):
+        return TelegramBotSender(bot_token="test:token")
+
+    @pytest.mark.asyncio
+    async def test_mapped_parent_quote_uses_reply_params(self, sender):
+        """When reply_to_message_id is present, quote is passed via reply_kwargs."""
+        sender.send_message = AsyncMock(return_value=99)
+
+        await sender.forward_to_destination(
+            dest_chat_id=-1001,
+            msg_type="text",
+            payload={
+                "message_id": 20,
+                "text": "Yes, I agree",
+                "reply_to_quote_text": "Original statement",
+            },
+            processed_payload={"text_changed": False},
+            reply_to_message_id=50,
+        )
+
+        sender.send_message.assert_awaited_once_with(
+            chat_id=-1001,
+            text="Yes, I agree",
+            parse_mode=None,
+            reply_to_message_id=50,
+            quote="Original statement",
+        )
+
+    @pytest.mark.asyncio
+    async def test_unmapped_parent_quote_fallback_text(self, sender):
+        """When reply_to_message_id is None, quote is rendered as an expandable blockquote."""
+        sender.send_message = AsyncMock(return_value=100)
+
+        await sender.forward_to_destination(
+            dest_chat_id=-1001,
+            msg_type="text",
+            payload={
+                "message_id": 21,
+                "text": "My reply to the old post",
+                "reply_to_quote_text": "Old message excerpt",
+                "reply_to_quote_html": "<b>Old message excerpt</b>",
+            },
+            processed_payload={"text_changed": False},
+            reply_to_message_id=None,
+        )
+
+        sender.send_message.assert_awaited_once_with(
+            chat_id=-1001,
+            text="<blockquote expandable><b>Old message excerpt</b></blockquote>\n\nMy reply to the old post",
+            parse_mode="HTML",
+            reply_to_message_id=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_unmapped_parent_quote_fallback_media(self, sender):
+        """When media has a quote with unmapped parent, caption receives the expandable blockquote."""
+        sender.copy_message = AsyncMock(return_value=101)
+
+        await sender.forward_to_destination(
+            dest_chat_id=-1001,
+            msg_type="photo",
+            payload={
+                "message_id": 22,
+                "caption": "Photo caption",
+                "reply_to_quote_text": "Quoted context",
+            },
+            processed_payload={"caption_changed": False},
+            reply_to_message_id=None,
+            relay_chat_id=999,
+            relay_message_ids=[88],
+        )
+
+        sender.copy_message.assert_awaited_once_with(
+            chat_id=-1001,
+            from_chat_id=999,
+            message_id=88,
+            caption="<blockquote expandable>Quoted context</blockquote>\n\nPhoto caption",
+            parse_mode="HTML",
+            reply_to_message_id=None,
+        )
+
+

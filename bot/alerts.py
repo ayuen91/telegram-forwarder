@@ -56,6 +56,11 @@ async def send_alert(
     if now - _last_alert.get(key, 0) < cooldown:
         return
 
+    if len(_last_alert) > 1000:
+        expired_keys = [k for k, ts in _last_alert.items() if now - ts > 3600]
+        for k in expired_keys:
+            _last_alert.pop(k, None)
+
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload: Dict[str, Any] = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
     if reply_markup is not None:
