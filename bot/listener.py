@@ -12,6 +12,7 @@ to Telegram and prevent FloodWait errors.
 """
 
 import asyncio
+import hashlib
 import itertools
 import json
 import logging
@@ -95,6 +96,20 @@ _RELAY_MEDIA_TYPES = frozenset({
     "photo", "video", "document", "sticker", "voice",
     "video_note", "animation", "audio",
 })
+
+
+def _compute_content_hash(payload: Dict[str, Any]) -> str:
+    """Compute a deterministic hash of message content for edit detection."""
+    components = [
+        str(payload.get("type", "")),
+        str(payload.get("text_html") or payload.get("text") or ""),
+        str(payload.get("caption_html") or payload.get("caption") or ""),
+        str(payload.get("media_group_id") or ""),
+        str(payload.get("reply_markup") or ""),
+        str(payload.get("reply_to_quote_html") or payload.get("reply_to_quote_text") or ""),
+    ]
+    raw = "||".join(components)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _serialize_reply_markup(reply_markup) -> Optional[Dict[str, Any]]:
@@ -1300,6 +1315,33 @@ async def process_payload(
     status: ForwardStatus = "failed"
     message_id = payload.get("message_id", payload.get("media_group_id", "?"))
 
+    # Check if message was deleted before forwarding began (tombstone check)
+    if dedup and inflight_ids:
+        for _mid in inflight_ids:
+            if await dedup.is_deleted(chat_id, _mid):
+                logger.info(
+                    f"Message {_mid} in chat {chat_id} was deleted at source before forwarding — discarding"
+                )
+                return "success"
+
+    telegram_id = _telegram_row_id(payload)
+    if telegram_id is not None and chat_id:
+        try:
+            async with aiosqlite.connect(db_path) as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute(
+                    "SELECT status FROM messages WHERE source_chat_id = ? AND telegram_message_id = ?",
+                    (chat_id, telegram_id),
+                )
+                row = await cursor.fetchone()
+                if row and row["status"] == "deleted":
+                    logger.info(
+                        f"Message {telegram_id} in chat {chat_id} already marked deleted in DB — discarding"
+                    )
+                    return "success"
+        except Exception:
+            pass
+
     await queue_manager.enqueue(payload)
     if dedup and inflight_ids:
         await dedup.mark_inflight(chat_id, inflight_ids)
@@ -1639,6 +1681,8 @@ LISTENER_LAST_PTS_KEY = "listener:last_pts"
 LISTENER_OVERFLOW_KEY = "listener:overflow"
 QUOTE_CACHE_PREFIX = "listener:quote"
 QUOTE_CACHE_TTL = 120
+CONTENT_HASH_PREFIX = "listener:content_hash"
+CONTENT_HASH_TTL = 86400 * 7
 
 
 def register_listener(
@@ -1754,6 +1798,16 @@ def register_listener(
                 await incr_received(redis_client)
             except Exception as e:
                 logger.debug(f"Received counter skipped: {e}")
+
+            try:
+                chash = _compute_content_hash(payload)
+                await redis_client.set(
+                    f"{CONTENT_HASH_PREFIX}:{message.chat.id}:{message.id}",
+                    chash,
+                    ex=CONTENT_HASH_TTL,
+                )
+            except Exception as he:
+                logger.debug(f"Initial content hash write skipped for msg {message.id}: {he}")
 
         try:
             # Non-blocking put — never suspends the dispatcher.
@@ -1962,6 +2016,23 @@ def register_listener(
             payload = normalize_message(message)
             if payload is None:
                 return
+
+            # Content hash check: skip if content has not changed
+            if redis_client is not None:
+                try:
+                    new_hash = _compute_content_hash(payload)
+                    hash_key = f"{CONTENT_HASH_PREFIX}:{source_chat_id}:{msg_id}"
+                    old_hash = await redis_client.get(hash_key)
+                    if old_hash and old_hash == new_hash:
+                        logger.debug(
+                            f"UpdateEditChannelMessage: skipping identical content edit for message {msg_id} "
+                            f"(content hash unchanged: {new_hash[:8]})"
+                        )
+                        return
+                    await redis_client.set(hash_key, new_hash, ex=CONTENT_HASH_TTL)
+                except Exception as he:
+                    logger.debug(f"Content hash check error for msg {msg_id}: {he}")
+
             try:
                 edit_queue.put_nowait({
                     "type": "edit",
@@ -2038,6 +2109,23 @@ def register_listener(
         payload = normalize_message(message)
         if payload is None:
             return  # Unsupported message type (service msg, etc.)
+
+        # Content hash check: skip if content has not changed
+        if redis_client is not None:
+            try:
+                new_hash = _compute_content_hash(payload)
+                hash_key = f"{CONTENT_HASH_PREFIX}:{source_chat_id}:{message.id}"
+                old_hash = await redis_client.get(hash_key)
+                if old_hash and old_hash == new_hash:
+                    logger.debug(
+                        f"on_edited_message: skipping identical content edit for message {message.id} "
+                        f"(content hash unchanged: {new_hash[:8]})"
+                    )
+                    return
+                await redis_client.set(hash_key, new_hash, ex=CONTENT_HASH_TTL)
+            except Exception as he:
+                logger.debug(f"Content hash check error for msg {message.id}: {he}")
+
         try:
             edit_queue.put_nowait({
                 "type": "edit",
@@ -2150,6 +2238,22 @@ async def _do_channel_catchup(
                 if payload is None:
                     continue
 
+                # Content hash check: skip if content has not changed
+                if redis_client is not None:
+                    try:
+                        new_hash = _compute_content_hash(payload)
+                        hash_key = f"{CONTENT_HASH_PREFIX}:{channel_chat_id}:{message.id}"
+                        old_hash = await redis_client.get(hash_key)
+                        if old_hash and old_hash == new_hash:
+                            logger.debug(
+                                f"Catch-up edit scan: skipping identical content edit on message {message.id} "
+                                f"(content hash unchanged: {new_hash[:8]})"
+                            )
+                            continue
+                        await redis_client.set(hash_key, new_hash, ex=CONTENT_HASH_TTL)
+                    except Exception as he:
+                        logger.debug(f"Catch-up content hash check error for msg {message.id}: {he}")
+
                 try:
                     edit_queue.put_nowait({
                         "type": "edit",
@@ -2196,6 +2300,16 @@ async def _do_channel_catchup(
                         await _resolve_raw_quote_if_needed(
                             client, channel_chat_id, int(message.id), payload
                         )
+                if redis_client is not None:
+                    try:
+                        chash = _compute_content_hash(payload)
+                        await redis_client.set(
+                            f"{CONTENT_HASH_PREFIX}:{channel_chat_id}:{message.id}",
+                            chash,
+                            ex=CONTENT_HASH_TTL,
+                        )
+                    except Exception as che:
+                        logger.debug(f"Catch-up content hash write skipped for msg {message.id}: {che}")
                 messages_to_process.append((message.id, payload))
     except FloodWait as fw:
         logger.warning(f"FloodWait {fw.value}s during channel catch-up for {channel_chat_id}")
@@ -2371,11 +2485,6 @@ async def overflow_drainer(
 
 
 # ── Deletion propagation ──────────────────────────────────────────────────────────
-# When the source-channel admin deletes a message, Telegram fires
-# UpdateDeleteChannelMessages (or UpdateDeleteMessages for groups) raw updates.
-# The on_raw_update handler inside register_listener() catches those and enqueues
-# them into a separate deletion_queue.  deletion_worker() consumes that queue,
-# looks up the forwarded copies in SQLite, and removes them from all destinations.
 
 
 async def _process_deletion_event(
@@ -2384,20 +2493,13 @@ async def _process_deletion_event(
     db_path: str,
     sender: TelegramBotSender,
     config,
+    dedup=None,
+    alert_token: str = "",
+    alert_chat_id: int = 0,
 ) -> None:
     """
     Look up forwarded copies of each deleted source message and remove them
     from every destination channel via the Bot API.
-
-    For each source_msg_id:
-      1. Queries message_destinations (status='sent') for all forwarded copies.
-      2. Calls sender.delete_message(dest_chat_id, sent_message_id) for each.
-      3. Marks the destination row status='deleted' in SQLite (regardless of
-         whether the API call succeeded — the source is gone either way).
-      4. Marks the parent messages row status='deleted' + deleted_at in SQLite.
-
-    Errors (e.g. bot lacks delete permission in a destination) are logged as
-    warnings — delivery continues for the remaining destinations and events.
     """
     destinations = [
         {"chat_id": d.chat_id, "name": d.name}
@@ -2406,11 +2508,15 @@ async def _process_deletion_event(
     if not destinations:
         return
 
+    # Mark tombstone in Redis immediately so any in-flight or queued messages abort forwarding
+    if dedup is not None:
+        await dedup.mark_deleted(source_chat_id, message_ids)
+
     async with aiosqlite.connect(db_path) as db:
         db.row_factory = aiosqlite.Row
 
         for source_msg_id in message_ids:
-            # Find every successfully forwarded copy of this source message.
+            # 1. Check primary message_destinations for single messages and album primaries
             cursor = await db.execute(
                 """
                 SELECT md.destination_chat_id,
@@ -2426,17 +2532,34 @@ async def _process_deletion_event(
             )
             rows = await cursor.fetchall()
 
-            if not rows:
+            # 2. Check message_reply_map for album sub-items (items 2..10) or channel reply mappings
+            reply_cursor = await db.execute(
+                """
+                SELECT destination_chat_id, sent_message_id
+                FROM   message_reply_map
+                WHERE  source_chat_id    = ?
+                  AND  source_message_id = ?
+                """,
+                (source_chat_id, source_msg_id),
+            )
+            reply_rows = await reply_cursor.fetchall()
+
+            # Aggregate unique targets per destination chat: dest_chat_id -> (sent_msg_id, db_message_id)
+            targets = {}
+            for row in rows:
+                targets[int(row["destination_chat_id"])] = (int(row["sent_message_id"]), row["db_message_id"])
+            for r_row in reply_rows:
+                d_id = int(r_row["destination_chat_id"])
+                if d_id not in targets:
+                    targets[d_id] = (int(r_row["sent_message_id"]), None)
+
+            if not targets:
                 logger.debug(
                     f"Deletion: source message {source_msg_id} has no forwarded "
                     "copies to delete (not in DB or already cleaned up)"
                 )
             else:
-                for row in rows:
-                    dest_chat_id  = row["destination_chat_id"]
-                    sent_msg_id   = row["sent_message_id"]
-                    db_message_id = row["db_message_id"]
-
+                for dest_chat_id, (sent_msg_id, db_message_id) in targets.items():
                     dest_name = next(
                         (d["name"] for d in destinations if d["chat_id"] == dest_chat_id),
                         str(dest_chat_id),
@@ -2450,27 +2573,61 @@ async def _process_deletion_event(
                             f"[source msg_id={source_msg_id} in {source_chat_id}]"
                         )
                     except Exception as del_err:
-                        # Typically: bot not admin, or lacks can_delete_messages.
-                        # Log as warning — other destinations still get processed.
                         logger.warning(
                             f"Deletion: could not delete message {sent_msg_id} "
                             f"from {dest_name} ({dest_chat_id}): {del_err}"
                         )
+                        if alert_token and alert_chat_id:
+                            err_str = str(del_err).lower()
+                            if "rights" in err_str or "admin" in err_str or "forbidden" in err_str:
+                                try:
+                                    await send_alert(
+                                        alert_token,
+                                        alert_chat_id,
+                                        f"⚠️ <b>Deletion Permission Error</b>\n\n"
+                                        f"<blockquote><b>Destination:</b> {dest_name} (<code>{dest_chat_id}</code>)\n"
+                                        f"<b>Message ID:</b> <code>{sent_msg_id}</code>\n"
+                                        f"<b>Error:</b> <code>{del_err}</code></blockquote>\n"
+                                        f"💡 <i>Ensure the sender bot has the <b>Delete Messages</b> admin permission.</i>",
+                                        alert_key=f"del-perm-{dest_chat_id}",
+                                        cooldown=300,
+                                    )
+                                except Exception:
+                                    pass
 
-                    # Mark as deleted in DB regardless of API outcome.
-                    # The source message is gone; the local record must reflect that.
-                    await db.execute(
-                        """
-                        UPDATE message_destinations
-                        SET    status  = 'deleted',
-                               sent_at = datetime('now')
-                        WHERE  message_id          = ?
-                          AND  destination_chat_id = ?
-                        """,
-                        (db_message_id, dest_chat_id),
-                    )
+                    if db_message_id is not None:
+                        await db.execute(
+                            """
+                            UPDATE message_destinations
+                            SET    status  = 'deleted',
+                                   sent_at = datetime('now')
+                            WHERE  message_id          = ?
+                              AND  destination_chat_id = ?
+                            """,
+                            (db_message_id, dest_chat_id),
+                        )
+                    else:
+                        await db.execute(
+                            """
+                            UPDATE message_destinations
+                            SET    status  = 'deleted',
+                                   sent_at = datetime('now')
+                            WHERE  destination_chat_id = ?
+                              AND  sent_message_id     = ?
+                            """,
+                            (dest_chat_id, sent_msg_id),
+                        )
 
-            # Mark the parent source-message row as deleted.
+            # Clean up message_reply_map for this source message
+            await db.execute(
+                """
+                DELETE FROM message_reply_map
+                WHERE source_chat_id = ? AND source_message_id = ?
+                """,
+                (source_chat_id, source_msg_id),
+            )
+
+            # Mark the parent source-message row as deleted
             await db.execute(
                 """
                 UPDATE messages
@@ -2490,30 +2647,12 @@ async def deletion_worker(
     db_path: str,
     sender: TelegramBotSender,
     config,
+    dedup=None,
+    alert_token: str = "",
+    alert_chat_id: int = 0,
 ) -> None:
     """
     Background worker that propagates source-channel deletions to destinations.
-
-    Consumes events from deletion_queue (populated by the on_raw_update handler
-    inside register_listener when it sees UpdateDeleteChannelMessages or
-    UpdateDeleteMessages).
-
-    Each event is a dict:
-        {
-            "type":           "channel_deletion" | "group_deletion",
-            "source_chat_id": int,
-            "message_ids":    [int, ...],
-        }
-
-    For each source message_id the worker:
-      1. Queries message_destinations for all forwarded copies with status='sent'.
-      2. Calls Bot API deleteMessage on each destination copy.
-      3. Marks the destination row status='deleted' in SQLite.
-      4. Marks the parent messages row status='deleted' + deleted_at in SQLite.
-
-    NOTE: The sender bot must be an administrator with can_delete_messages=True
-    in each destination channel.  Without that permission, API calls will fail
-    and the deletion will be logged as a warning but will not crash the worker.
     """
     logger.info("Deletion worker started")
 
@@ -2532,6 +2671,9 @@ async def deletion_worker(
                         db_path=db_path,
                         sender=sender,
                         config=config,
+                        dedup=dedup,
+                        alert_token=alert_token,
+                        alert_chat_id=alert_chat_id,
                     )
                 except Exception as ev_err:
                     logger.error(
@@ -2553,11 +2695,6 @@ async def deletion_worker(
 
 
 # ── Edit propagation ──────────────────────────────────────────────────────────────
-# When the source-channel admin edits a message, Telegram fires
-# UpdateEditChannelMessage which Hydrogram surfaces as on_edited_message.
-# The on_edited_message handler inside register_listener() catches those and
-# enqueues them into a separate edit_queue. edit_worker() consumes that queue,
-# looks up the forwarded copies in SQLite, and updates them in all destinations.
 
 
 async def _process_edit_event(
@@ -2567,18 +2704,11 @@ async def _process_edit_event(
     db_path: str,
     sender: TelegramBotSender,
     config,
+    alert_token: str = "",
+    alert_chat_id: int = 0,
 ) -> None:
     """
     Apply an edited source message to every forwarded copy in destination channels.
-
-    For the edited source message:
-      1. Queries message_reply_map to find the sent_message_id in each destination.
-      2. Applies word replacement rules to the new text/caption.
-      3. Calls editMessageText (text) or editMessageCaption (media) on each copy.
-      4. Updates the messages table with the new processed text/caption.
-
-    Errors (e.g. bot lacks edit permission, or the destination message was deleted)
-    are logged as warnings — delivery continues for remaining destinations.
     """
     destinations = [
         {"chat_id": d.chat_id, "name": d.name}
@@ -2611,6 +2741,18 @@ async def _process_edit_event(
         processed.get("processed_caption_html") or payload.get("caption_html")
     )
 
+    quote = (
+        processed.get("processed_reply_to_quote")
+        or payload.get("reply_to_quote_text")
+        or (re.sub(r"<[^>]+>", "", processed.get("processed_reply_to_quote_html") or payload.get("reply_to_quote_html") or "") or None)
+    )
+    quote_html = (
+        processed.get("processed_reply_to_quote_html")
+        or payload.get("reply_to_quote_html")
+        or quote
+    )
+    source_reply_id = payload.get("reply_to_message_id")
+
     async with aiosqlite.connect(db_path) as db:
         db.row_factory = aiosqlite.Row
 
@@ -2636,29 +2778,56 @@ async def _process_edit_event(
 
             sent_msg_id = int(row["sent_message_id"])
 
+            reply_to_id = None
+            if source_reply_id:
+                reply_to_id = await _lookup_reply_target(
+                    db, source_chat_id, int(source_reply_id), dest_chat_id
+                )
+
+            # Preserve synthetic expandable blockquote for unmapped quote replies
+            unmapped_quote_prefix = (
+                f"<blockquote expandable>{quote_html}</blockquote>\n\n"
+                if (quote and not reply_to_id)
+                else ""
+            )
+
+            dest_text = (
+                f"{unmapped_quote_prefix}{new_text_html}"
+                if (new_text_html and unmapped_quote_prefix)
+                else new_text_html
+            )
+            dest_use_text_html = use_text_html or bool(unmapped_quote_prefix)
+
+            dest_caption = (
+                f"{unmapped_quote_prefix}{new_caption_html}"
+                if (new_caption_html and unmapped_quote_prefix)
+                else new_caption_html
+            )
+            dest_use_caption_html = use_caption_html or bool(unmapped_quote_prefix)
+
             try:
-                if msg_type == "text" and new_text_html:
+                if msg_type == "text" and dest_text:
                     from telegram_sender import _normalize_html_for_bot_api
-                    text = _normalize_html_for_bot_api(new_text_html) if use_text_html else new_text_html
+                    text = _normalize_html_for_bot_api(dest_text) if dest_use_text_html else dest_text
                     await sender.edit_message_text(
                         dest_chat_id,
                         sent_msg_id,
                         text,
-                        parse_mode="HTML" if use_text_html else None,
+                        parse_mode="HTML" if dest_use_text_html else None,
                     )
                     logger.info(
                         f"Edit propagated: text msg {sent_msg_id} updated in "
                         f"{dest_name} ({dest_chat_id}) "
                         f"[source msg_id={message_id}]"
                     )
-                elif msg_type in _RELAY_MEDIA_TYPES and new_caption_html is not None:
+                elif msg_type in _RELAY_MEDIA_TYPES and dest_caption is not None:
                     from telegram_sender import _normalize_html_for_bot_api
-                    caption = _normalize_html_for_bot_api(new_caption_html) if use_caption_html else new_caption_html
+                    caption = _normalize_html_for_bot_api(dest_caption) if dest_use_caption_html else dest_caption
                     await sender.edit_message_caption(
                         dest_chat_id,
                         sent_msg_id,
                         caption,
-                        parse_mode="HTML" if use_caption_html else None,
+                        parse_mode="HTML" if dest_use_caption_html else None,
                     )
                     logger.info(
                         f"Edit propagated: caption msg {sent_msg_id} updated in "
@@ -2703,24 +2872,11 @@ async def edit_worker(
     db_path: str,
     sender: TelegramBotSender,
     config,
+    alert_token: str = "",
+    alert_chat_id: int = 0,
 ) -> None:
     """
     Background worker that propagates source-channel edits to all destinations.
-
-    Consumes events from edit_queue (populated by the on_edited_message handler
-    inside register_listener when Hydrogram fires an edit update).
-
-    Each event is a dict:
-        {
-            "type":           "edit",
-            "source_chat_id": int,
-            "message_id":     int,
-            "payload":        dict,   # normalized message payload
-        }
-
-    NOTE: The sender bot must be an administrator with can_edit_messages=True
-    in each destination channel.  Without that permission, API calls will fail
-    and the edit will be logged as a warning but will not crash the worker.
     """
     logger.info("Edit worker started")
 
@@ -2741,6 +2897,8 @@ async def edit_worker(
                         db_path=db_path,
                         sender=sender,
                         config=config,
+                        alert_token=alert_token,
+                        alert_chat_id=alert_chat_id,
                     )
                 except Exception as ev_err:
                     logger.error(
@@ -2759,3 +2917,4 @@ async def edit_worker(
                 exc_info=True,
             )
             await asyncio.sleep(1.0)
+

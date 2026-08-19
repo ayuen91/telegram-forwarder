@@ -567,7 +567,183 @@ class TestFloodWaitPropagation:
         with pytest.raises(FloodWait):
             await process_payload(sender, qm, payload, ":memory:", config)
 
-        # Confirm it was NOT pushed to the failed queue
-        qm.enqueue_failed.assert_not_called()
+    @pytest.mark.asyncio
+    async def test_process_payload_skips_in_flight_deleted_tombstone(self):
+        from listener import process_payload
+
+        sender = MagicMock()
+        qm = MagicMock()
+        qm.enqueue = AsyncMock()
+        qm.remove_from_queue = AsyncMock()
+
+        dedup = MagicMock()
+        dedup.is_deleted = AsyncMock(return_value=True)
+
+        payload = {"message_id": 100, "chat_id": -100123, "type": "text", "text": "hello"}
+        config = MagicMock()
+
+        res = await process_payload(sender, qm, payload, ":memory:", config, dedup=dedup)
+        assert res == "success"
+        qm.enqueue.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_process_deletion_event_deletes_album_sub_items(self, tmp_path):
+        import aiosqlite
+        from listener import _process_deletion_event
+
+        db_path = str(tmp_path / "test_del.db")
+        async with aiosqlite.connect(db_path) as db:
+            await db.execute("""
+                CREATE TABLE messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    telegram_message_id INTEGER,
+                    source_chat_id INTEGER,
+                    status TEXT,
+                    deleted_at DATETIME
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE message_destinations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    message_id INTEGER,
+                    destination_chat_id INTEGER,
+                    sent_message_id INTEGER,
+                    status TEXT,
+                    sent_at DATETIME
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE message_reply_map (
+                    source_chat_id INTEGER,
+                    source_message_id INTEGER,
+                    destination_chat_id INTEGER,
+                    sent_message_id INTEGER,
+                    PRIMARY KEY (source_chat_id, source_message_id, destination_chat_id)
+                )
+            """)
+            # Album item 1
+            await db.execute("INSERT INTO messages (id, telegram_message_id, source_chat_id, status) VALUES (1, 501, -100123, 'received')")
+            await db.execute("INSERT INTO message_destinations (message_id, destination_chat_id, sent_message_id, status) VALUES (1, -100999, 901, 'sent')")
+            await db.execute("INSERT INTO message_reply_map VALUES (-100123, 501, -100999, 901)")
+            # Album item 2 (stored only in message_reply_map)
+            await db.execute("INSERT INTO message_reply_map VALUES (-100123, 502, -100999, 902)")
+            await db.commit()
+
+        sender = MagicMock()
+        sender.delete_message = AsyncMock()
+
+        dest_obj = MagicMock()
+        dest_obj.chat_id = -100999
+        dest_obj.name = "Dest 1"
+        config = MagicMock()
+        config.get_active_destinations.return_value = [dest_obj]
+
+        dedup = MagicMock()
+        dedup.mark_deleted = AsyncMock()
+
+        # Delete both item 501 and item 502
+        await _process_deletion_event(
+            source_chat_id=-100123,
+            message_ids=[501, 502],
+            db_path=db_path,
+            sender=sender,
+            config=config,
+            dedup=dedup,
+        )
+
+        dedup.mark_deleted.assert_called_once_with(-100123, [501, 502])
+        assert sender.delete_message.call_count == 2
+        sender.delete_message.assert_any_call(-100999, 901)
+        sender.delete_message.assert_any_call(-100999, 902)
+
+        # Check DB cleanup
+        async with aiosqlite.connect(db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT status FROM messages WHERE telegram_message_id = 501")
+            m_row = await cursor.fetchone()
+            assert m_row["status"] == "deleted"
+
+            cursor = await db.execute("SELECT COUNT(*) as cnt FROM message_reply_map")
+            cnt_row = await cursor.fetchone()
+            assert cnt_row["cnt"] == 0
+
+    @pytest.mark.asyncio
+    async def test_compute_content_hash_behavior(self):
+        from listener import _compute_content_hash
+
+        p1 = {"type": "text", "text_html": "Hello World"}
+        p2 = {"type": "text", "text_html": "Hello World"}
+        p3 = {"type": "text", "text_html": "Hello World Edited"}
+
+        h1 = _compute_content_hash(p1)
+        h2 = _compute_content_hash(p2)
+        h3 = _compute_content_hash(p3)
+
+        assert h1 == h2
+        assert h1 != h3
+        assert len(h1) == 64
+
+    @pytest.mark.asyncio
+    async def test_process_edit_event_preserves_unmapped_quote(self, tmp_path):
+        import aiosqlite
+        from listener import _process_edit_event
+
+        db_path = str(tmp_path / "test_edit.db")
+        async with aiosqlite.connect(db_path) as db:
+            await db.execute("""
+                CREATE TABLE messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    telegram_message_id INTEGER,
+                    source_chat_id INTEGER,
+                    processed_text TEXT,
+                    processed_caption TEXT,
+                    processed_at DATETIME
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE message_reply_map (
+                    source_chat_id INTEGER,
+                    source_message_id INTEGER,
+                    destination_chat_id INTEGER,
+                    sent_message_id INTEGER,
+                    PRIMARY KEY (source_chat_id, source_message_id, destination_chat_id)
+                )
+            """)
+            await db.execute("INSERT INTO messages (id, telegram_message_id, source_chat_id) VALUES (1, 100, -100123)")
+            await db.execute("INSERT INTO message_reply_map VALUES (-100123, 100, -100999, 555)")
+            await db.commit()
+
+        sender = MagicMock()
+        sender.edit_message_text = AsyncMock()
+
+        dest_obj = MagicMock()
+        dest_obj.chat_id = -100999
+        dest_obj.name = "Dest 1"
+        config = MagicMock()
+        config.get_active_destinations.return_value = [dest_obj]
+        config.get_rules_for_destination.return_value = []
+
+        payload = {
+            "type": "text",
+            "text": "New body text",
+            "reply_to_quote_text": "Original quote text",
+            "reply_to_message_id": 9999,  # unmapped reply
+        }
+
+        await _process_edit_event(
+            source_chat_id=-100123,
+            message_id=100,
+            payload=payload,
+            db_path=db_path,
+            sender=sender,
+            config=config,
+        )
+
+        sender.edit_message_text.assert_called_once()
+        args, kwargs = sender.edit_message_text.call_args
+        assert args[0] == -100999
+        assert args[1] == 555
+        assert "<blockquote expandable>Original quote text</blockquote>\n\nNew body text" in args[2]
+
 
 

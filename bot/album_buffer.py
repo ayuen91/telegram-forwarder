@@ -214,6 +214,22 @@ class AlbumBuffer:
 
         except Exception as e:
             logger.error(f"Error flushing album {group_id}: {e}", exc_info=True)
+            try:
+                if 'raw_items' in locals() and raw_items:
+                    await self.redis.rpush(
+                        "queue:failed",
+                        json.dumps({
+                            "type": "album_flush_error",
+                            "media_group_id": str(group_id),
+                            "error": str(e),
+                            "raw_items": {
+                                (k.decode() if isinstance(k, bytes) else str(k)): (v.decode() if isinstance(v, bytes) else str(v))
+                                for k, v in raw_items.items()
+                            },
+                        }),
+                    )
+            except Exception:
+                pass
             return None
 
     async def flush_stale_albums(self) -> List[Dict[str, Any]]:

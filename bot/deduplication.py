@@ -19,16 +19,21 @@ class Deduplication:
     # Key prefix for dedup entries
     KEY_PREFIX = "dedup"
     INFLIGHT_PREFIX = "inflight"
+    TOMBSTONE_PREFIX = "tombstone"
 
     # How long to remember a message_id (24 hours)
     TTL_SECONDS = 86400
     INFLIGHT_TTL = 600  # 10 minutes — covers worker delay + relay + Bot API send
+    TOMBSTONE_TTL = 600  # 10 minutes — covers queued message lifespan
 
     def __init__(self, redis_client: aioredis.Redis):
         self.redis = redis_client
 
     def _inflight_key(self, chat_id: int) -> str:
         return f"{self.INFLIGHT_PREFIX}:{chat_id}"
+
+    def _tombstone_key(self, chat_id: int, message_id: int) -> str:
+        return f"{self.TOMBSTONE_PREFIX}:{chat_id}:{message_id}"
 
     async def is_new(self, chat_id: int, message_id: int) -> bool:
         """
@@ -70,3 +75,24 @@ class Deduplication:
         """True if the parent message is still being processed."""
         key = self._inflight_key(chat_id)
         return bool(await self.redis.sismember(key, str(message_id)))
+
+    async def mark_deleted(self, chat_id: int, message_ids: list):
+        """Set tombstone flags for messages deleted at source to abort in-flight sends."""
+        if not message_ids:
+            return
+        for mid in message_ids:
+            try:
+                key = self._tombstone_key(chat_id, int(mid))
+                await self.redis.set(key, "1", ex=self.TOMBSTONE_TTL)
+            except Exception as e:
+                logger.debug(f"Tombstone write skipped for msg {mid}: {e}")
+
+    async def is_deleted(self, chat_id: int, message_id: int) -> bool:
+        """True if the message was deleted at source before forwarding started."""
+        try:
+            key = self._tombstone_key(chat_id, int(message_id))
+            return bool(await self.redis.exists(key))
+        except Exception as e:
+            logger.debug(f"Tombstone check skipped for msg {message_id}: {e}")
+            return False
+

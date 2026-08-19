@@ -285,6 +285,7 @@ def make_album_flush_factory(ctx: WorkerContext):
 
 def make_retry_factory(ctx: WorkerContext):
     async def retry():
+        failed_check_counter = 0
         while not shutdown_event.is_set():
             payload = None
             queue_type = None
@@ -298,21 +299,26 @@ def make_retry_factory(ctx: WorkerContext):
                         hydrogram_app=ctx.hydrogram_app, relay=ctx.relay,
                         alert_token=ctx.alert_token, alert_chat_id=ctx.alert_chat_id,
                     )
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(0.1)
                     continue
 
-                payload = await ctx.queue_mgr.dequeue_failed()
-                if payload:
-                    queue_type = "failed"
-                    await retry_payload(
-                        ctx.sender, ctx.queue_mgr, payload,
-                        ctx.db_path, ctx.config, dedup=ctx.dedup,
-                        hydrogram_app=ctx.hydrogram_app, relay=ctx.relay,
-                        alert_token=ctx.alert_token, alert_chat_id=ctx.alert_chat_id,
-                    )
-                else:
-                    await asyncio.sleep(60)
-                    continue
+                failed_check_counter += 1
+                if failed_check_counter >= 15:  # Check failed queue every ~30s
+                    failed_check_counter = 0
+                    payload = await ctx.queue_mgr.dequeue_failed()
+                    if payload:
+                        queue_type = "failed"
+                        await retry_payload(
+                            ctx.sender, ctx.queue_mgr, payload,
+                            ctx.db_path, ctx.config, dedup=ctx.dedup,
+                            hydrogram_app=ctx.hydrogram_app, relay=ctx.relay,
+                            alert_token=ctx.alert_token, alert_chat_id=ctx.alert_chat_id,
+                        )
+                        await asyncio.sleep(1)
+                        continue
+
+                await asyncio.sleep(2)
+                continue
             except (FloodWait, TelegramFloodWait) as e:
                 wait = getattr(e, "value", getattr(e, "retry_after", 5)) + 1
                 logger.warning(
@@ -720,12 +726,12 @@ async def main():
     # Separate lightweight queue for deletion propagation events.
     # Populated by the on_raw_update handler when UpdateDeleteChannelMessages or
     # UpdateDeleteMessages fires; consumed by deletion_worker().
-    deletion_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
+    deletion_queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
 
     # Separate lightweight queue for edit propagation events.
     # Populated by the on_edited_message handler when a source message is edited;
     # consumed by edit_worker() which applies the change to all destination copies.
-    edit_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
+    edit_queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
 
     # Record startup time BEFORE connecting so the listener can drop
     # any backlog updates Telegram pushes upon reconnect.
@@ -897,6 +903,9 @@ async def main():
             db_path=ctx.db_path,
             sender=ctx.sender,
             config=ctx.config,
+            dedup=ctx.dedup,
+            alert_token=ctx.alert_token,
+            alert_chat_id=ctx.alert_chat_id,
         )
 
     tasks.append(asyncio.create_task(
@@ -913,6 +922,8 @@ async def main():
             db_path=ctx.db_path,
             sender=ctx.sender,
             config=ctx.config,
+            alert_token=ctx.alert_token,
+            alert_chat_id=ctx.alert_chat_id,
         )
 
     tasks.append(asyncio.create_task(

@@ -112,3 +112,29 @@ class TestDeduplication:
 
         assert await dedup.is_inflight(chat_id=-100123, message_id=10) is True
         self.mock_redis.sismember.assert_called_once_with("inflight:-100123", "10")
+
+    @pytest.mark.asyncio
+    async def test_mark_deleted_and_is_deleted(self):
+        from deduplication import Deduplication
+
+        dedup = Deduplication(self.mock_redis)
+        await dedup.mark_deleted(chat_id=-100123, message_ids=[10, 11])
+
+        assert self.mock_redis.set.call_count == 2
+        self.mock_redis.set.assert_any_call("tombstone:-100123:10", "1", ex=600)
+        self.mock_redis.set.assert_any_call("tombstone:-100123:11", "1", ex=600)
+
+        self.mock_redis.exists.return_value = 1
+        assert await dedup.is_deleted(chat_id=-100123, message_id=10) is True
+        self.mock_redis.exists.assert_called_with("tombstone:-100123:10")
+
+        self.mock_redis.exists.return_value = 0
+        assert await dedup.is_deleted(chat_id=-100123, message_id=99) is False
+
+    @pytest.mark.asyncio
+    async def test_mark_deleted_no_redis_graceful(self):
+        from deduplication import Deduplication
+
+        dedup = Deduplication(None)
+        await dedup.mark_deleted(chat_id=-100123, message_ids=[10])
+        assert await dedup.is_deleted(chat_id=-100123, message_id=10) is False
