@@ -327,7 +327,18 @@ async def _resolve_raw_quote_if_needed(
         import hydrogram.raw.types as _raw_types
 
         peer = await client.resolve_peer(source_chat_id)
-        if isinstance(peer, (_raw_types.InputPeerChannel, _raw_types.InputChannel)):
+        if isinstance(peer, _raw_types.InputPeerChannel):
+            channel_input = _raw_types.InputChannel(
+                channel_id=peer.channel_id,
+                access_hash=peer.access_hash,
+            )
+            res = await client.invoke(
+                _ch_raw.GetMessages(
+                    channel=channel_input,
+                    id=[_raw_types.InputMessageID(id=int(message_id))]
+                )
+            )
+        elif isinstance(peer, _raw_types.InputChannel):
             res = await client.invoke(
                 _ch_raw.GetMessages(
                     channel=peer,
@@ -355,7 +366,7 @@ async def _resolve_raw_quote_if_needed(
                     f"pos={payload.get('reply_to_quote_position')}"
                 )
     except Exception as e:
-        logger.debug(f"Failed to resolve raw quote for msg {message_id}: {e}")
+        logger.warning(f"Failed to resolve raw quote for msg {message_id}: {e}")
 
 
 def _extract_reply_quote(message: Message) -> tuple:

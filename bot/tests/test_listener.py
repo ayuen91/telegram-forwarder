@@ -42,9 +42,13 @@ def _install_hydrogram_stub():
     class UpdatesTooLong:
         pass
     class InputPeerChannel:
-        pass
+        def __init__(self, channel_id=0, access_hash=0):
+            self.channel_id = channel_id
+            self.access_hash = access_hash
     class InputChannel:
-        pass
+        def __init__(self, channel_id=0, access_hash=0):
+            self.channel_id = channel_id
+            self.access_hash = access_hash
     class InputMessageID:
         def __init__(self, id=0):
             self.id = id
@@ -93,6 +97,7 @@ from listener import (
     _extract_reply_quote,
     _extract_quote_from_tl_reply_header,
     _capture_tl_message_quote,
+    _resolve_raw_quote_if_needed,
     normalize_message,
 )
 
@@ -744,6 +749,119 @@ class TestFloodWaitPropagation:
         assert args[0] == -100999
         assert args[1] == 555
         assert "<blockquote expandable>Original quote text</blockquote>\n\nNew body text" in args[2]
+
+
+class TestResolveRawQuoteIfNeeded:
+    @pytest.mark.asyncio
+    async def test_input_peer_channel_converted_to_input_channel(self):
+        import hydrogram.raw.types as _raw_types
+        import hydrogram.raw.functions.channels as _ch_raw
+
+        peer = _raw_types.InputPeerChannel(channel_id=123456789, access_hash=987654321)
+        client = MagicMock()
+        client.resolve_peer = AsyncMock(return_value=peer)
+
+        # Mock reply_to TL header with quote
+        reply_to_header = SimpleNamespace(
+            quote=True,
+            quote_text="Quoted text from large channel",
+            quote_offset=15,
+            quote_entities=None,
+        )
+        raw_msg = SimpleNamespace(id=50, reply_to=reply_to_header)
+        res = SimpleNamespace(messages=[raw_msg])
+        client.invoke = AsyncMock(return_value=res)
+
+        payload = {
+            "reply_to_message_id": 40,
+            "reply_to_quote_text": None,
+        }
+
+        await _resolve_raw_quote_if_needed(
+            client=client,
+            source_chat_id=-100123456789,
+            message_id=50,
+            payload=payload,
+        )
+
+        client.invoke.assert_called_once()
+        # Verify channels.GetMessages was called with InputChannel
+        assert _ch_raw.GetMessages.called
+        channel_arg = _ch_raw.GetMessages.call_args.kwargs["channel"]
+        assert isinstance(channel_arg, _raw_types.InputChannel)
+        assert channel_arg.channel_id == 123456789
+        assert channel_arg.access_hash == 987654321
+
+        # Verify quote data extracted into payload
+        assert payload["reply_to_quote_text"] == "Quoted text from large channel"
+        assert payload["reply_to_quote_position"] == 15
+
+    @pytest.mark.asyncio
+    async def test_input_channel_directly_passed(self):
+        import hydrogram.raw.types as _raw_types
+        import hydrogram.raw.functions.channels as _ch_raw
+
+        peer = _raw_types.InputChannel(channel_id=123456789, access_hash=987654321)
+        client = MagicMock()
+        client.resolve_peer = AsyncMock(return_value=peer)
+
+        reply_to_header = SimpleNamespace(
+            quote=True,
+            quote_text="Quoted text directly from input channel",
+            quote_offset=0,
+            quote_entities=None,
+        )
+        raw_msg = SimpleNamespace(id=51, reply_to=reply_to_header)
+        res = SimpleNamespace(messages=[raw_msg])
+        client.invoke = AsyncMock(return_value=res)
+
+        payload = {
+            "reply_to_message_id": 41,
+            "reply_to_quote_text": None,
+        }
+
+        await _resolve_raw_quote_if_needed(
+            client=client,
+            source_chat_id=-100123456789,
+            message_id=51,
+            payload=payload,
+        )
+
+        assert payload["reply_to_quote_text"] == "Quoted text directly from input channel"
+        assert payload["reply_to_quote_position"] == 0
+
+    @pytest.mark.asyncio
+    async def test_no_reply_id_skips_call(self):
+        client = MagicMock()
+        client.resolve_peer = AsyncMock()
+        payload = {
+            "reply_to_message_id": None,
+            "reply_to_quote_text": None,
+        }
+        await _resolve_raw_quote_if_needed(
+            client=client,
+            source_chat_id=-100123,
+            message_id=50,
+            payload=payload,
+        )
+        client.resolve_peer.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_already_has_quote_skips_call(self):
+        client = MagicMock()
+        client.resolve_peer = AsyncMock()
+        payload = {
+            "reply_to_message_id": 40,
+            "reply_to_quote_text": "Already present",
+        }
+        await _resolve_raw_quote_if_needed(
+            client=client,
+            source_chat_id=-100123,
+            message_id=50,
+            payload=payload,
+        )
+        client.resolve_peer.assert_not_called()
+
 
 
 
