@@ -49,6 +49,8 @@ class Destination:
     chat_id: int
     name: str
     enabled: bool = True
+    username: str = ""
+
 
 
 @dataclass
@@ -56,6 +58,9 @@ class ReplacementRule:
     pattern: str
     replacement: str
     is_regex: bool = False
+    replace_text: bool = True
+    replace_url: bool = False
+
 
 
 @dataclass
@@ -81,6 +86,7 @@ class Settings:
     api_hash: str = ""
     phone_number: str = ""
     source_chat_id: int = 0
+    source_username: str = ""
 
     # Telegram Sender Bot (Bot API — destination delivery only)
     bot_token: str = ""
@@ -227,6 +233,8 @@ class Config:
             source = data.get("source", {})
             if source.get("chat_id") and not self.settings.source_chat_id:
                 self.settings.source_chat_id = int(source["chat_id"])
+            if source.get("username"):
+                self.settings.source_username = str(source["username"]).lstrip("@").strip()
 
             # Destinations
             self.settings.destinations = []
@@ -236,8 +244,10 @@ class Config:
                         chat_id=int(dest["chat_id"]),
                         name=dest.get("name", str(dest["chat_id"])),
                         enabled=dest.get("enabled", True),
+                        username=str(dest.get("username", "")).lstrip("@").strip(),
                     )
                 )
+
 
             # Forward attribution (preserve "Forwarded from" tag)
             fa_data = data.get("forward_attribution") or {}
@@ -278,13 +288,18 @@ class Config:
 
             self.settings.replacement_rules = []
             for rule in data.get("rules", []):
+                replace_text = rule.get("replace_text", True)
+                replace_url = rule.get("replace_url", rule.get("replace_hyperlink", rule.get("replace_urls", False)))
                 self.settings.replacement_rules.append(
                     ReplacementRule(
-                        pattern=rule["pattern"],
-                        replacement=rule.get("replacement", ""),
-                        is_regex=rule.get("is_regex", False),
+                        pattern=str(rule["pattern"]),
+                        replacement=str(rule.get("replacement", "")),
+                        is_regex=bool(rule.get("is_regex", False)),
+                        replace_text=bool(replace_text),
+                        replace_url=bool(replace_url),
                     )
                 )
+
 
             self._replacements_mtime = os.path.getmtime(path)
             logger.info(f"Loaded replacements.yml: {len(self.settings.replacement_rules)} rules")

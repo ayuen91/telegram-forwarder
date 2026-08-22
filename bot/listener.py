@@ -17,9 +17,11 @@ import itertools
 import json
 import logging
 import random
+import re
 import time
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, Literal
+
 
 import aiosqlite
 from hydrogram import Client, filters
@@ -78,6 +80,8 @@ from forward_attribution import (
     ForwardAttributionChecker,
     attach_native_forward_flag,
 )
+from link_rewriter import rewrite_payload_for_destination
+
 
 logger = logging.getLogger(__name__)
 
@@ -1039,6 +1043,7 @@ async def forward_message_pipeline(
 
             dest_chat_id = _to_int(dest["chat_id"])
             dest_name = dest.get("name", str(dest_chat_id))
+            dest_username = dest.get("username", "")
 
             # Skip destinations already delivered (e.g. retry after defer)
             cursor = await db.execute(
@@ -1053,6 +1058,16 @@ async def forward_message_pipeline(
                 continue
 
             try:
+                dest_proc = await rewrite_payload_for_destination(
+                    payload=payload,
+                    processed_payload=processed_payload,
+                    db=db,
+                    source_chat_id=source_chat_id,
+                    dest_chat_id=dest_chat_id,
+                    dest_username=dest_username,
+                    source_username=processed_payload.get("source_username"),
+                )
+
                 reply_to_id = None
                 if source_reply_id:
                     reply_to_id = await _lookup_reply_target(
@@ -1085,12 +1100,13 @@ async def forward_message_pipeline(
                     _dest=dest_chat_id,
                     _reply=reply_to_id,
                     _relay_ids=relay_message_ids,
+                    _proc=dest_proc,
                 ):
                     return await sender.forward_to_destination(
                         dest_chat_id=_dest,
                         msg_type=msg_type,
                         payload=payload,
-                        processed_payload=processed_payload,
+                        processed_payload=_proc,
                         relay_chat_id=relay.bot_from_chat if relay else None,
                         relay_message_ids=_relay_ids,
                         reply_to_message_id=_reply,
@@ -1112,7 +1128,7 @@ async def forward_message_pipeline(
                         result = await _deliver_with_native_fallback(
                             sender=sender,
                             payload=payload,
-                            processed_payload=processed_payload,
+                            processed_payload=dest_proc,
                             msg_type=msg_type,
                             dest_chat_id=dest_chat_id,
                             reply_to_id=reply_to_id,
@@ -1124,6 +1140,7 @@ async def forward_message_pipeline(
                         relay_message_ids = relay_holder[0]
                     else:
                         raise
+
 
                 sent_msg_id = result["sent_message_id"]
 
@@ -2722,7 +2739,7 @@ async def _process_edit_event(
     Apply an edited source message to every forwarded copy in destination channels.
     """
     destinations = [
-        {"chat_id": d.chat_id, "name": d.name}
+        {"chat_id": d.chat_id, "name": d.name, "username": getattr(d, "username", "")}
         for d in config.get_active_destinations()
     ]
     if not destinations:
@@ -2730,38 +2747,7 @@ async def _process_edit_event(
 
     # Apply word replacement rules to the edited content
     processed = build_processed_payload(payload, config)
-
     msg_type = payload.get("type")
-    # Resolved text to send (prefer HTML for rich formatting)
-    new_text_html = (
-        processed.get("processed_text_html")
-        or processed.get("processed_text")
-        or payload.get("text_html")
-        or payload.get("text")
-    )
-    use_text_html = bool(
-        processed.get("processed_text_html") or payload.get("text_html")
-    )
-    new_caption_html = (
-        processed.get("processed_caption_html")
-        or processed.get("processed_caption")
-        or payload.get("caption_html")
-        or payload.get("caption")
-    )
-    use_caption_html = bool(
-        processed.get("processed_caption_html") or payload.get("caption_html")
-    )
-
-    quote = (
-        processed.get("processed_reply_to_quote")
-        or payload.get("reply_to_quote_text")
-        or (re.sub(r"<[^>]+>", "", processed.get("processed_reply_to_quote_html") or payload.get("reply_to_quote_html") or "") or None)
-    )
-    quote_html = (
-        processed.get("processed_reply_to_quote_html")
-        or payload.get("reply_to_quote_html")
-        or quote
-    )
     source_reply_id = payload.get("reply_to_message_id")
 
     async with aiosqlite.connect(db_path) as db:
@@ -2770,6 +2756,7 @@ async def _process_edit_event(
         for dest in destinations:
             dest_chat_id = int(dest["chat_id"])
             dest_name = dest["name"]
+            dest_username = dest.get("username", "")
 
             # Resolve the destination message ID from the reply map
             cursor = await db.execute(
@@ -2789,6 +2776,47 @@ async def _process_edit_event(
 
             sent_msg_id = int(row["sent_message_id"])
 
+            # Rewrite internal links for this destination
+            dest_processed = await rewrite_payload_for_destination(
+                payload=payload,
+                processed_payload=processed,
+                db=db,
+                source_chat_id=source_chat_id,
+                dest_chat_id=dest_chat_id,
+                dest_username=dest_username,
+                source_username=processed.get("source_username"),
+            )
+
+            dest_new_text_html = (
+                dest_processed.get("processed_text_html")
+                or dest_processed.get("processed_text")
+                or payload.get("text_html")
+                or payload.get("text")
+            )
+            dest_use_text_html = bool(
+                dest_processed.get("processed_text_html") or payload.get("text_html")
+            )
+            dest_new_caption_html = (
+                dest_processed.get("processed_caption_html")
+                or dest_processed.get("processed_caption")
+                or payload.get("caption_html")
+                or payload.get("caption")
+            )
+            dest_use_caption_html = bool(
+                dest_processed.get("processed_caption_html") or payload.get("caption_html")
+            )
+
+            dest_quote = (
+                dest_processed.get("processed_reply_to_quote")
+                or payload.get("reply_to_quote_text")
+                or (re.sub(r"<[^>]+>", "", dest_processed.get("processed_reply_to_quote_html") or payload.get("reply_to_quote_html") or "") or None)
+            )
+            dest_quote_html = (
+                dest_processed.get("processed_reply_to_quote_html")
+                or payload.get("reply_to_quote_html")
+                or dest_quote
+            )
+
             reply_to_id = None
             if source_reply_id:
                 reply_to_id = await _lookup_reply_target(
@@ -2797,24 +2825,25 @@ async def _process_edit_event(
 
             # Preserve synthetic expandable blockquote for unmapped quote replies
             unmapped_quote_prefix = (
-                f"<blockquote expandable>{quote_html}</blockquote>\n\n"
-                if (quote and not reply_to_id)
+                f"<blockquote expandable>{dest_quote_html}</blockquote>\n\n"
+                if (dest_quote and not reply_to_id)
                 else ""
             )
 
             dest_text = (
-                f"{unmapped_quote_prefix}{new_text_html}"
-                if (new_text_html and unmapped_quote_prefix)
-                else new_text_html
+                f"{unmapped_quote_prefix}{dest_new_text_html}"
+                if (dest_new_text_html and unmapped_quote_prefix)
+                else dest_new_text_html
             )
-            dest_use_text_html = use_text_html or bool(unmapped_quote_prefix)
+            dest_use_text_html = dest_use_text_html or bool(unmapped_quote_prefix)
 
             dest_caption = (
-                f"{unmapped_quote_prefix}{new_caption_html}"
-                if (new_caption_html and unmapped_quote_prefix)
-                else new_caption_html
+                f"{unmapped_quote_prefix}{dest_new_caption_html}"
+                if (dest_new_caption_html and unmapped_quote_prefix)
+                else dest_new_caption_html
             )
-            dest_use_caption_html = use_caption_html or bool(unmapped_quote_prefix)
+            dest_use_caption_html = dest_use_caption_html or bool(unmapped_quote_prefix)
+
 
             try:
                 if msg_type == "text" and dest_text:

@@ -1,29 +1,55 @@
-# Word Replacement Rules
-# Applied in order (top to bottom) to both text and caption fields.
+# Word & Hyperlink Replacement Rules
+# Applied in order (top to bottom) to text, captions, hyperlinks, and button URLs.
 # Hot-reloaded every 5 minutes — edit on VPS without restart.
+#
+# Options per rule:
+#   pattern:        String or regular expression pattern to match.
+#   replacement:    Replacement text or regex substitution (e.g. \1 for capture groups).
+#   is_regex:       true / false (default: false).
+#   replace_text:   true / false (default: true) — apply replacement to visible text / message body.
+#   replace_url:    true / false (default: false) — apply replacement to hyperlink values (href="..." and inline button URLs).
 
 rules:
-  # Simple string replacement
+  # 1. Simple text replacement (replaces visible word, leaves any hyperlinks intact)
   - pattern: "old_word"
     replacement: "new_word"
     is_regex: false
+    replace_text: true
+    replace_url: false
 
-  # Regex replacement (URL rewriting)
+  # 2. Hyperlink value ONLY replacement (rewrites the URL behind hyperlinks, preserves anchor text)
+  # Example: <a href="https://original.com/promo">Click Here</a> -> <a href="https://new-domain.com/promo">Click Here</a>
   - pattern: "https?://original\\.com(/\\S*)?"
     replacement: "https://new-domain.com\\1"
     is_regex: true
+    replace_text: false
+    replace_url: true
 
-  # Channel/username replacement
+  # 3. Both Hyperlink value AND visible text replacement (rewrites both URL and matching visible text)
+  # Example: <a href="https://original.com/promo">https://original.com/promo</a> -> <a href="https://new-domain.com/promo">https://new-domain.com/promo</a>
+  - pattern: "https?://affiliate-old\\.com(/\\S*)?"
+    replacement: "https://affiliate-new.com\\1"
+    is_regex: true
+    replace_text: true
+    replace_url: true
+
+  # 4. Channel/username replacement in visible text
   - pattern: "@old_channel"
     replacement: "@new_channel"
     is_regex: false
+    replace_text: true
+    replace_url: false
 
-  # Remove specific text
+  # 5. Remove specific text
   - pattern: "Sponsored by.*$"
     replacement: ""
     is_regex: true
+    replace_text: true
+    replace_url: false
 
-  # Case-insensitive replacement
+  # 6. Case-insensitive text replacement
   - pattern: "(?i)old brand"
     replacement: "New Brand"
     is_regex: true
+    replace_text: true
+    replace_url: false

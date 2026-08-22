@@ -99,7 +99,10 @@ from listener import (
     _capture_tl_message_quote,
     _resolve_raw_quote_if_needed,
     normalize_message,
+    forward_message_pipeline,
+    _process_edit_event,
 )
+
 
 
 def _msg(**attrs):
@@ -861,6 +864,372 @@ class TestResolveRawQuoteIfNeeded:
             payload=payload,
         )
         client.resolve_peer.assert_not_called()
+
+
+@pytest.mark.asyncio
+class TestPipelineLinkRewriting:
+    @pytest.fixture
+    def db_path(self, tmp_path):
+        return str(tmp_path / "test_pipeline.db")
+
+    async def _setup_db(self, path):
+        import aiosqlite
+        async with aiosqlite.connect(path) as db:
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    telegram_message_id INTEGER NOT NULL,
+                    source_chat_id INTEGER NOT NULL,
+                    message_type TEXT NOT NULL,
+                    original_text TEXT,
+                    original_caption TEXT,
+                    processed_text TEXT,
+                    processed_caption TEXT,
+                    has_media INTEGER DEFAULT 0,
+                    media_group_id TEXT,
+                    album_item_count INTEGER,
+                    status TEXT NOT NULL DEFAULT 'received',
+                    error_message TEXT,
+                    retry_count INTEGER DEFAULT 0,
+                    received_at TEXT DEFAULT (datetime('now')),
+                    processed_at TEXT,
+                    sent_at TEXT,
+                    deleted_at TEXT,
+                    UNIQUE(telegram_message_id, source_chat_id)
+                );
+                """
+            )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS message_destinations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    message_id INTEGER NOT NULL REFERENCES messages(id),
+                    destination_chat_id INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    sent_message_id INTEGER,
+                    sent_at TEXT,
+                    error_message TEXT,
+                    retry_count INTEGER DEFAULT 0,
+                    UNIQUE(message_id, destination_chat_id)
+                );
+                """
+            )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS message_reply_map (
+                    source_chat_id INTEGER NOT NULL,
+                    source_message_id INTEGER NOT NULL,
+                    destination_chat_id INTEGER NOT NULL,
+                    sent_message_id INTEGER NOT NULL,
+                    created_at TEXT DEFAULT (datetime('now')),
+                    PRIMARY KEY (source_chat_id, source_message_id, destination_chat_id)
+                );
+                """
+            )
+            # Insert mapping: source msg 11808 in dest -1002674892914 -> 5432
+            await db.execute(
+                """
+                INSERT INTO message_reply_map (source_chat_id, source_message_id, destination_chat_id, sent_message_id)
+                VALUES (?, ?, ?, ?)
+                """,
+                (-1001707179235, 11808, -1002674892914, 5432),
+            )
+            # Insert mapping: source msg 11808 in dest -1005555555555 -> 8888
+            await db.execute(
+                """
+                INSERT INTO message_reply_map (source_chat_id, source_message_id, destination_chat_id, sent_message_id)
+                VALUES (?, ?, ?, ?)
+                """,
+                (-1001707179235, 11808, -1005555555555, 8888),
+            )
+            await db.commit()
+
+    async def test_forward_pipeline_rewrites_internal_hyperlink(self, db_path):
+        from unittest.mock import patch
+        from media_relay import RelayConfig
+        await self._setup_db(db_path)
+
+        sender = MagicMock()
+        delivered_payloads = []
+
+        async def _mock_forward(**kwargs):
+            delivered_payloads.append(dict(kwargs["processed_payload"]))
+            return {
+                "sent_message_id": 9001,
+                "reply_mappings": [(kwargs["payload"]["message_id"], 9001)],
+            }
+
+        sender.forward_to_destination = AsyncMock(side_effect=_mock_forward)
+
+        async def _call_mock(fn):
+            return await fn()
+
+        sender.call_with_flood_wait = AsyncMock(side_effect=_call_mock)
+
+
+        payload = {
+            "type": "text",
+            "message_id": 11850,
+            "chat_id": -1001707179235,
+            "text": "For more info follow this post",
+            "text_html": 'For more info <a href="https://t.me/c/1707179235/11808">follow</a> this post',
+        }
+        processed_payload = {
+            **payload,
+            "text_changed": False,
+            "destinations": [
+                {"chat_id": -1002674892914, "name": "Dest A", "enabled": True},
+                {"chat_id": -1005555555555, "name": "Dest B", "enabled": True},
+            ],
+        }
+
+        with patch("listener.relay_to_bot", new=AsyncMock(return_value=[11850])), \
+             patch("listener.cleanup_relay", new=AsyncMock()):
+            status = await forward_message_pipeline(
+                sender=sender,
+                payload=payload,
+                processed_payload=processed_payload,
+                db_path=db_path,
+                hydrogram_app=MagicMock(),
+                relay=RelayConfig(userbot_target=123, bot_from_chat=123),
+            )
+
+
+        assert status == "success"
+        assert len(delivered_payloads) == 2
+
+
+        # Destination A payload
+        p_a = delivered_payloads[0]
+        assert p_a["text_changed"] is True
+        assert 'href="https://t.me/c/2674892914/5432"' in p_a["processed_text_html"]
+
+        # Destination B payload
+        p_b = delivered_payloads[1]
+        assert p_b["text_changed"] is True
+        assert 'href="https://t.me/c/5555555555/8888"' in p_b["processed_text_html"]
+
+    async def test_process_edit_event_rewrites_internal_hyperlink(self, db_path):
+        import aiosqlite
+        await self._setup_db(db_path)
+
+        # Map msg 11850 in Dest A -> 9001
+        async with aiosqlite.connect(db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO message_reply_map (source_chat_id, source_message_id, destination_chat_id, sent_message_id)
+                VALUES (?, ?, ?, ?)
+                """,
+                (-1001707179235, 11850, -1002674892914, 9001),
+            )
+            await db.commit()
+
+        sender = MagicMock()
+        sender.edit_message_text = AsyncMock()
+
+        config = MagicMock()
+        config.get_active_destinations.return_value = [
+            SimpleNamespace(chat_id=-1002674892914, name="Dest A", enabled=True, username="")
+        ]
+        config.settings.replacement_rules = []
+
+        payload = {
+            "type": "text",
+            "message_id": 11850,
+            "chat_id": -1001707179235,
+            "text": "Edited text follow",
+            "text_html": 'Edited text <a href="https://t.me/c/1707179235/11808">follow</a>',
+        }
+
+        await _process_edit_event(
+            source_chat_id=-1001707179235,
+            message_id=11850,
+            payload=payload,
+            db_path=db_path,
+            sender=sender,
+            config=config,
+        )
+
+        sender.edit_message_text.assert_called_once()
+        call_args = sender.edit_message_text.call_args[0]
+        dest_id, sent_id, text = call_args[0], call_args[1], call_args[2]
+        assert dest_id == -1002674892914
+        assert sent_id == 9001
+        assert '<a href="https://t.me/c/2674892914/5432">follow</a>' in text
+
+    async def test_forward_pipeline_rewrites_public_dest_and_inline_keyboard(self, db_path):
+        from unittest.mock import patch
+        from media_relay import RelayConfig
+        await self._setup_db(db_path)
+
+        sender = MagicMock()
+        delivered_payloads = []
+
+        async def _mock_forward(**kwargs):
+            delivered_payloads.append(dict(kwargs["processed_payload"]))
+            return {
+                "sent_message_id": 9002,
+                "reply_mappings": [(kwargs["payload"]["message_id"], 9002)],
+            }
+
+        sender.forward_to_destination = AsyncMock(side_effect=_mock_forward)
+        async def _call_mock(fn):
+            return await fn()
+        sender.call_with_flood_wait = AsyncMock(side_effect=_call_mock)
+
+        payload = {
+            "type": "text",
+            "message_id": 11851,
+            "chat_id": -1001707179235,
+            "text": "Check out our previous post",
+            "text_html": 'Check out our <a href="https://t.me/c/1707179235/11808">previous post</a>',
+            "reply_markup": {
+                "inline_keyboard": [
+                    [{"text": "Post Link", "url": "https://t.me/c/1707179235/11808"}]
+                ]
+            },
+        }
+        processed_payload = {
+            **payload,
+            "text_changed": False,
+            "destinations": [
+                {"chat_id": -1002674892914, "name": "Public Dest", "username": "public_channel", "enabled": True},
+            ],
+        }
+
+        with patch("listener.relay_to_bot", new=AsyncMock(return_value=[11851])), \
+             patch("listener.cleanup_relay", new=AsyncMock()):
+            status = await forward_message_pipeline(
+                sender=sender,
+                payload=payload,
+                processed_payload=processed_payload,
+                db_path=db_path,
+                hydrogram_app=MagicMock(),
+                relay=RelayConfig(userbot_target=123, bot_from_chat=123),
+            )
+
+        assert status == "success"
+        assert len(delivered_payloads) == 1
+        p = delivered_payloads[0]
+        assert 'href="https://t.me/public_channel/5432"' in p["processed_text_html"]
+        assert p["reply_markup"]["inline_keyboard"][0][0]["url"] == "https://t.me/public_channel/5432"
+
+    async def test_forward_pipeline_unmapped_links_preserved(self, db_path):
+        from unittest.mock import patch
+        from media_relay import RelayConfig
+        await self._setup_db(db_path)
+
+        sender = MagicMock()
+        delivered_payloads = []
+
+        async def _mock_forward(**kwargs):
+            delivered_payloads.append(dict(kwargs["processed_payload"]))
+            return {
+                "sent_message_id": 9003,
+                "reply_mappings": [(kwargs["payload"]["message_id"], 9003)],
+            }
+
+        sender.forward_to_destination = AsyncMock(side_effect=_mock_forward)
+        async def _call_mock(fn):
+            return await fn()
+        sender.call_with_flood_wait = AsyncMock(side_effect=_call_mock)
+
+        payload = {
+            "type": "text",
+            "message_id": 11852,
+            "chat_id": -1001707179235,
+            "text": "Link to unmapped post https://t.me/c/1707179235/99999",
+            "text_html": 'Link to unmapped post <a href="https://t.me/c/1707179235/99999">unmapped</a>',
+        }
+        processed_payload = {
+            **payload,
+            "text_changed": False,
+            "destinations": [
+                {"chat_id": -1002674892914, "name": "Dest A", "enabled": True},
+            ],
+        }
+
+        with patch("listener.relay_to_bot", new=AsyncMock(return_value=[11852])), \
+             patch("listener.cleanup_relay", new=AsyncMock()):
+            status = await forward_message_pipeline(
+                sender=sender,
+                payload=payload,
+                processed_payload=processed_payload,
+                db_path=db_path,
+                hydrogram_app=MagicMock(),
+                relay=RelayConfig(userbot_target=123, bot_from_chat=123),
+            )
+
+        assert status == "success"
+        p = delivered_payloads[0]
+        # Unmapped link is preserved as-is
+        assert 'href="https://t.me/c/1707179235/99999"' in (p.get("processed_text_html") or p.get("text_html"))
+
+    async def test_forward_pipeline_multiple_links_in_single_message(self, db_path):
+        import aiosqlite
+        from unittest.mock import patch
+        from media_relay import RelayConfig
+        await self._setup_db(db_path)
+
+        # Insert second mapping: msg 11809 -> 5433 in Dest A
+        async with aiosqlite.connect(db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO message_reply_map (source_chat_id, source_message_id, destination_chat_id, sent_message_id)
+                VALUES (?, ?, ?, ?)
+                """,
+                (-1001707179235, 11809, -1002674892914, 5433),
+            )
+            await db.commit()
+
+        sender = MagicMock()
+        delivered_payloads = []
+
+        async def _mock_forward(**kwargs):
+            delivered_payloads.append(dict(kwargs["processed_payload"]))
+            return {
+                "sent_message_id": 9004,
+                "reply_mappings": [(kwargs["payload"]["message_id"], 9004)],
+            }
+
+        sender.forward_to_destination = AsyncMock(side_effect=_mock_forward)
+        async def _call_mock(fn):
+            return await fn()
+        sender.call_with_flood_wait = AsyncMock(side_effect=_call_mock)
+
+        payload = {
+            "type": "text",
+            "message_id": 11853,
+            "chat_id": -1001707179235,
+            "text": "Check part 1 and part 2",
+            "text_html": 'Check <a href="https://t.me/c/1707179235/11808">part 1</a> and <a href="https://t.me/c/1707179235/11809?single">part 2</a>',
+        }
+        processed_payload = {
+            **payload,
+            "text_changed": False,
+            "destinations": [
+                {"chat_id": -1002674892914, "name": "Dest A", "enabled": True},
+            ],
+        }
+
+        with patch("listener.relay_to_bot", new=AsyncMock(return_value=[11853])), \
+             patch("listener.cleanup_relay", new=AsyncMock()):
+            status = await forward_message_pipeline(
+                sender=sender,
+                payload=payload,
+                processed_payload=processed_payload,
+                db_path=db_path,
+                hydrogram_app=MagicMock(),
+                relay=RelayConfig(userbot_target=123, bot_from_chat=123),
+            )
+
+        assert status == "success"
+        p = delivered_payloads[0]
+        assert 'href="https://t.me/c/2674892914/5432"' in p["processed_text_html"]
+        assert 'href="https://t.me/c/2674892914/5433?single"' in p["processed_text_html"]
+
+
 
 
 
